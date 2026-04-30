@@ -1,0 +1,10 @@
+avisos
+
+# IDEs
+.vscode/
+.idea/
+
+# Ambiente virtual
+venv/
+.env/
+.venv/
