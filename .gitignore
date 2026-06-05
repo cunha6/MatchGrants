@@ -1,8 +1,11 @@
-avisos
-
 # IDEs
 .vscode/
 .idea/
+
+.env
+
+pdf_Avisos/
+output/
 
 # Ambiente virtual
 venv/
