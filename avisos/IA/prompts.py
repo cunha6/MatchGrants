@@ -225,42 +225,42 @@ REGRAS (CRÍTICO):
 
 ESQUEMA DE DADOS ESPERADO:
 {
-  "Aviso_Parte1": {
-    "codigo_aviso": "String",
-    "titulo": "String",
-    "programa_financiador": "String",
-    "entidade_gestora": "String",
-    "data_publicacao": "YYYY-MM-DDThh:mm:ss",
-    "data_republicacao": "YYYY-MM-DDThh:mm:ss ou null",
-    "ultima_republicacao": "String ou null",
-    "data_alteracao": "YYYY-MM-DDThh:mm:ss ou null",
-    "modalidade_aviso": "String ou null",
-    "objetivo": "String ou null",
-    "nome_fundo": "String ou null",
-    "prioridade_programa": "String ou null",
-    "tipo_intervencao_codigo": "String ou null",
-    "duracao_maxima_meses": "Integer ou null",
-    "caes_elegiveis": ["List de Strings"],
-    "regioes_admissiveis": ["List de Strings - NUTS II e/ou NUTS III admissíveis"],
-    "data_inicio_elegibilidade_despesa": "YYYY-MM-DDThh:mm:ss ou null",
-    "objetivo_especifico": "String ou null",
-    "tipologia_operacao": "String",
-    "acoes_abrangidas": "String",
-    "organismos_intermedios": [{ "nome": "String", "nif": "String ou null", "competencias": "String ou null" }],
-    "legislacao_aplicavel": ["List de Strings"],
-    "documentos_regulamentacao": [{ "nome": "String", "url": "String ou null" }],
-    "setores_tecnologicos_alvo": ["List de Strings ou []"],
-    "submissao_candidaturas": "String",
-    "criterios_elegibilidade_beneficiario": ["List de Strings"],
-    "destinatarios_finais": ["List de Strings ou []"],
-    "principio_dnsh": "String ou null",
-    "contacto": ["List de Strings — 'Entidade - Responsável: X | Telefone: Y | Email: Z'"],
-    "requisitos_compromisso": "String ou null",
-    "investimento_minimo": "Float ou null",
-    "investimento_maximo": "Float ou null"
+  "Grant_Part1": {
+    "grant_code": "String",
+    "title": "String",
+    "financing_program": "String",
+    "managing_entity": "String",
+    "publication_date": "YYYY-MM-DDThh:mm:ss",
+    "republication_date": "YYYY-MM-DDThh:mm:ss ou null",
+    "last_republication": "String ou null",
+    "amendment_date": "YYYY-MM-DDThh:mm:ss ou null",
+    "notice_modality": "String ou null",
+    "objective": "String ou null",
+    "fund_name": "String ou null",
+    "program_priority": "String ou null",
+    "intervention_type_code": "String ou null",
+    "max_duration_months": "Integer ou null",
+    "eligible_cae_codes": ["List de Strings"],
+    "eligible_regions": ["List de Strings - NUTS II e/ou NUTS III admissíveis"],
+    "expense_eligibility_start_date": "YYYY-MM-DDThh:mm:ss ou null",
+    "specific_objective": "String ou null",
+    "operation_typology": "String",
+    "covered_actions": "String",
+    "intermediate_bodies": [{ "name": "String", "tax_id": "String ou null", "competencies": "String ou null" }],
+    "applicable_legislation": ["List de Strings"],
+    "regulatory_documents": [{ "name": "String", "url": "String ou null" }],
+    "target_technology_sectors": ["List de Strings ou []"],
+    "application_submission": "String",
+    "beneficiary_eligibility_criteria": ["List de Strings"],
+    "final_recipients": ["List de Strings ou []"],
+    "dnsh_principle": "String ou null",
+    "contact": ["List de Strings — 'Entidade - Responsável: X | Telefone: Y | Email: Z'"],
+    "commitment_requirements": "String ou null",
+    "minimum_investment": "Float ou null",
+    "maximum_investment": "Float ou null"
   },
-  "Beneficiario_Por_Acao": [
-    { "codigo_aviso": "String", "tipo_acao": "String", "entidades": ["List de Strings"] }
+  "BeneficiaryByAction": [
+    { "grant_code": "String", "action_type": "String", "entities": ["List de Strings"] }
   ]
 }
 
@@ -371,39 +371,39 @@ REGRAS CRÍTICAS:
 
 ESQUEMA DE DADOS ESPERADO:
 {
-  "Aviso": {
-    "codigo_aviso": "String",
-    "dotacao_global": "Float ou null",
-    "territorios_baixa_densidade": ["List de strings ou []"],
-    "limites_submissao": "String ou null",
-    "duracao_maxima_meses": "Integer ou null",
-    "data_limite_execucao_absoluta": "YYYY-MM-DDThh:mm:ss ou null",
-    "metas_execucao_financeira": ["List de Strings com marcos percentuais e datas-limite"]
+  "Grant": {
+    "grant_code": "String",
+    "total_allocation": "Float ou null",
+    "low_density_territories": ["List de strings ou []"],
+    "submission_limits": "String ou null",
+    "max_duration_months": "Integer ou null",
+    "absolute_execution_deadline": "YYYY-MM-DDThh:mm:ss ou null",
+    "financial_execution_targets": ["List de Strings com marcos percentuais e datas-limite"]
   },
-  "fases": [
+  "phases": [
     {
-      "codigo_fase": "String (ex: F1)",
-      "codigo_aviso": "String",
-      "nome": "String",
-      "data_inicio": "YYYY-MM-DDThh:mm:ss",
-      "data_fim": "YYYY-MM-DDThh:mm:ss",
-      "condicao_acesso": "String — NUNCA null; usa 'Sem restrição de acesso' se não houver restrição"
+      "phase_code": "String (ex: F1)",
+      "grant_code": "String",
+      "name": "String",
+      "start_date": "YYYY-MM-DDThh:mm:ss",
+      "end_date": "YYYY-MM-DDThh:mm:ss",
+      "access_condition": "String — NUNCA null; usa 'Sem restrição de acesso' se não houver restrição"
     }
   ],
-  "Area_Abrangida": [
+  "CoveredArea": [
     {
-      "codigo_area": "String (ex: A1)",
-      "codigo_aviso": "String",
-      "area_geografica": "String — nome completo com acrónimo, ex: 'Área Metropolitana do Porto (AMP)'"
+      "area_code": "String (ex: A1)",
+      "grant_code": "String",
+      "geographic_area": "String — nome completo com acrónimo, ex: 'Área Metropolitana do Porto (AMP)'"
     }
   ],
-  "Fase_Area": [
+  "PhaseArea": [
     {
-      "codigo_fase": "String — 'GLOBAL' se a tabela territorial não mencionar fases; nunca 'F1' por defeito",
-      "codigo_area": "String",
-      "codigo_aviso": "String",
-      "dotacao_orcamental": "Float ou null",
-      "taxa_financiamento_maxima": "Float ou null"
+      "phase_code": "String — 'GLOBAL' se a tabela territorial não mencionar fases; nunca 'F1' por defeito",
+      "area_code": "String",
+      "grant_code": "String",
+      "budget_allocation": "Float ou null",
+      "max_financing_rate": "Float ou null"
     }
   ]
 }
@@ -502,43 +502,43 @@ REGRAS (CRÍTICO):
 REGRA DE TIPAGEM — CRÍTICO:
    Todos os campos numéricos definidos como Float NO ESQUEMA ABAIXO devem ser escritos
    como números sem aspas. EXEMPLOS OBRIGATÓRIOS:
-   CORRECTO:  "taxa_base": 85.0
-   ERRADO:    "taxa_base": "85.0"
-   CORRECTO:  "taxa_maxima_global": 45.0
-   ERRADO:    "taxa_maxima_global": "45.0"
-   Esta regra aplica-se a: taxa_base, majoracao_regional, taxa_maxima_global,
-   limite_acumulacao_minimis, dotacao_orcamental, taxa_financiamento_maxima,
-   investimento_minimo, investimento_maximo, limite_autofinanciamento_exigido.
+   CORRECTO:  "base_rate": 85.0
+   ERRADO:    "base_rate": "85.0"
+   CORRECTO:  "max_global_rate": 45.0
+   ERRADO:    "max_global_rate": "45.0"
+   Esta regra aplica-se a: base_rate, regional_bonus, max_global_rate,
+   minimis_accumulation_limit, budget_allocation, max_financing_rate,
+   minimum_investment, maximum_investment, required_self_financing_limit.
    NUNCA uses aspas em valores que sejam Float no esquema.
 
 ESQUEMA DE DADOS ESPERADO:
 {
-  "Aviso": {
-    "codigo_aviso": "String",
-    "investimento_minimo": null,
-    "investimento_maximo": null,
-    "limite_autofinanciamento_exigido": null,
-    "regime_auxilio_estado": "String ou null",
-    "artigo_rgbc_aplicavel": "String ou null",
-    "formas_pagamento": ["List de Strings com modalidades e condições detalhadas"],
-    "contacto": ["List de Strings"]
+  "Grant": {
+    "grant_code": "String",
+    "minimum_investment": null,
+    "maximum_investment": null,
+    "required_self_financing_limit": null,
+    "state_aid_regime": "String ou null",
+    "applicable_gber_article": "String ou null",
+    "payment_methods": ["List de Strings com modalidades e condições detalhadas"],
+    "contact": ["List de Strings"]
   },
-  "Taxa_Financiamento": [
+  "FinancingRate": [
     {
-      "codigo_taxa": "String (ex: T1)",
-      "codigo_aviso": "String",
-      "dimensao_empresa": "String (ex: Todos)",
-      "regime_auxilio": "String",
-      "taxa_base": 85.0,
-      "majoracao_regional": null,
-      "taxa_maxima_global": 85.0,
-      "limite_acumulacao_minimis": null,
-      "condicao_especifica": "String ou null"
+      "rate_code": "String (ex: T1)",
+      "grant_code": "String",
+      "company_size": "String (ex: Todos)",
+      "aid_regime": "String",
+      "base_rate": 85.0,
+      "regional_bonus": null,
+      "max_global_rate": 85.0,
+      "minimis_accumulation_limit": null,
+      "specific_condition": "String ou null"
     }
   ]
 }
 
-NOTA: O esquema acima mostra os campos Float SEM aspas (ex: 85.0, não "85.0").
+NOTA: O esquema acima mostra os campos Float SEM aspas (ex: base_rate: 85.0, não "85.0").
 Reproduz exactamente este padrão no output.
 
 CONTACTOS — DEDUPLICAÇÃO OBRIGATÓRIA:
@@ -586,32 +586,32 @@ SÓ depois deste raciocínio escrito produzires o JSON.
 
 ESQUEMA JSON OBRIGATÓRIO:
 {
-  "Aviso": {
-    "codigo_aviso": "String",
-    "criterios_selecao_projeto": ["List de Strings"]
+  "Grant": {
+    "grant_code": "String",
+    "project_selection_criteria": ["List de Strings"]
   },
-  "Metodologia_Avaliacao": [
+  "EvaluationMethodology": [
     {
-      "codigo_avaliacao": "String",
-      "codigo_aviso": "String",
-      "formula_merito_projeto": "String ou null",
-      "pontuacao_minima_global": "Float ou null",
+      "evaluation_code": "String",
+      "grant_code": "String",
+      "project_merit_formula": "String ou null",
+      "min_global_score": "Float ou null",
       "_verificacao": {
         "nivel1": "String — ex: 'A(60.0) + B(40.0) = 100.0 ✓'",
         "nivel2_por_pai": ["String por pai — ex: 'A1(x) + A2(y) = A(60.0) ✓'"],
         "nivel3_por_pai": ["String por pai de nível 3 se existir"],
         "formula_coef": "String — ex: 'coef_A=60.0 ✓  coef_B=40.0 ✓'"
       },
-      "criterios_avaliacao": [
+      "evaluation_criteria": [
         {
-          "codigo_criterio": "String",
-          "descricao": "String",
-          "ponderacao": "Float — valor ABSOLUTO em percentagem",
-          "pontuacao_minima": "Float ou null — preenche quando existe nota de exclusão",
-          "pontuacao_minima_criterio_exclusao": "Boolean — true se critério de exclusão, false caso contrário"
+          "criterion_code": "String",
+          "description": "String",
+          "weight": "Float — valor ABSOLUTO em percentagem",
+          "min_score": "Float ou null — preenche quando existe nota de exclusão",
+          "is_exclusion_criterion": "Boolean — true se critério de exclusão, false caso contrário"
         }
       ],
-      "criterios_desempate": ["List de Strings"]
+      "tiebreaker_criteria": ["List de Strings"]
     }
   ]
 }
@@ -757,64 +757,64 @@ Objetivo: Extrair despesas, limites e INDICADORES OFICIAIS.
 
 ESQUEMA JSON OBRIGATÓRIO:
 {
-  "Aviso": {
-    "codigo_aviso": "String",
-    "despesas_elegiveis": ["List de Strings"],
-    "despesas_nao_elegiveis": ["List de Strings"],
-    "indicadores_realizacao": [
+  "Grant": {
+    "grant_code": "String",
+    "eligible_expenses": ["List de Strings"],
+    "ineligible_expenses": ["List de Strings"],
+    "output_indicators": [
       {
-        "codigo_indicador": "String",
-        "descricao": "String",
-        "unidade_medida": "String ou null",
-        "meta": "String ou null",
-        "metodo_calculo": "String ou null"
+        "indicator_code": "String",
+        "description": "String",
+        "unit_of_measure": "String ou null",
+        "target": "String ou null",
+        "calculation_method": "String ou null"
       }
     ],
-    "indicadores_resultados": [
+    "result_indicators": [
       {
-        "codigo_indicador": "String",
-        "descricao": "String",
-        "unidade_medida": "String ou null",
-        "meta": "String ou null",
-        "metodo_calculo": "String ou null"
+        "indicator_code": "String",
+        "description": "String",
+        "unit_of_measure": "String ou null",
+        "target": "String ou null",
+        "calculation_method": "String ou null"
       }
     ],
-    "indicadores_acompanhamento": [
+    "monitoring_indicators": [
       {
-        "codigo_indicador": "String",
-        "descricao": "String",
-        "unidade_medida": "String ou null",
-        "meta": "String ou null",
-        "metodo_calculo": "String ou null"
+        "indicator_code": "String",
+        "description": "String",
+        "unit_of_measure": "String ou null",
+        "target": "String ou null",
+        "calculation_method": "String ou null"
       }
     ],
-    "obrigacoes_beneficiarios": ["List de Strings ou []"],
-    "obrigacoes_comunicacao": ["List de Strings ou []"]
+    "beneficiary_obligations": ["List de Strings ou []"],
+    "communication_obligations": ["List de Strings ou []"]
   },
-  "Limite_Despesa": [
+  "ExpenseLimit": [
     {
-      "codigo_limite": "String",
-      "codigo_aviso": "String",
-      "rubrica_despesa": "String",
-      "metodologia_ocs_aplicavel": "String",
-      "valor_maximo_absoluto": "Float ou null",
-      "valor_maximo_percentual": "Float ou null",
-      "base_calculo": "String ou null",
-      "condicoes_especifica": "String ou null"
+      "limit_code": "String",
+      "grant_code": "String",
+      "expense_category": "String",
+      "applicable_ocs_methodology": "String",
+      "max_absolute_value": "Float ou null",
+      "max_percentage_value": "Float ou null",
+      "calculation_base": "String ou null",
+      "specific_conditions": "String ou null"
     }
   ],
-  "Penalizacao_Incumprimento": [
+  "NonCompliancePenalty": [
     {
-      "codigo_penalizacao": "String",
-      "codigo_aviso": "String",
-      "tipo_indicadores": "String ou null",
-      "formula_grau_cumprimento": "String ou null — fórmula de cálculo do GC, ex: 'GC = (valor realizado / meta) × 100'",
-      "limiar_tolerancia_geral": "Float ou null",
-      "limiar_tolerancia_baixa_densidade": "Float ou null",
-      "reducao_por_ponto_percentual": "Float ou null",
-      "penalizacao_maxima_percentual": "Float ou null",
-      "limiar_revogacao_financiamento": "Float ou null",
-      "descricao_regra": "String"
+      "penalty_code": "String",
+      "grant_code": "String",
+      "indicator_types": "String ou null",
+      "compliance_grade_formula": "String ou null — fórmula de cálculo do GC, ex: 'GC = (valor realizado / meta) × 100'",
+      "general_tolerance_threshold": "Float ou null",
+      "low_density_tolerance_threshold": "Float ou null",
+      "reduction_per_percentage_point": "Float ou null",
+      "max_penalty_percentage": "Float ou null",
+      "financing_revocation_threshold": "Float ou null",
+      "rule_description": "String"
     }
   ]
 }
@@ -950,10 +950,10 @@ Objetivo: Extrair a lista EXAUSTIVA de documentos de candidatura.
 
 ESQUEMA JSON OBRIGATÓRIO:
 {
-  "Aviso": {
-    "codigo_aviso": "String",
-    "documentos_candidatura": [
-      { "nome": "String", "obrigatorio": "Boolean", "tipo_documento": "String (Geral ou Técnico)", "prova_maturidade": "Boolean", "restricoes_formato_anexo_tecnico": "String ou null" }
+  "Grant": {
+    "grant_code": "String",
+    "application_documents": [
+      { "name": "String", "mandatory": "Boolean", "document_type": "String (Geral ou Técnico)", "maturity_proof": "Boolean", "technical_annex_format_restrictions": "String ou null" }
     ]
   }
 }
@@ -1056,7 +1056,7 @@ CAMPOS A ENRIQUECER COM OS ANEXOS:
    Se encontrares diplomas em falta, inclui a lista COMPLETA (existentes + novos).
    Se já estiver completa e correcta, NÃO a incluas no output.
 
-2. `Area_Abrangida` + `Fase_Area` — Se receberes um Anexo com delimitação territorial
+2. `CoveredArea` + `PhaseArea` — Se receberes um Anexo com delimitação territorial
    (ex: "Anexo A-4 — Delimitação geográfica ITI" ou similar):
 
    PASSO 1 — extrai o nível de detalhe máximo disponível:
@@ -1065,23 +1065,23 @@ CAMPOS A ENRIQUECER COM OS ANEXOS:
    - Se listar CIM/AMP: 1 entrada por CIM/AMP.
 
    PASSO 2 — atribui códigos sequenciais OBRIGATÓRIOS:
-   Cada entrada de `Area_Abrangida` DEVE ter `codigo_area` preenchido: "A1", "A2", "A3"...
-   NUNCA deixas `codigo_area: null`.
+   Cada entrada de `CoveredArea` DEVE ter `area_code` preenchido: "A1", "A2", "A3"...
+   NUNCA deixas `area_code: null`.
 
-   PASSO 3 — constrói `Fase_Area` usando os mesmos códigos:
-   Para cada area (A1, A2, A3...), cria uma entrada em `Fase_Area` com:
-   - `codigo_area`: o mesmo código que atribuíste em `Area_Abrangida` (ex: "A1")
-   - `codigo_fase`: "GLOBAL" (se não houver fases distintas por área)
-   - `dotacao_orcamental`: valor se especificado por área, caso contrário null
-   - `taxa_financiamento_maxima`: taxa aplicável
+   PASSO 3 — constrói `PhaseArea` usando os mesmos códigos:
+   Para cada area (A1, A2, A3...), cria uma entrada em `PhaseArea` com:
+   - `area_code`: o mesmo código que atribuíste em `CoveredArea` (ex: "A1")
+   - `phase_code`: "GLOBAL" (se não houver fases distintas por área)
+   - `budget_allocation`: valor se especificado por área, caso contrário null
+   - `max_financing_rate`: taxa aplicável
 
-   REGRA DE CONSISTÊNCIA: os `codigo_area` em `Fase_Area` DEVEM corresponder exactamente
-   aos `codigo_area` em `Area_Abrangida`. Um código em `Fase_Area` sem par em `Area_Abrangida`
+   REGRA DE CONSISTÊNCIA: os `area_code` em `PhaseArea` DEVEM corresponder exactamente
+   aos `area_code` em `CoveredArea`. Um código em `PhaseArea` sem par em `CoveredArea`
    é um erro.
 
    Se o Anexo não trouxer nova informação territorial, NÃO incluas estes campos.
 
-3. `Metodologia_Avaliacao` — Se receberes o Anexo com a grelha de avaliação
+3. `EvaluationMethodology` — Se receberes o Anexo com a grelha de avaliação
    (ex: "Referencial de Mérito", "Grelha de Avaliação", "Critérios de Seleção"),
    substitui SEMPRE a lista existente — pode ter sub-critérios em falta ou pesos errados.
    Extrai TODOS os subcritérios (A1, A2, B1, B2, C1, D1, D2...) com pesos correctos:
@@ -1105,16 +1105,16 @@ CAMPOS A ENRIQUECER COM OS ANEXOS:
 7. `setores_tecnologicos_alvo` — Inclui a lista COMPLETA (existentes + novos) APENAS se
    encontrares domínios adicionais mencionados nos Anexos de critérios (RIS3, EREI).
 
-8. `Taxa_Financiamento` — Se um Anexo contiver tabela de taxas de financiamento por dimensão
+8. `FinancingRate` — Se um Anexo contiver tabela de taxas de financiamento por dimensão
    de empresa ou por região que não esteja já correcta, inclui a lista COMPLETA actualizada.
-   Cada entrada: { "dimensao_empresa": "...", "taxa_base": 0.0, "majoracao_regional": 0.0,
-   "taxa_maxima_global": 0.0, "limite_acumulacao_minimis": 0.0 }.
+   Cada entrada: { "company_size": "...", "base_rate": 0.0, "regional_bonus": 0.0,
+   "max_global_rate": 0.0, "minimis_accumulation_limit": 0.0 }.
    Se já estiver correcta, NÃO a incluas no output.
 
-9. `Limite_Despesa` — Se um Anexo de elegibilidade de despesa contiver limites por rubrica
+9. `ExpenseLimit` — Se um Anexo de elegibilidade de despesa contiver limites por rubrica
    não capturados, inclui a lista COMPLETA (existentes + novos).
-   Cada entrada: { "rubrica": "...", "limite_valor": 0.0, "limite_percentual": 0.0,
-   "base_calculo": "..." }.
+   Cada entrada: { "expense_category": "...", "max_absolute_value": 0.0, "max_percentage_value": 0.0,
+   "calculation_base": "..." }.
    Se já estiver correcta, NÃO a incluas no output.
 
 10. CAMPOS VAZIOS DO CORPO DO DOCUMENTO — recebeste a lista "CAMPOS VAZIOS A TENTAR PREENCHER".
@@ -1124,30 +1124,30 @@ CAMPOS A ENRIQUECER COM OS ANEXOS:
     Se não encontrares informação suficiente para um campo, não o incluas no output.
 
 CAMPOS QUE NUNCA INCLUIS NO OUTPUT:
-   `codigo_aviso`, `data_publicacao`, `dotacao_global`,
-   `indicadores_realizacao`, `indicadores_resultados`, `Penalizacao_Incumprimento`,
+   `grant_code`, `publication_date`, `total_allocation`,
+   `output_indicators`, `result_indicators`, `NonCompliancePenalty`,
    e qualquer campo escalar correcto já preenchido.
 
 ANTI-TRUNCAGEM: Nunca abrevias com "..." — copia sempre o texto completo.
 
 OUTPUT: Devolve APENAS os campos alterados, usando exactamente os mesmos nomes de campos
 e tipos de valores que estão no JSON que recebeste:
-- Campos que pertencem ao objecto `Aviso` no JSON recebido → coloca-os dentro de `alteracoes.Aviso`
-- Arrays de topo no JSON recebido (ex: `Area_Abrangida`, `Metodologia_Avaliacao`, etc.) → coloca-os directamente em `alteracoes`
+- Campos que pertencem ao objecto `Grant` no JSON recebido → coloca-os dentro de `changes.Grant`
+- Arrays de topo no JSON recebido (ex: `CoveredArea`, `EvaluationMethodology`, etc.) → coloca-os directamente em `changes`
 {
-  "alteracoes": {
-    "Aviso": { ... apenas campos de Aviso alterados ... },
+  "changes": {
+    "Grant": { ... apenas campos de Grant alterados ... },
     "<array_de_topo_alterado>": [ ... lista completa actualizada ... ]
   }
 }
 Omite completamente qualquer chave que não tenha sido alterada.
-Se não houver nada a alterar, devolve: {"alteracoes": {}}
+Se não houver nada a alterar, devolve: {"changes": {}}
 
-Inclui sempre também a chave `nao_capturado`: lista de títulos/temas que encontraste
+Inclui sempre também a chave `not_captured`: lista de títulos/temas que encontraste
 nos Anexos mas que NÃO fazem parte da lista fechada acima.
 Apenas o título ou tema em 1 linha — sem conteúdo detalhado.
 Ex: ["Anexo C — Critérios de elegibilidade de operações", "Tabela de penalizações por atraso"]
-Se não encontrares nada fora da lista fechada: `"nao_capturado": []`
+Se não encontrares nada fora da lista fechada: `"not_captured": []`
 """
 
 # Router — classifica chunks sem categoria
@@ -1166,23 +1166,23 @@ ROUTER_SYSTEM = (
 
 
 def build_messages_from_chunks(system_prompt: str, chunks: list[dict]) -> list[dict]:
-    """Constrói mensagens com contexto de chunks semânticos (1 chunk = 1 secção completa)."""
+    """Builds messages with semantic chunk context (1 chunk = 1 complete section)."""
     if not chunks:
         context = "(Sem secções relevantes encontradas para este tema.)"
     else:
-        partes = []
+        parts = []
         for c in chunks:
-            secao     = c.get("secao") or c.get("titulo", "")
-            categoria = c.get("categoria", "")
-            pags      = ""
-            p_ini     = c.get("pagina_inicio") or 0
-            p_fim     = c.get("pagina_fim") or 0
-            if p_ini:
-                pags = f" — pág. {p_ini}" if p_ini == p_fim else f" — págs. {p_ini}–{p_fim}"
-            partes.append(
-                f"### {secao} [{categoria}{pags}]\n\n{c['texto']}"
+            section  = c.get("section") or c.get("title", "")
+            category = c.get("category", "")
+            pages    = ""
+            p_start  = c.get("page_start") or 0
+            p_end    = c.get("page_end") or 0
+            if p_start:
+                pages = f" — pág. {p_start}" if p_start == p_end else f" — págs. {p_start}–{p_end}"
+            parts.append(
+                f"### {section} [{category}{pages}]\n\n{c['text']}"
             )
-        context = "\n\n---\n\n".join(partes)
+        context = "\n\n---\n\n".join(parts)
 
     suffix = "\n\nResponde apenas com um objeto json válido."
     return [

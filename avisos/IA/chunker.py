@@ -31,15 +31,15 @@ def load_mapping(config_path: Path | str | None = None) -> tuple[dict, dict]:
 MAPEAMENTO, CATEGORIA_PARA_PROMPTS = load_mapping()
 
 
-def _cats(prompt: str) -> frozenset[str]:
+def _get_prompt_categories(prompt: str) -> frozenset[str]:
     return frozenset(cat for cat, prompts in CATEGORIA_PARA_PROMPTS.items() if prompt in prompts.split(","))
 
-CATS_P1 = _cats("P1")
-CATS_P2 = _cats("P2")
-CATS_P3 = _cats("P3")
-CATS_P4 = _cats("P4")
-CATS_P5 = _cats("P5")
-CATS_P6 = _cats("P6")
+CATS_P1 = _get_prompt_categories("P1")
+CATS_P2 = _get_prompt_categories("P2")
+CATS_P3 = _get_prompt_categories("P3")
+CATS_P4 = _get_prompt_categories("P4")
+CATS_P5 = _get_prompt_categories("P5")
+CATS_P6 = _get_prompt_categories("P6")
 
 _chunker = HierarchicalChunker()
 
@@ -69,54 +69,54 @@ _ACAO_LABEL_PATTERN = re.compile(
 
 
 def _hard_split(
-    texto: str,
-    titulo: str,
-    codigo_aviso: str,
-    fonte: str,
-    categoria: str,
-    prompt_origem: str,
-    pagina_inicio: int,
-    pagina_fim: int,
+    text: str,
+    title: str,
+    grant_code: str,
+    source: str,
+    category: str,
+    prompt_source: str,
+    page_start: int,
+    page_end: int,
 ) -> list[dict]:
-    blocos = _HARD_SPLIT_PATTERN.split(texto)
-    if len(blocos) <= 1:
+    blocks = _HARD_SPLIT_PATTERN.split(text)
+    if len(blocks) <= 1:
         return []
 
-    resultado: list[dict] = []
-    for bloco in blocos:
-        bloco = bloco.strip()
-        if len(bloco) < 30:
+    result: list[dict] = []
+    for block in blocks:
+        block = block.strip()
+        if len(block) < 30:
             continue
 
-        match = _ACAO_LABEL_PATTERN.search(bloco)
+        match = _ACAO_LABEL_PATTERN.search(block)
         label = match.group(1).strip().upper() if match else "CONTEXTO GERAL"
 
-        texto_enriquecido = (
-            f"DOCUMENTO: {codigo_aviso}\n"
-            f"SECÇÃO PAI: {titulo}\n"
+        enriched_text = (
+            f"DOCUMENTO: {grant_code}\n"
+            f"SECÇÃO PAI: {title}\n"
             f"APLICAÇÃO: {label}\n"
             f"---\n"
-            f"{bloco}"
+            f"{block}"
         )
 
-        resultado.append({
-            "titulo":        f"{titulo} — {label}",
-            "secao":         titulo,
-            "categoria":     categoria,
-            "prompt_origem": prompt_origem,
-            "codigo_aviso":  codigo_aviso,
-            "fonte":         fonte,
-            "pagina_inicio": pagina_inicio,
-            "pagina_fim":    pagina_fim,
-            "is_anexo":      "anexo" in normalize_text(titulo),
-            "texto":         texto_enriquecido,
+        result.append({
+            "title":         f"{title} — {label}",
+            "section":       title,
+            "category":      category,
+            "prompt_source": prompt_source,
+            "grant_code":    grant_code,
+            "source":        source,
+            "page_start":    page_start,
+            "page_end":      page_end,
+            "is_annex":      "anexo" in normalize_text(title),
+            "text":          enriched_text,
         })
 
-    return resultado
+    return result
 
 
 # ---------------------------------------------------------------------------
-# _get_anexo_categoria — REESCRITA COMPLETA
+# _get_annex_category — REESCRITA COMPLETA
 # Problema original: mapeamento por letra do Anexo era frágil e errava:
 #   - Anexo A-3 (RIS3) -> criterios_indicadores (devia ser ignorar)
 #   - Anexo A-4 (Grelha) -> documentos_requisitos (devia ser criterios_indicadores)
@@ -148,7 +148,7 @@ _ANEXO_CONTENT_RULES: list[tuple[re.Pattern, str]] = [
 ]
 
 
-def _get_anexo_categoria(header: str) -> str | None:
+def _get_annex_category(header: str) -> str | None:
     """
     Classifica anexos EXCLUSIVAMENTE pelo conteúdo semântico do título.
     Não usa a letra do Anexo como critério — isso é frágil e varia por aviso.
@@ -160,9 +160,9 @@ def _get_anexo_categoria(header: str) -> str | None:
     if not (h_norm.startswith("anexo") or h_norm.startswith("annex")):
         return None
 
-    for pattern, categoria in _ANEXO_CONTENT_RULES:
+    for pattern, cat in _ANEXO_CONTENT_RULES:
         if pattern.search(h_norm):
-            return categoria
+            return cat
 
     # Sem match semântico: retorna None e deixa o mapeamento geral decidir
     # (melhor do que assumir uma categoria errada por letra)
@@ -170,7 +170,7 @@ def _get_anexo_categoria(header: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# mapear_categoria — CORRIGIDA
+# map_category — CORRIGIDA
 # Problema original: iteração em ordem de inserção do dict, com keywords
 # genéricas (ex: "enquadramento", "norma", "calendário") aparecendo em
 # categorias de índice menor e ganhando sobre keywords específicas em
@@ -178,7 +178,7 @@ def _get_anexo_categoria(header: str) -> str | None:
 # Solução: match pelo comprimento da keyword (mais longa = mais específica).
 # ---------------------------------------------------------------------------
 
-def mapear_categoria(titulo: str, conteudo: str = "") -> str:
+def map_category(title: str, content: str = "") -> str:
     """
     Classifica um chunk pela keyword mais longa (mais específica) que faça match,
     em vez da primeira que fizer match por ordem de inserção no dict.
@@ -187,36 +187,33 @@ def mapear_categoria(titulo: str, conteudo: str = "") -> str:
       - "norma" (legislacao) vs "normas técnicas" (operacoes_elegibilidade)
       - "calendário" (financiamento_dotacao) vs "calendário de candidaturas" (processo_decisao)
     """
-    anexo_cat = _get_anexo_categoria(titulo)
-    if anexo_cat:
-        return anexo_cat
+    annex_cat = _get_annex_category(title)
+    if annex_cat:
+        return annex_cat
 
-    titulo_n = normalize(titulo)
+    title_n = normalize(title)
 
-    # Recolher TODOS os matches com o comprimento da keyword
-    matches: list[tuple[int, str]] = []  # (len_keyword, categoria)
-    for categoria, palavras in MAPEAMENTO.items():
-        for p in palavras:
-            p_n = normalize(p)
-            if p_n and p_n in titulo_n:
-                matches.append((len(p_n), categoria))
+    matches: list[tuple[int, str]] = []
+    for category, keywords in MAPEAMENTO.items():
+        for kw in keywords:
+            kw_n = normalize(kw)
+            if kw_n and kw_n in title_n:
+                matches.append((len(kw_n), category))
 
     if matches:
-        # Vence a keyword mais longa (mais específica)
         matches.sort(key=lambda x: x[0], reverse=True)
         return matches[0][1]
 
-    # Fallback: conteúdo dos primeiros 400 chars — só frases multi-palavra
-    if conteudo:
-        conteudo_n = normalize(conteudo[:400])
+    if content:
+        content_n = normalize(content[:400])
         content_matches: list[tuple[int, str]] = []
-        for categoria, palavras in MAPEAMENTO.items():
-            if categoria == "ignorar":
+        for category, keywords in MAPEAMENTO.items():
+            if category == "ignorar":
                 continue
-            for p in palavras:
-                p_n = normalize(p)
-                if p_n and p_n in conteudo_n:
-                    content_matches.append((len(p_n), categoria))
+            for kw in keywords:
+                kw_n = normalize(kw)
+                if kw_n and kw_n in content_n:
+                    content_matches.append((len(kw_n), category))
         if content_matches:
             content_matches.sort(key=lambda x: x[0], reverse=True)
             return content_matches[0][1]
@@ -236,10 +233,10 @@ def _pages_from_doc_items(doc_items: list[Any]) -> tuple[int, int]:
     return (min(pages), max(pages))
 
 
-def chunk_por_headers(
+def chunk_by_headers(
     doc: Any,
-    codigo_aviso: str,
-    fonte: str,
+    grant_code: str,
+    source: str,
 ) -> list[dict]:
     """
     Usa HierarchicalChunker para criar 1 chunk por secção do DoclingDocument.
@@ -254,40 +251,40 @@ def chunk_por_headers(
         groups[key].append(raw)
 
     chunks: list[dict] = []
-    categoria_ativa = "outros"
+    active_category = "outros"
 
     for key, raw_list in groups.items():
-        titulo = " > ".join(key[-2:]) if len(key) >= 2 else key[-1]
+        title = " > ".join(key[-2:]) if len(key) >= 2 else key[-1]
 
         texts = [rc.text for rc in raw_list if rc.text and rc.text.strip()]
-        texto = _clean_ocr("\n\n".join(texts))
+        text = _clean_ocr("\n\n".join(texts))
 
-        categoria_detectada = mapear_categoria(titulo, texto)
+        detected_category = map_category(title, text)
 
-        if categoria_detectada == "ignorar":
+        if detected_category == "ignorar":
             continue
 
-        if categoria_detectada != "outros":
-            categoria_ativa = categoria_detectada
+        if detected_category != "outros":
+            active_category = detected_category
 
-        if len(texto) < 30:
+        if len(text) < 30:
             continue
 
         all_doc_items = [item for rc in raw_list for item in rc.meta.doc_items]
-        pagina_inicio, pagina_fim = _pages_from_doc_items(all_doc_items)
+        page_start, page_end = _pages_from_doc_items(all_doc_items)
 
-        primary_cat = categoria_detectada if categoria_detectada != "outros" else categoria_ativa
+        primary_cat = detected_category if detected_category != "outros" else active_category
 
-        if categoria_detectada == "outros":
-            print(f"[herdado -> {primary_cat}]: '{titulo[:50]}'")
+        if detected_category == "outros":
+            print(f"[herdado -> {primary_cat}]: '{title[:50]}'")
 
-        prompt_origem = CATEGORIA_PARA_PROMPTS.get(primary_cat, "")
+        prompt_source = CATEGORIA_PARA_PROMPTS.get(primary_cat, "")
 
-        if primary_cat in _HARD_SPLIT_CATEGORIAS and len(texto) >= _HARD_SPLIT_MIN_CHARS:
+        if primary_cat in _HARD_SPLIT_CATEGORIAS and len(text) >= _HARD_SPLIT_MIN_CHARS:
             sub = _hard_split(
-                texto=texto, titulo=titulo, codigo_aviso=codigo_aviso, fonte=fonte,
-                categoria=primary_cat, prompt_origem=prompt_origem,
-                pagina_inicio=pagina_inicio, pagina_fim=pagina_fim,
+                text=text, title=title, grant_code=grant_code, source=source,
+                category=primary_cat, prompt_source=prompt_source,
+                page_start=page_start, page_end=page_end,
             )
             if sub:
                 for sc in sub:
@@ -296,17 +293,17 @@ def chunk_por_headers(
                 continue
 
         chunks.append({
-            "titulo":        titulo,
-            "secao":         titulo,
-            "categoria":     primary_cat,
-            "prompt_origem": prompt_origem,
-            "codigo_aviso":  codigo_aviso,
-            "fonte":         fonte,
+            "title":         title,
+            "section":       title,
+            "category":      primary_cat,
+            "prompt_source": prompt_source,
+            "grant_code":    grant_code,
+            "source":        source,
             "chunk_index":   len(chunks),
-            "pagina_inicio": pagina_inicio,
-            "pagina_fim":    pagina_fim,
-            "is_anexo":      "anexo" in normalize_text(titulo),
-            "texto":         texto,
+            "page_start":    page_start,
+            "page_end":      page_end,
+            "is_annex":      "anexo" in normalize_text(title),
+            "text":          text,
         })
 
     return chunks

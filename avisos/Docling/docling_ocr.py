@@ -25,23 +25,22 @@ _OCR_PATTERNS = [
 _TABLE_REPAIR = re.compile(r'(\|[^\n]+)\n{2,}(\|)', re.MULTILINE)
 
 
-def _clean_ocr(texto: str) -> str:
-    texto = _normalizar_monetarios(texto)
+def _clean_ocr(text: str) -> str:
+    text = _normalize_monetary(text)
     for pattern, repl in _OCR_PATTERNS:
-        texto = pattern.sub(repl, texto)
-    # Colapsa espaços duplos dentro de cada linha (artefacto de texto justificado)
-    texto = re.sub(r'(?<!\n) {2,}(?!\n)', ' ', texto)
+        text = pattern.sub(repl, text)
+    text = re.sub(r'(?<!\n) {2,}(?!\n)', ' ', text)
     prev = None
-    while prev != texto:
-        prev = texto
-        texto = _TABLE_REPAIR.sub(r'\1\n\2', texto)
-    texto = re.sub(r'\n{3,}', '\n\n', texto)
-    return texto.strip()
+    while prev != text:
+        prev = text
+        text = _TABLE_REPAIR.sub(r'\1\n\2', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
-def _normalizar_monetarios(texto: str) -> str:
-    texto = _NM_PATTERNS[0].sub(r'\1.\2', texto)
+def _normalize_monetary(text: str) -> str:
+    text = _NM_PATTERNS[0].sub(r'\1.\2', text)
     for _ in range(3):
-        texto = _NM_PATTERNS[1].sub(r'\1.\2', texto)
-        texto = _NM_PATTERNS[2].sub(r'\1.\2', texto)
-        texto = _NM_PATTERNS[3].sub(r'\1.\2', texto)
-    return texto
+        text = _NM_PATTERNS[1].sub(r'\1.\2', text)
+        text = _NM_PATTERNS[2].sub(r'\1.\2', text)
+        text = _NM_PATTERNS[3].sub(r'\1.\2', text)
+    return text

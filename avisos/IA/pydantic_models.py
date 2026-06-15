@@ -93,219 +93,218 @@ class _Base(BaseModel):
 
 # Sub-modelos reutilizáveis
 class Indicador(_Base):
-    codigo_indicador: CoercedStr   = None
-    descricao:        CoercedStr   = None
-    unidade_medida:   CoercedStr   = None
-    meta:             CoercedStr   = None
-    metodo_calculo:   CoercedStr   = None
+    indicator_code: CoercedStr   = Field(default=None, alias="codigo_indicador")
+    description:    CoercedStr   = Field(default=None, alias="descricao")
+    unit_of_measure: CoercedStr  = Field(default=None, alias="unidade_medida")
+    target:         CoercedStr   = Field(default=None, alias="meta")
+    calculation_method: CoercedStr = Field(default=None, alias="metodo_calculo")
 
 
 class DocumentoRegulamentacao(_Base):
-    nome: CoercedStr = None
+    name: CoercedStr = Field(default=None, alias="nome")
     url:  CoercedStr = None
 
 
-class DocumentoCandidatura(_Base):
-    nome:                              CoercedStr  = None
-    obrigatorio:                       CoercedBool = None
-    tipo_documento:                    CoercedStr  = None
-    prova_maturidade:                  CoercedBool = None
-    restricoes_formato_anexo_tecnico:  CoercedStr  = None
+class ApplicationDocument(_Base):
+    name:                              CoercedStr  = Field(default=None, alias="nome")
+    mandatory:                         CoercedBool = Field(default=None, alias="obrigatorio")
+    document_type:                     CoercedStr  = Field(default=None, alias="tipo_documento")
+    maturity_proof:                    CoercedBool = Field(default=None, alias="prova_maturidade")
+    technical_annex_format_restrictions: CoercedStr = Field(default=None, alias="restricoes_formato_anexo_tecnico")
 
 
 class OrganismoIntermedio(_Base):
-    nome:        CoercedStr = None
-    nif:         CoercedStr = None
-    competencias: CoercedStr = None
-
-
-
-# Entidades finais
-class Aviso(_Base):
-    # P1 — identificação
-    codigo_aviso:                         CoercedStr   = None
-    titulo:                               CoercedStr   = None
-    programa_financiador:                 CoercedStr   = None
-    entidade_gestora:                     CoercedStr   = None
-    data_publicacao:                      CoercedStr   = None
-    data_republicacao:                    CoercedStr   = None
-    ultima_republicacao:                  CoercedStr   = None
-    data_alteracao:                       CoercedStr   = None
-    modalidade_aviso:                     CoercedStr   = None
-    objetivo:                             CoercedStr   = None
-    nome_fundo:                           CoercedStr   = None
-    prioridade_programa:                  CoercedStr   = None
-    tipo_intervencao_codigo:              CoercedStr   = None
-    duracao_maxima_meses:                 CoercedInt   = None
-    caes_elegiveis:                       CoercedList  = Field(default_factory=list)
-    regioes_admissiveis:                  CoercedList  = Field(default_factory=list)
-    data_inicio_elegibilidade_despesa:    CoercedStr   = None
-    objetivo_especifico:                  CoercedStr   = None
-    tipologia_operacao:                   CoercedStr   = None
-    acoes_abrangidas:                     CoercedStr   = None
-    organismos_intermedios:               list[OrganismoIntermedio] = Field(default_factory=list)
-    legislacao_aplicavel:                 CoercedList  = Field(default_factory=list)
-    documentos_regulamentacao:            list[DocumentoRegulamentacao] = Field(default_factory=list)
-    setores_tecnologicos_alvo:            CoercedList  = Field(default_factory=list)
-    submissao_candidaturas:               CoercedStr   = None
-    criterios_elegibilidade_beneficiario: CoercedList  = Field(default_factory=list)
-    destinatarios_finais:                 CoercedList  = Field(default_factory=list)
-    principio_dnsh:                       CoercedStr   = None
-    requisitos_compromisso:               CoercedStr   = None
-    # P2 — território e execução
-    dotacao_global:                       CoercedFloat = None
-    territorios_baixa_densidade:          CoercedList  = Field(default_factory=list)
-    limites_submissao:                    CoercedStr   = None
-    data_limite_execucao_absoluta:        CoercedStr   = None
-    metas_execucao_financeira:            CoercedList  = Field(default_factory=list)
-    # P3 — financeiro
-    investimento_minimo:                  CoercedFloat = None
-    investimento_maximo:                  CoercedFloat = None
-    limite_autofinanciamento_exigido:     CoercedFloat = None
-    regime_auxilio_estado:                CoercedStr   = None
-    artigo_rgbc_aplicavel:                CoercedStr   = None
-    contacto:                             CoercedList  = Field(default_factory=list)
-    formas_pagamento:                     CoercedList  = Field(default_factory=list)
-    # P4 — avaliação
-    criterios_selecao_projeto:            CoercedList  = Field(default_factory=list)
-    # P5 — despesas e indicadores
-    despesas_elegiveis:                   CoercedList  = Field(default_factory=list)
-    despesas_nao_elegiveis:               CoercedList  = Field(default_factory=list)
-    indicadores_realizacao:               list[Indicador] = Field(default_factory=list)
-    indicadores_resultados:               list[Indicador] = Field(default_factory=list)
-    indicadores_acompanhamento:           list[Indicador] = Field(default_factory=list)
-    obrigacoes_beneficiarios:             CoercedList  = Field(default_factory=list)
-    obrigacoes_comunicacao:               CoercedList  = Field(default_factory=list)
-    # P6 — documentos
-    documentos_candidatura:               list[DocumentoCandidatura] = Field(default_factory=list)
-    # P7 — temas dos Anexos não capturados
-    aprofundar:                           CoercedList  = Field(default_factory=list)
-
-
-class BeneficiarioPorAcao(_Base):
-    codigo_aviso: CoercedStr  = None
-    tipo_acao:    CoercedStr  = None
-    entidades:    CoercedList = Field(default_factory=list)
-
-
-class TaxaFinanciamento(_Base):
-    codigo_taxa:               CoercedStr   = None
-    codigo_aviso:              CoercedStr   = None
-    dimensao_empresa:          CoercedStr   = None
-    regime_auxilio:            CoercedStr   = None
-    taxa_base:                 CoercedStr   = None
-    majoracao_regional:        CoercedStr   = None
-    taxa_maxima_global:        CoercedStr   = None
-    limite_acumulacao_minimis: CoercedFloat = None
-    condicao_especifica:       CoercedStr   = None
-
-
-class LimiteDespesa(_Base):
-    codigo_limite:            CoercedStr   = None
-    codigo_aviso:             CoercedStr   = None
-    rubrica_despesa:          CoercedStr   = None
-    metodologia_ocs_aplicavel: CoercedStr  = None
-    valor_maximo_absoluto:    CoercedFloat = None
-    valor_maximo_percentual:  CoercedFloat = None
-    base_calculo:             CoercedStr   = None
-    condicoes_especifica:     CoercedStr   = None
-
-
-class PenalizacaoIncumprimento(_Base):
-    codigo_penalizacao:                CoercedStr   = None
-    codigo_aviso:                      CoercedStr   = None
-    tipo_indicadores:                  CoercedStr   = None
-    formula_grau_cumprimento:          CoercedStr   = None
-    limiar_tolerancia_geral:           CoercedFloat = None
-    limiar_tolerancia_baixa_densidade: CoercedFloat = None
-    reducao_por_ponto_percentual:      CoercedFloat = None
-    penalizacao_maxima_percentual:     CoercedFloat = None
-    limiar_revogacao_financiamento:    CoercedFloat = None
-    descricao_regra:                   CoercedStr   = None
+    name:         CoercedStr = Field(default=None, alias="nome")
+    tax_id:       CoercedStr = Field(default=None, alias="nif")
+    competencies: CoercedStr = Field(default=None, alias="competencias")
 
 
 class CriterioAvaliacao(_Base):
-    codigo_criterio:                   CoercedStr   = None
-    descricao:                         CoercedStr   = None
-    ponderacao:                        CoercedFloat = None
-    pontuacao_minima:                  CoercedFloat = None
-    pontuacao_minima_criterio_exclusao: Optional[bool] = None
+    criterion_code:              CoercedStr   = Field(default=None, alias="codigo_criterio")
+    description:                 CoercedStr   = Field(default=None, alias="descricao")
+    weight:                      CoercedFloat = Field(default=None, alias="ponderacao")
+    min_score:                   CoercedFloat = Field(default=None, alias="pontuacao_minima")
+    is_exclusion_criterion:      Optional[bool] = Field(default=None, alias="pontuacao_minima_criterio_exclusao")
 
 
-class MetodologiaAvaliacao(_Base):
-    codigo_avaliacao:        CoercedStr   = None
-    codigo_aviso:            CoercedStr   = None
-    formula_merito_projeto:  CoercedStr   = None
-    pontuacao_minima_global: CoercedFloat = None
-    criterios_avaliacao:     list[CriterioAvaliacao] = Field(default_factory=list)
-    criterios_desempate:     CoercedList  = Field(default_factory=list)
+# Entidades finais
+class Grant(_Base):
+    # P1 — identificação
+    grant_code:                          CoercedStr   = Field(default=None, alias="codigo_aviso")
+    title:                               CoercedStr   = Field(default=None, alias="titulo")
+    financing_program:                   CoercedStr   = Field(default=None, alias="programa_financiador")
+    managing_entity:                     CoercedStr   = Field(default=None, alias="entidade_gestora")
+    publication_date:                    CoercedStr   = Field(default=None, alias="data_publicacao")
+    republication_date:                  CoercedStr   = Field(default=None, alias="data_republicacao")
+    last_republication:                  CoercedStr   = Field(default=None, alias="ultima_republicacao")
+    amendment_date:                      CoercedStr   = Field(default=None, alias="data_alteracao")
+    notice_modality:                     CoercedStr   = Field(default=None, alias="modalidade_aviso")
+    objective:                           CoercedStr   = Field(default=None, alias="objetivo")
+    fund_name:                           CoercedStr   = Field(default=None, alias="nome_fundo")
+    program_priority:                    CoercedStr   = Field(default=None, alias="prioridade_programa")
+    intervention_type_code:              CoercedStr   = Field(default=None, alias="tipo_intervencao_codigo")
+    max_duration_months:                 CoercedInt   = Field(default=None, alias="duracao_maxima_meses")
+    eligible_cae_codes:                  CoercedList  = Field(default_factory=list, alias="caes_elegiveis")
+    eligible_regions:                    CoercedList  = Field(default_factory=list, alias="regioes_admissiveis")
+    expense_eligibility_start_date:      CoercedStr   = Field(default=None, alias="data_inicio_elegibilidade_despesa")
+    specific_objective:                  CoercedStr   = Field(default=None, alias="objetivo_especifico")
+    operation_typology:                  CoercedStr   = Field(default=None, alias="tipologia_operacao")
+    covered_actions:                     CoercedStr   = Field(default=None, alias="acoes_abrangidas")
+    intermediate_bodies:                 list[OrganismoIntermedio] = Field(default_factory=list, alias="organismos_intermedios")
+    applicable_legislation:              CoercedList  = Field(default_factory=list, alias="legislacao_aplicavel")
+    regulatory_documents:                list[DocumentoRegulamentacao] = Field(default_factory=list, alias="documentos_regulamentacao")
+    target_technology_sectors:           CoercedList  = Field(default_factory=list, alias="setores_tecnologicos_alvo")
+    application_submission:              CoercedStr   = Field(default=None, alias="submissao_candidaturas")
+    beneficiary_eligibility_criteria:    CoercedList  = Field(default_factory=list, alias="criterios_elegibilidade_beneficiario")
+    final_recipients:                    CoercedList  = Field(default_factory=list, alias="destinatarios_finais")
+    dnsh_principle:                      CoercedStr   = Field(default=None, alias="principio_dnsh")
+    commitment_requirements:             CoercedStr   = Field(default=None, alias="requisitos_compromisso")
+    # P2 — território e execução
+    total_allocation:                    CoercedFloat = Field(default=None, alias="dotacao_global")
+    low_density_territories:             CoercedList  = Field(default_factory=list, alias="territorios_baixa_densidade")
+    submission_limits:                   CoercedStr   = Field(default=None, alias="limites_submissao")
+    absolute_execution_deadline:         CoercedStr   = Field(default=None, alias="data_limite_execucao_absoluta")
+    financial_execution_targets:         CoercedList  = Field(default_factory=list, alias="metas_execucao_financeira")
+    # P3 — financeiro
+    minimum_investment:                  CoercedFloat = Field(default=None, alias="investimento_minimo")
+    maximum_investment:                  CoercedFloat = Field(default=None, alias="investimento_maximo")
+    required_self_financing_limit:       CoercedFloat = Field(default=None, alias="limite_autofinanciamento_exigido")
+    state_aid_regime:                    CoercedStr   = Field(default=None, alias="regime_auxilio_estado")
+    applicable_gber_article:             CoercedStr   = Field(default=None, alias="artigo_rgbc_aplicavel")
+    contact:                             CoercedList  = Field(default_factory=list, alias="contacto")
+    payment_methods:                     CoercedList  = Field(default_factory=list, alias="formas_pagamento")
+    # P4 — avaliação
+    project_selection_criteria:          CoercedList  = Field(default_factory=list, alias="criterios_selecao_projeto")
+    # P5 — despesas e indicadores
+    eligible_expenses:                   CoercedList  = Field(default_factory=list, alias="despesas_elegiveis")
+    ineligible_expenses:                 CoercedList  = Field(default_factory=list, alias="despesas_nao_elegiveis")
+    output_indicators:                   list[Indicador] = Field(default_factory=list, alias="indicadores_realizacao")
+    result_indicators:                   list[Indicador] = Field(default_factory=list, alias="indicadores_resultados")
+    monitoring_indicators:               list[Indicador] = Field(default_factory=list, alias="indicadores_acompanhamento")
+    beneficiary_obligations:             CoercedList  = Field(default_factory=list, alias="obrigacoes_beneficiarios")
+    communication_obligations:           CoercedList  = Field(default_factory=list, alias="obrigacoes_comunicacao")
+    # P6 — documentos
+    application_documents:               list[ApplicationDocument] = Field(default_factory=list, alias="documentos_candidatura")
+    # P7 — temas dos Anexos não capturados
+    to_explore:                          CoercedList  = Field(default_factory=list, alias="aprofundar")
 
 
-class Fase(_Base):
-    codigo_fase:     CoercedStr = None
-    codigo_aviso:    CoercedStr = None
-    nome:            CoercedStr = None
-    data_inicio:     CoercedStr = None
-    data_fim:        CoercedStr = None
-    condicao_acesso: CoercedStr = None
+class BeneficiaryByAction(_Base):
+    grant_code:  CoercedStr  = Field(default=None, alias="codigo_aviso")
+    action_type: CoercedStr  = Field(default=None, alias="tipo_acao")
+    entities:    CoercedList = Field(default_factory=list, alias="entidades")
 
 
-class AreaAbrangida(_Base):
-    codigo_area:     CoercedStr = None
-    codigo_aviso:    CoercedStr = None
-    area_geografica: CoercedStr = None
+class FinancingRate(_Base):
+    rate_code:                  CoercedStr   = Field(default=None, alias="codigo_taxa")
+    grant_code:                 CoercedStr   = Field(default=None, alias="codigo_aviso")
+    company_size:               CoercedStr   = Field(default=None, alias="dimensao_empresa")
+    aid_regime:                 CoercedStr   = Field(default=None, alias="regime_auxilio")
+    base_rate:                  CoercedStr   = Field(default=None, alias="taxa_base")
+    regional_bonus:             CoercedStr   = Field(default=None, alias="majoracao_regional")
+    max_global_rate:            CoercedStr   = Field(default=None, alias="taxa_maxima_global")
+    minimis_accumulation_limit: CoercedFloat = Field(default=None, alias="limite_acumulacao_minimis")
+    specific_condition:         CoercedStr   = Field(default=None, alias="condicao_especifica")
 
 
-class FaseArea(_Base):
-    codigo_fase:              CoercedStr   = None
-    codigo_area:              CoercedStr   = None
-    codigo_aviso:             CoercedStr   = None
-    dotacao_orcamental:       CoercedFloat = None
-    taxa_financiamento_maxima: CoercedFloat = None
+class ExpenseLimit(_Base):
+    limit_code:                 CoercedStr   = Field(default=None, alias="codigo_limite")
+    grant_code:                 CoercedStr   = Field(default=None, alias="codigo_aviso")
+    expense_category:           CoercedStr   = Field(default=None, alias="rubrica_despesa")
+    applicable_ocs_methodology: CoercedStr   = Field(default=None, alias="metodologia_ocs_aplicavel")
+    max_absolute_value:         CoercedFloat = Field(default=None, alias="valor_maximo_absoluto")
+    max_percentage_value:       CoercedFloat = Field(default=None, alias="valor_maximo_percentual")
+    calculation_base:           CoercedStr   = Field(default=None, alias="base_calculo")
+    specific_conditions:        CoercedStr   = Field(default=None, alias="condicoes_especifica")
+
+
+class NonCompliancePenalty(_Base):
+    penalty_code:                        CoercedStr   = Field(default=None, alias="codigo_penalizacao")
+    grant_code:                          CoercedStr   = Field(default=None, alias="codigo_aviso")
+    indicator_types:                     CoercedStr   = Field(default=None, alias="tipo_indicadores")
+    compliance_grade_formula:            CoercedStr   = Field(default=None, alias="formula_grau_cumprimento")
+    general_tolerance_threshold:         CoercedFloat = Field(default=None, alias="limiar_tolerancia_geral")
+    low_density_tolerance_threshold:     CoercedFloat = Field(default=None, alias="limiar_tolerancia_baixa_densidade")
+    reduction_per_percentage_point:      CoercedFloat = Field(default=None, alias="reducao_por_ponto_percentual")
+    max_penalty_percentage:              CoercedFloat = Field(default=None, alias="penalizacao_maxima_percentual")
+    financing_revocation_threshold:      CoercedFloat = Field(default=None, alias="limiar_revogacao_financiamento")
+    rule_description:                    CoercedStr   = Field(default=None, alias="descricao_regra")
+
+
+class EvaluationMethodology(_Base):
+    evaluation_code:        CoercedStr   = Field(default=None, alias="codigo_avaliacao")
+    grant_code:             CoercedStr   = Field(default=None, alias="codigo_aviso")
+    project_merit_formula:  CoercedStr   = Field(default=None, alias="formula_merito_projeto")
+    min_global_score:       CoercedFloat = Field(default=None, alias="pontuacao_minima_global")
+    evaluation_criteria:    list[CriterioAvaliacao] = Field(default_factory=list, alias="criterios_avaliacao")
+    tiebreaker_criteria:    CoercedList  = Field(default_factory=list, alias="criterios_desempate")
+
+
+class Phase(_Base):
+    phase_code:      CoercedStr = Field(default=None, alias="codigo_fase")
+    grant_code:      CoercedStr = Field(default=None, alias="codigo_aviso")
+    name:            CoercedStr = Field(default=None, alias="nome")
+    start_date:      CoercedStr = Field(default=None, alias="data_inicio")
+    end_date:        CoercedStr = Field(default=None, alias="data_fim")
+    access_condition: CoercedStr = Field(default=None, alias="condicao_acesso")
+
+
+class CoveredArea(_Base):
+    area_code:       CoercedStr = Field(default=None, alias="codigo_area")
+    grant_code:      CoercedStr = Field(default=None, alias="codigo_aviso")
+    geographic_area: CoercedStr = Field(default=None, alias="area_geografica")
+
+
+class PhaseArea(_Base):
+    phase_code:          CoercedStr   = Field(default=None, alias="codigo_fase")
+    area_code:           CoercedStr   = Field(default=None, alias="codigo_area")
+    grant_code:          CoercedStr   = Field(default=None, alias="codigo_aviso")
+    budget_allocation:   CoercedFloat = Field(default=None, alias="dotacao_orcamental")
+    max_financing_rate:  CoercedFloat = Field(default=None, alias="taxa_financiamento_maxima")
 
 
 # Parse functions — uma por prompt (P1–P6)
 
-def parse_p1(raw: dict) -> tuple[dict, list[BeneficiarioPorAcao]]:
+def parse_p1(raw: dict) -> tuple[dict, list[BeneficiaryByAction]]:
     from pydantic import TypeAdapter
-    p1   = raw.get("Aviso_Parte1") or {}
-    p1.pop("fundo_financiador", None)  # descartado — dotacao_global vem do P2
-    bpas = TypeAdapter(list[BeneficiarioPorAcao]).validate_python(raw.get("Beneficiario_Por_Acao") or [])
+    p1   = raw.get("Grant_Part1") or {}
+    p1.pop("fundo_financiador", None)  # descartado — total_allocation vem do P2
+    bpas = TypeAdapter(list[BeneficiaryByAction]).validate_python(raw.get("BeneficiaryByAction") or [])
     return p1, bpas
 
 
-def parse_p2(raw: dict) -> tuple[dict, list[Fase], list[AreaAbrangida], list[FaseArea]]:
+def parse_p2(raw: dict) -> tuple[dict, list[Phase], list[CoveredArea], list[PhaseArea]]:
     from pydantic import TypeAdapter
-    aviso = raw.get("Aviso") or {}
-    fases = TypeAdapter(list[Fase]).validate_python(raw.get("fases") or [])
-    areas = TypeAdapter(list[AreaAbrangida]).validate_python(raw.get("Area_Abrangida") or [])
-    fa    = TypeAdapter(list[FaseArea]).validate_python(raw.get("Fase_Area") or [])
-    return aviso, fases, areas, fa
+    grant_data = raw.get("Grant") or {}
+    phases = TypeAdapter(list[Phase]).validate_python(raw.get("phases") or [])
+    areas  = TypeAdapter(list[CoveredArea]).validate_python(raw.get("CoveredArea") or [])
+    fa     = TypeAdapter(list[PhaseArea]).validate_python(raw.get("PhaseArea") or [])
+    return grant_data, phases, areas, fa
 
 
-def parse_p3(raw: dict) -> tuple[dict, list[TaxaFinanciamento]]:
+def parse_p3(raw: dict) -> tuple[dict, list[FinancingRate]]:
     from pydantic import TypeAdapter
-    aviso = raw.get("Aviso") or {}
-    taxas = TypeAdapter(list[TaxaFinanciamento]).validate_python(raw.get("Taxa_Financiamento") or [])
-    return aviso, taxas
+    grant_data = raw.get("Grant") or {}
+    rates = TypeAdapter(list[FinancingRate]).validate_python(raw.get("FinancingRate") or [])
+    return grant_data, rates
 
 
-def parse_p4(raw: dict) -> tuple[dict, list[MetodologiaAvaliacao]]:
+def parse_p4(raw: dict) -> tuple[dict, list[EvaluationMethodology]]:
     from pydantic import TypeAdapter
-    aviso = raw.get("Aviso") or {}
-    metod = TypeAdapter(list[MetodologiaAvaliacao]).validate_python(raw.get("Metodologia_Avaliacao") or [])
-    return aviso, metod
+    grant_data    = raw.get("Grant") or {}
+    methodologies = TypeAdapter(list[EvaluationMethodology]).validate_python(raw.get("EvaluationMethodology") or [])
+    return grant_data, methodologies
 
 
-def parse_p5(raw: dict) -> tuple[dict, list[LimiteDespesa], list[PenalizacaoIncumprimento]]:
+def parse_p5(raw: dict) -> tuple[dict, list[ExpenseLimit], list[NonCompliancePenalty]]:
     from pydantic import TypeAdapter
-    aviso   = raw.get("Aviso") or {}
-    limites = TypeAdapter(list[LimiteDespesa]).validate_python(raw.get("Limite_Despesa") or [])
-    penal   = TypeAdapter(list[PenalizacaoIncumprimento]).validate_python(raw.get("Penalizacao_Incumprimento") or [])
-    return aviso, limites, penal
+    grant_data  = raw.get("Grant") or {}
+    limits      = TypeAdapter(list[ExpenseLimit]).validate_python(raw.get("ExpenseLimit") or [])
+    penalties   = TypeAdapter(list[NonCompliancePenalty]).validate_python(raw.get("NonCompliancePenalty") or [])
+    return grant_data, limits, penalties
 
 
 def parse_p6(raw: dict) -> dict:
     from pydantic import TypeAdapter
-    docs = (raw.get("Aviso") or {}).get("documentos_candidatura") or []
-    return {"documentos_candidatura": TypeAdapter(list[DocumentoCandidatura]).validate_python(docs)}
+    docs = (raw.get("Grant") or {}).get("application_documents") or []
+    return {"application_documents": TypeAdapter(list[ApplicationDocument]).validate_python(docs)}

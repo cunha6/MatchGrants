@@ -37,17 +37,17 @@ _MESES = {
 }
 
 
-def _normalizar_data(texto: str) -> str:
+def _normalize_date(text: str) -> str:
     hora = ""
-    t = re.search(r"(\d{1,2})[h:](\d{2})", texto)
+    t = re.search(r"(\d{1,2})[h:](\d{2})", text)
     if t:
         hora = f" {t.group(1).zfill(2)}:{t.group(2)}h"
 
-    m = re.search(r"(\d{2}/\d{2}/\d{4})", texto)
+    m = re.search(r"(\d{2}/\d{2}/\d{4})", text)
     if m:
         return m.group(1) + hora
 
-    m = re.search(r"(\d{1,2})\s+de\s+(\w+)(?:\s+de)?\s+(\d{4})", texto, re.IGNORECASE)
+    m = re.search(r"(\d{1,2})\s+de\s+(\w+)(?:\s+de)?\s+(\d{4})", text, re.IGNORECASE)
     if m:
         dia, mes_str, ano = m.group(1), m.group(2).lower(), m.group(3)
         mes = _MESES.get(mes_str)
@@ -189,19 +189,19 @@ def _parse_grants(driver: WebDriver, all_data: list[dict]) -> None:
                                 hora = f" {t.group(1).zfill(2)}:{t.group(2)}h"
                             data_fim = all_dates[-1] + hora
                         else:
-                            data_fim = _normalizar_data(text) or None
+                            data_fim = _normalize_date(text) or None
 
                 all_data.append({
-                    "origem": "PRR",
+                    "source": "PRR",
                     "tipo": grants_type,
                     "subtitulo": grants_subtitle,
-                    "titulo": title,
-                    "codigo_aviso": codigo_aviso,
-                    "data_inicio": data_inicio,
-                    "fim_candidatura": data_fim,
-                    "ultima_republicacao": last_repub_number,
-                    "data_ultima_republicacao": last_repub_date,
-                    "contacto": last_contact,
+                    "title": title,
+                    "grant_code": codigo_aviso,
+                    "opening_date": data_inicio,
+                    "closing_date": data_fim,
+                    "last_republication": last_repub_number,
+                    "last_republication_date": last_repub_date,
+                    "contact": last_contact,
                     "documentos": documentos,
-                    "ultimo_aviso": last_doc_link,
+                    "latest_notice": last_doc_link,
                 })

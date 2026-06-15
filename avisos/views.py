@@ -2,42 +2,42 @@ from django.http import JsonResponse
 from . import service
 
 
-def avisos_todos(request):
+def grants_all(request):
     try:
-        dados = service.scrape_todos()
-        return JsonResponse(dados, json_dumps_params={"ensure_ascii": False, "indent": 2})
+        data = service.scrape_todos()
+        return JsonResponse(data, json_dumps_params={"ensure_ascii": False, "indent": 2})
     except Exception as e:
-        return JsonResponse({"status": "erro", "mensagem": str(e)}, status=500)
+        return JsonResponse({"error": str(e)}, status=500)
 
 
-def avisos_compete(request):
+def grants_compete(request):
     try:
-        dados = service.scrape_compete()
+        data = service.scrape_compete()
         return JsonResponse(
-            {"total": len(dados), "avisos": dados},
+            {"total": len(data), "grants": data},
             json_dumps_params={"ensure_ascii": False, "indent": 2},
         )
     except Exception as e:
-        return JsonResponse({"status": "erro", "mensagem": str(e)}, status=500)
+        return JsonResponse({"error": str(e)}, status=500)
 
 
-def avisos_portugal(request):
+def grants_portugal(request):
     try:
-        dados = service.scrape_portugal()
+        data = service.scrape_portugal()
         return JsonResponse(
-            {"total": len(dados), "avisos": dados},
+            {"total": len(data), "grants": data},
             json_dumps_params={"ensure_ascii": False, "indent": 2},
         )
     except Exception as e:
-        return JsonResponse({"status": "erro", "mensagem": str(e)}, status=500)
+        return JsonResponse({"error": str(e)}, status=500)
 
 
-def avisos_prr(request):
+def grants_prr(request):
     try:
-        dados = service.scrape_prr()
+        data = service.scrape_prr()
         return JsonResponse(
-            {"total": len(dados), "avisos": dados},
+            {"total": len(data), "grants": data},
             json_dumps_params={"ensure_ascii": False, "indent": 2},
         )
     except Exception as e:
-        return JsonResponse({"status": "erro", "mensagem": str(e)}, status=500)
+        return JsonResponse({"error": str(e)}, status=500)

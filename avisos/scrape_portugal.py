@@ -36,13 +36,13 @@ _CHROME_ARGS = [
 ]
 
 _KEY_MAP = {
-    "Data de Publicação": "data_publicacao",
-    "Data de Início": "data_inicio",
-    "Data de Fim": "fim_candidatura",
-    "Código do Aviso": "codigo_aviso",
-    "Objetivo Específico": "objetivo",
-    "Dotação": "dotacao",
-    "Submissão de Candidaturas": "submissao_candidaturas",
+    "Data de Publicação": "publication_date",
+    "Data de Início": "opening_date",
+    "Data de Fim": "closing_date",
+    "Código do Aviso": "grant_code",
+    "Objetivo Específico": "objective",
+    "Dotação": "total_allocation",
+    "Submissão de Candidaturas": "application_submission",
 }
 
 
@@ -105,7 +105,7 @@ def _parse_main(html: str) -> list[dict]:
         if not strong:
             continue
 
-        data = {"origem": "Portugal2030", "titulo": strong.get_text(strip=True)}
+        data = {"source": "Portugal2030", "title": strong.get_text(strip=True)}
 
         for line in aviso.find_all("div"):
             for label in line.find_all("dl"):
@@ -127,7 +127,7 @@ def _parse_main(html: str) -> list[dict]:
         ] if docs_div else []
         data["documentos"] = documentos
 
-        normalize_code = normalize(data.get("codigo_aviso", ""))
+        normalize_code = normalize(data.get("grant_code", ""))
         codigo_numeros = re.sub(r'^[a-z]+', '', normalize_code)
 
         pdfs = [doc for doc in documentos if doc["nome"].lower().endswith(".pdf")]
@@ -158,13 +158,13 @@ def _parse_main(html: str) -> list[dict]:
             url = futures[future]
             cache[url] = future.result()
 
-    # 3ª passagem: atribuir ultimo_aviso com base no cache
+    # 3ª passagem: atribuir latest_notice com base no cache
     for data in parsed:
-        data["ultimo_aviso"] = None
+        data["latest_notice"] = None
         for doc in data.pop("_candidatos", []):
             info = cache.get(doc["url"], {"paginas": 0, "natureza": None})
             if info["paginas"] > 4 and info["natureza"] != "convite":
-                data["ultimo_aviso"] = doc
+                data["latest_notice"] = doc
                 break
 
     return parsed

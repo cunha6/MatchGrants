@@ -1,179 +1,154 @@
 from django.db import models
 
 
-class Aviso(models.Model):
-    ORIGEM_CHOICES = [
+class Grant(models.Model):
+    SOURCE_CHOICES = [
         ("compete", "Compete2030"),
         ("portugal", "Portugal2030"),
         ("prr", "PRR"),
     ]
 
-    # Metadata de scraping
-    origem = models.CharField(max_length=20, choices=ORIGEM_CHOICES, db_index=True)
-    url_scraping = models.URLField(max_length=500, unique=True)
-    caminho_pdf = models.CharField(max_length=500, blank=True)
-    caminho_markdown = models.CharField(max_length=500, blank=True)
-    processado_ia = models.BooleanField(default=False)
-    criado_em = models.DateTimeField(auto_now_add=True)
-    atualizado_em = models.DateTimeField(auto_now=True)
+    # Scraping metadata
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, db_index=True)
+    scraping_url = models.URLField(max_length=500, unique=True)
+    pdf_path = models.CharField(max_length=500, blank=True)
+    markdown_path = models.CharField(max_length=500, blank=True)
+    ai_processed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     # P1 — identificação
-    codigo_aviso = models.CharField(max_length=100, blank=True, null=True, db_index=True)
-    titulo = models.TextField(blank=True, null=True)
-    programa_financiador = models.TextField(blank=True, null=True)
-    entidade_gestora = models.TextField(blank=True, null=True)
-    data_publicacao = models.CharField(max_length=50, blank=True, null=True)
-    data_republicacao = models.CharField(max_length=50, blank=True, null=True)
-    ultima_republicacao = models.CharField(max_length=50, blank=True, null=True)
-    data_alteracao = models.CharField(max_length=50, blank=True, null=True)
-    modalidade_aviso = models.CharField(max_length=100, blank=True, null=True)
-    objetivo = models.TextField(blank=True, null=True)
-    nome_fundo = models.CharField(max_length=100, blank=True, null=True)
-    prioridade_programa = models.TextField(blank=True, null=True)
-    tipo_intervencao_codigo = models.TextField(blank=True, null=True)
-    duracao_maxima_meses = models.IntegerField(null=True, blank=True)
-    caes_elegiveis = models.JSONField(default=list, blank=True)
-    regioes_admissiveis = models.JSONField(default=list, blank=True)
-    data_inicio_elegibilidade_despesa = models.CharField(max_length=50, blank=True, null=True)
-    objetivo_especifico = models.TextField(blank=True, null=True)
-    tipologia_operacao = models.TextField(blank=True, null=True)
-    acoes_abrangidas = models.TextField(blank=True, null=True)
-    organismos_intermedios = models.JSONField(default=list, blank=True)
-    legislacao_aplicavel = models.JSONField(default=list, blank=True)
-    documentos_regulamentacao = models.JSONField(default=list, blank=True)
-    setores_tecnologicos_alvo = models.JSONField(default=list, blank=True)
-    submissao_candidaturas = models.TextField(blank=True, null=True)
-    criterios_elegibilidade_beneficiario = models.JSONField(default=list, blank=True)
-    destinatarios_finais = models.JSONField(default=list, blank=True)
-    principio_dnsh = models.TextField(blank=True, null=True)
-    requisitos_compromisso = models.TextField(blank=True, null=True)
+    grant_code = models.CharField(max_length=100, blank=True, null=True, db_index=True)
+    title = models.TextField(blank=True, null=True)
+    financing_program = models.TextField(blank=True, null=True)
+    managing_entity = models.TextField(blank=True, null=True)
+    publication_date = models.CharField(max_length=50, blank=True, null=True)
+    republication_date = models.CharField(max_length=50, blank=True, null=True)
+    last_republication = models.CharField(max_length=50, blank=True, null=True)
+    amendment_date = models.CharField(max_length=50, blank=True, null=True)
+    notice_modality = models.CharField(max_length=100, blank=True, null=True)
+    objective = models.TextField(blank=True, null=True)
+    fund_name = models.CharField(max_length=100, blank=True, null=True)
+    program_priority = models.TextField(blank=True, null=True)
+    intervention_type_code = models.TextField(blank=True, null=True)
+    max_duration_months = models.IntegerField(null=True, blank=True)
+    eligible_cae_codes = models.JSONField(default=list, blank=True)
+    eligible_regions = models.JSONField(default=list, blank=True)
+    expense_eligibility_start_date = models.CharField(max_length=50, blank=True, null=True)
+    specific_objective = models.TextField(blank=True, null=True)
+    operation_typology = models.TextField(blank=True, null=True)
+    covered_actions = models.TextField(blank=True, null=True)
+    intermediate_bodies = models.JSONField(default=list, blank=True)
+    applicable_legislation = models.JSONField(default=list, blank=True)
+    regulatory_documents = models.JSONField(default=list, blank=True)
+    target_technology_sectors = models.JSONField(default=list, blank=True)
+    application_submission = models.TextField(blank=True, null=True)
+    beneficiary_eligibility_criteria = models.JSONField(default=list, blank=True)
+    final_recipients = models.JSONField(default=list, blank=True)
+    dnsh_principle = models.TextField(blank=True, null=True)
+    commitment_requirements = models.TextField(blank=True, null=True)
     # P2 — território e execução
-    dotacao_global = models.FloatField(null=True, blank=True)
-    territorios_baixa_densidade = models.JSONField(default=list, blank=True)
-    limites_submissao = models.TextField(blank=True, null=True)
-    data_limite_execucao_absoluta = models.CharField(max_length=50, blank=True, null=True)
-    metas_execucao_financeira = models.JSONField(default=list, blank=True)
+    total_allocation = models.FloatField(null=True, blank=True)
+    low_density_territories = models.JSONField(default=list, blank=True)
+    submission_limits = models.TextField(blank=True, null=True)
+    absolute_execution_deadline = models.CharField(max_length=50, blank=True, null=True)
+    financial_execution_targets = models.JSONField(default=list, blank=True)
     # P3 — financeiro
-    investimento_minimo = models.FloatField(null=True, blank=True)
-    investimento_maximo = models.FloatField(null=True, blank=True)
-    limite_autofinanciamento_exigido = models.FloatField(null=True, blank=True)
-    regime_auxilio_estado = models.TextField(blank=True, null=True)
-    artigo_rgbc_aplicavel = models.TextField(blank=True, null=True)
-    contacto = models.JSONField(default=list, blank=True)
-    formas_pagamento = models.JSONField(default=list, blank=True)
+    minimum_investment = models.FloatField(null=True, blank=True)
+    maximum_investment = models.FloatField(null=True, blank=True)
+    required_self_financing_limit = models.FloatField(null=True, blank=True)
+    state_aid_regime = models.TextField(blank=True, null=True)
+    applicable_gber_article = models.TextField(blank=True, null=True)
+    contact = models.JSONField(default=list, blank=True)
+    payment_methods = models.JSONField(default=list, blank=True)
     # P4 — avaliação
-    criterios_selecao_projeto = models.JSONField(default=list, blank=True)
+    project_selection_criteria = models.JSONField(default=list, blank=True)
     # P5 — despesas e indicadores
-    despesas_elegiveis = models.JSONField(default=list, blank=True)
-    despesas_nao_elegiveis = models.JSONField(default=list, blank=True)
-    indicadores_realizacao = models.JSONField(default=list, blank=True)
-    indicadores_resultados = models.JSONField(default=list, blank=True)
-    indicadores_acompanhamento = models.JSONField(default=list, blank=True)
-    obrigacoes_beneficiarios = models.JSONField(default=list, blank=True)
-    obrigacoes_comunicacao = models.JSONField(default=list, blank=True)
+    eligible_expenses = models.JSONField(default=list, blank=True)
+    ineligible_expenses = models.JSONField(default=list, blank=True)
+    output_indicators = models.JSONField(default=list, blank=True)
+    result_indicators = models.JSONField(default=list, blank=True)
+    monitoring_indicators = models.JSONField(default=list, blank=True)
+    beneficiary_obligations = models.JSONField(default=list, blank=True)
+    communication_obligations = models.JSONField(default=list, blank=True)
     # P6 — documentos
-    documentos_candidatura = models.JSONField(default=list, blank=True)
-    # P7 — temas dos Anexos não capturados (para revisão futura)
-    aprofundar = models.JSONField(default=list, blank=True)
-
-    class Meta:
-        verbose_name = "Aviso"
-        verbose_name_plural = "Avisos"
+    application_documents = models.JSONField(default=list, blank=True)
+    # P7 — annex topics not captured (for future review)
+    to_explore = models.JSONField(default=list, blank=True)
 
     def __str__(self):
-        return self.codigo_aviso or self.titulo or f"Aviso #{self.pk}"
+        return self.grant_code or self.title or f"Grant #{self.pk}"
 
 
-
-class BeneficiarioPorAcao(models.Model):
-    aviso = models.ForeignKey(Aviso, on_delete=models.CASCADE, related_name="beneficiarios_por_acao")
-    tipo_acao = models.TextField(blank=True, null=True)
-    entidades = models.JSONField(default=list, blank=True)
-
-    class Meta:
-        verbose_name_plural = "Beneficiários por Ação"
+class BeneficiaryByAction(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="beneficiaries_by_action")
+    action_type = models.TextField(blank=True, null=True)
+    entities = models.JSONField(default=list, blank=True)
 
 
-class Fase(models.Model):
-    aviso = models.ForeignKey(Aviso, on_delete=models.CASCADE, related_name="fases")
-    codigo_fase = models.CharField(max_length=100, blank=True, null=True)
-    nome = models.CharField(max_length=200, blank=True, null=True)
-    data_inicio = models.CharField(max_length=50, blank=True, null=True)
-    data_fim = models.CharField(max_length=50, blank=True, null=True)
-    condicao_acesso = models.TextField(blank=True, null=True)
+class Phase(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="phases")
+    phase_code = models.CharField(max_length=100, blank=True, null=True)
+    name = models.CharField(max_length=200, blank=True, null=True)
+    start_date = models.CharField(max_length=50, blank=True, null=True)
+    end_date = models.CharField(max_length=50, blank=True, null=True)
+    access_condition = models.TextField(blank=True, null=True)
 
 
-class AreaAbrangida(models.Model):
-    aviso = models.ForeignKey(Aviso, on_delete=models.CASCADE, related_name="areas_abrangidas")
-    codigo_area = models.CharField(max_length=100, blank=True, null=True)
-    area_geografica = models.TextField(blank=True, null=True)
-
-    class Meta:
-        verbose_name_plural = "Áreas Abrangidas"
+class CoveredArea(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="covered_areas")
+    area_code = models.CharField(max_length=100, blank=True, null=True)
+    geographic_area = models.TextField(blank=True, null=True)
 
 
-class FaseArea(models.Model):
-    aviso = models.ForeignKey(Aviso, on_delete=models.CASCADE, related_name="fase_areas")
-    codigo_fase = models.CharField(max_length=100, blank=True, null=True)
-    codigo_area = models.CharField(max_length=100, blank=True, null=True)
-    dotacao_orcamental = models.FloatField(null=True, blank=True)
-    taxa_financiamento_maxima = models.FloatField(null=True, blank=True)
-
-    class Meta:
-        verbose_name_plural = "Fases por Área"
+class PhaseArea(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="phase_areas")
+    phase_code = models.CharField(max_length=100, blank=True, null=True)
+    area_code = models.CharField(max_length=100, blank=True, null=True)
+    budget_allocation = models.FloatField(null=True, blank=True)
+    max_financing_rate = models.FloatField(null=True, blank=True)
 
 
-class TaxaFinanciamento(models.Model):
-    aviso = models.ForeignKey(Aviso, on_delete=models.CASCADE, related_name="taxas_financiamento")
-    codigo_taxa = models.CharField(max_length=100, blank=True, null=True)
-    dimensao_empresa = models.TextField(blank=True, null=True)
-    regime_auxilio = models.TextField(blank=True, null=True)
-    taxa_base = models.CharField(max_length=50, blank=True, null=True)
-    majoracao_regional = models.CharField(max_length=50, blank=True, null=True)
-    taxa_maxima_global = models.CharField(max_length=50, blank=True, null=True)
-    limite_acumulacao_minimis = models.FloatField(null=True, blank=True)
-    condicao_especifica = models.TextField(blank=True, null=True)
-
-    class Meta:
-        verbose_name_plural = "Taxas de Financiamento"
+class FinancingRate(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="financing_rates")
+    rate_code = models.CharField(max_length=100, blank=True, null=True)
+    company_size = models.TextField(blank=True, null=True)
+    aid_regime = models.TextField(blank=True, null=True)
+    base_rate = models.CharField(max_length=50, blank=True, null=True)
+    regional_bonus = models.CharField(max_length=50, blank=True, null=True)
+    max_global_rate = models.CharField(max_length=50, blank=True, null=True)
+    minimis_accumulation_limit = models.FloatField(null=True, blank=True)
+    specific_condition = models.TextField(blank=True, null=True)
 
 
-class LimiteDespesa(models.Model):
-    aviso = models.ForeignKey(Aviso, on_delete=models.CASCADE, related_name="limites_despesa")
-    codigo_limite = models.CharField(max_length=100, blank=True, null=True)
-    rubrica_despesa = models.TextField(blank=True, null=True)
-    metodologia_ocs_aplicavel = models.TextField(blank=True, null=True)
-    valor_maximo_absoluto = models.FloatField(null=True, blank=True)
-    valor_maximo_percentual = models.FloatField(null=True, blank=True)
-    base_calculo = models.TextField(blank=True, null=True)
-    condicoes_especifica = models.TextField(blank=True, null=True)
-
-    class Meta:
-        verbose_name_plural = "Limites de Despesa"
+class ExpenseLimit(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="expense_limits")
+    limit_code = models.CharField(max_length=100, blank=True, null=True)
+    expense_category = models.TextField(blank=True, null=True)
+    applicable_ocs_methodology = models.TextField(blank=True, null=True)
+    max_absolute_value = models.FloatField(null=True, blank=True)
+    max_percentage_value = models.FloatField(null=True, blank=True)
+    calculation_base = models.TextField(blank=True, null=True)
+    specific_conditions = models.TextField(blank=True, null=True)
 
 
-class PenalizacaoIncumprimento(models.Model):
-    aviso = models.ForeignKey(Aviso, on_delete=models.CASCADE, related_name="penalizacoes")
-    codigo_penalizacao = models.CharField(max_length=100, blank=True, null=True)
-    tipo_indicadores = models.TextField(blank=True, null=True)
-    limiar_tolerancia_geral = models.FloatField(null=True, blank=True)
-    limiar_tolerancia_baixa_densidade = models.FloatField(null=True, blank=True)
-    reducao_por_ponto_percentual = models.FloatField(null=True, blank=True)
-    penalizacao_maxima_percentual = models.FloatField(null=True, blank=True)
-    limiar_revogacao_financiamento = models.FloatField(null=True, blank=True)
-    descricao_regra = models.TextField(blank=True, null=True)
-
-    class Meta:
-        verbose_name_plural = "Penalizações por Incumprimento"
+class NonCompliancePenalty(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="non_compliance_penalties")
+    penalty_code = models.CharField(max_length=100, blank=True, null=True)
+    indicator_types = models.TextField(blank=True, null=True)
+    compliance_grade_formula = models.TextField(blank=True, null=True)
+    general_tolerance_threshold = models.FloatField(null=True, blank=True)
+    low_density_tolerance_threshold = models.FloatField(null=True, blank=True)
+    reduction_per_percentage_point = models.FloatField(null=True, blank=True)
+    max_penalty_percentage = models.FloatField(null=True, blank=True)
+    financing_revocation_threshold = models.FloatField(null=True, blank=True)
+    rule_description = models.TextField(blank=True, null=True)
 
 
-class MetodologiaAvaliacao(models.Model):
-    aviso = models.ForeignKey(Aviso, on_delete=models.CASCADE, related_name="metodologias_avaliacao")
-    codigo_avaliacao = models.CharField(max_length=100, blank=True, null=True)
-    formula_merito_projeto = models.TextField(blank=True, null=True)
-    pontuacao_minima_global = models.FloatField(null=True, blank=True)
-    criterios_avaliacao = models.JSONField(default=list, blank=True)
-    criterios_desempate = models.JSONField(default=list, blank=True)
-
-    class Meta:
-        verbose_name_plural = "Metodologias de Avaliação"
+class EvaluationMethodology(models.Model):
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="evaluation_methodologies")
+    evaluation_code = models.CharField(max_length=100, blank=True, null=True)
+    project_merit_formula = models.TextField(blank=True, null=True)
+    min_global_score = models.FloatField(null=True, blank=True)
+    evaluation_criteria = models.JSONField(default=list, blank=True)
+    tiebreaker_criteria = models.JSONField(default=list, blank=True)

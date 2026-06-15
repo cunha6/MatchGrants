@@ -32,6 +32,20 @@ def _extract_filename(url: str) -> str:
     return url.split("/")[-1].split("?")[0] or "unknown.pdf"
 
 
+def find_existing_document(url: str | None, download_dir: str) -> str | None:
+    """Devolve o caminho do PDF já descarregado, ou None se ainda não existir."""
+    if not url or not os.path.isdir(download_dir):
+        return None
+
+    original_name = _extract_filename(url)
+    return next(
+        (os.path.join(download_dir, f) for f in os.listdir(download_dir)
+         if os.path.isfile(os.path.join(download_dir, f))
+         and _DATETIME_RE.sub("", f) == original_name),
+        None,
+    )
+
+
 def download_document(url: str | None, download_dir: str, url_pagina: str = "") -> str | None:
     if not url:
         return None
@@ -39,16 +53,10 @@ def download_document(url: str | None, download_dir: str, url_pagina: str = "") 
     original_name = _extract_filename(url)
     os.makedirs(download_dir, exist_ok=True)
 
-    existing = next(
-        (f for f in os.listdir(download_dir)
-         if os.path.isfile(os.path.join(download_dir, f))
-         and _DATETIME_RE.sub("", f) == original_name),
-        None,
-    )
-
+    existing = find_existing_document(url, download_dir)
     if existing:
         print(f"Já existe: {original_name} — download ignorado.")
-        return os.path.join(download_dir, existing)
+        return existing
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     extended_name = f"{timestamp}_{original_name}"
@@ -80,8 +88,8 @@ def convert(path: str | None, download_dir: str = "", url_origem: str = "") -> s
     md_dir = os.path.join("output", "markdown", subfolder) if subfolder else os.path.join("output", "markdown")
     os.makedirs(md_dir, exist_ok=True)
 
-    fonte = os.path.splitext(os.path.basename(path))[0]
-    md_path = os.path.join(md_dir, fonte + ".md")
+    source_name = os.path.splitext(os.path.basename(path))[0]
+    md_path = os.path.join(md_dir, source_name + ".md")
 
     with open(path, "rb") as f:
         if not f.read(5).startswith(b"%PDF"):
@@ -100,11 +108,11 @@ def convert(path: str | None, download_dir: str = "", url_origem: str = "") -> s
 
     try:
         from ..IA.pipeline import run_pipeline
-        dados_ia = run_pipeline(result.document, fonte)
-        if dados_ia:
-            from ..db_service import guardar_aviso_ia
-            guardar_aviso_ia(dados_ia, url_scraping=url_origem, caminho_pdf=path, caminho_markdown=md_path)
+        ai_data = run_pipeline(result.document, source_name)
+        if ai_data:
+            from ..db_service import save_ai_grant
+            save_ai_grant(ai_data, scraping_url=url_origem, pdf_path=path, markdown_path=md_path)
     except Exception as e:
-        print(f"Erro ao guardar na base de dados: {e}")
+        print(f"Error saving to database: {e}")
 
     return md_path

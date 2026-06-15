@@ -15,14 +15,14 @@ load_dotenv()
 _MODELS_SEM_TEMP = ("o1", "o3", "o4", "gpt-5")
 
 
-def criar_cliente() -> AsyncOpenAI:
+def create_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key or api_key.startswith("sk-..."):
         raise RuntimeError("OPENAI_API_KEY não está definida no ficheiro .env")
     return AsyncOpenAI(api_key=api_key)
 
 
-async def chamar_openai(
+async def call_openai(
     client: AsyncOpenAI,
     system_prompt: str,
     chunks: list[dict],
@@ -51,11 +51,11 @@ async def chamar_openai(
     response = await client.chat.completions.create(**kwargs)
 
     usage = response.usage
-    truncado = " [TRUNCADO]" if response.choices[0].finish_reason == "length" else ""
+    truncated = " [TRUNCADO]" if response.choices[0].finish_reason == "length" else ""
     print(
         f"  [{label}] OK  "
         f"in={usage.prompt_tokens} out={usage.completion_tokens} tokens  "
-        f"({time.time()-t:.1f}s){truncado}"
+        f"({time.time()-t:.1f}s){truncated}"
     )
 
     raw = response.choices[0].message.content or "{}"
@@ -66,7 +66,7 @@ async def chamar_openai(
         return {}
 
 
-async def classificar_chunks_ambiguos(
+async def classify_ambiguous_chunks(
     client: AsyncOpenAI,
     chunks: list[dict],
 ) -> dict[str, list[str]]:
@@ -78,10 +78,10 @@ async def classificar_chunks_ambiguos(
     if not chunks:
         return {}
 
-    partes = [
+    parts = [
         f"CHUNK_ID: {c.get('chunk_index', id(c))}\n"
-        f"HEADER: {c.get('titulo', '')[:80]}\n"
-        f"TEXTO: {c.get('texto', '')[:200]}\n---"
+        f"HEADER: {c.get('title', '')[:80]}\n"
+        f"TEXT: {c.get('text', '')[:200]}\n---"
         for c in chunks
     ]
 
@@ -90,7 +90,7 @@ async def classificar_chunks_ambiguos(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": ROUTER_SYSTEM},
-                {"role": "user",   "content": "\n".join(partes)},
+                {"role": "user",   "content": "\n".join(parts)},
             ],
             response_format={"type": "json_object"},
             max_completion_tokens=1000,

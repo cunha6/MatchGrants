@@ -1,7 +1,7 @@
 """
 Orquestração do pipeline: chunking -> OpenAI (6 prompts) -> merge -> JSON.
 
-Ponto de entrada: run_pipeline(doc, fonte, output_dir)
+Ponto de entrada: run_pipeline(doc, source, output_dir)
 """
 
 import asyncio
@@ -9,10 +9,10 @@ import json
 import time
 from pathlib import Path
 
-from .chunker import chunk_por_headers, CATS_P1, CATS_P2, CATS_P3, CATS_P4, CATS_P5, CATS_P6
+from .chunker import chunk_by_headers, CATS_P1, CATS_P2, CATS_P3, CATS_P4, CATS_P5, CATS_P6
 from .merge import merge
-from .normalizers import extrair_codigo_aviso, injetar_ancora, normalizar_codigo_aviso, normalizar_codigos_aviso_json, normalize_text
-from .openai_client import classificar_chunks_ambiguos, chamar_openai, criar_cliente
+from .normalizers import extract_grant_code, inject_anchor, normalize_grant_code, normalize_grant_codes_json
+from .openai_client import classify_ambiguous_chunks, call_openai, create_client
 from .prompts import SYSTEM_PROMPT_1, SYSTEM_PROMPT_2, SYSTEM_PROMPT_3, SYSTEM_PROMPT_4, SYSTEM_PROMPT_5, SYSTEM_PROMPT_6, SYSTEM_PROMPT_7
 
 # Modelo usado em cada prompt
@@ -25,38 +25,38 @@ P5_MODEL = "gpt-4o-mini"
 P6_MODEL = "gpt-4o-mini"
 
 
-def _contar_vazios(final: dict) -> int:
-    return sum(1 for v in final.get("Aviso", {}).values() if v in (None, [], ""))
+def _count_empty_fields(result: dict) -> int:
+    return sum(1 for v in result.get("Grant", {}).values() if v in (None, [], ""))
 
 
 _STOPWORDS = {"de", "da", "do", "dos", "das", "e", "em", "a", "o", "por", "para", "ao", "com"}
 
-def _chunks_relevantes_para_vazios(chunks: list[dict], campos_vazios: list[str]) -> list[dict]:
+def _chunks_for_empty_fields(chunks: list[dict], empty_fields: list[str]) -> list[dict]:
     """Devolve chunks do corpo (não-Anexo) mais relevantes para os campos vazios.
 
     Pontua cada chunk pelo número de keywords dos nomes dos campos vazios que
     aparecem no título da secção ou na categoria do chunk.
     """
-    if not campos_vazios:
+    if not empty_fields:
         return []
 
     keywords = {
         w.lower()
-        for campo in campos_vazios
-        for w in campo.split("_")
+        for field in empty_fields
+        for w in field.split("_")
         if w not in _STOPWORDS and len(w) > 2
     }
 
     scored: list[tuple[int, dict]] = []
     for c in chunks:
-        if c.get("is_anexo") or c.get("categoria") == "ignorar":
+        if c.get("is_annex") or c.get("category") == "ignorar":
             continue
         haystack = (
-            (c.get("secao") or c.get("titulo") or "")
+            (c.get("section") or c.get("titulo") or "")
             + " "
-            + (c.get("categoria") or "")
+            + (c.get("category") or "")
             + " "
-            + (c.get("texto") or "")[:200]
+            + (c.get("text") or "")[:200]
         ).lower()
         score = sum(1 for kw in keywords if kw in haystack)
         if score > 0:
@@ -74,60 +74,60 @@ def _chunks_relevantes_para_vazios(chunks: list[dict], campos_vazios: list[str])
 
 
 
-async def _run(doc, fonte: str, output_dir: Path) -> dict:
+async def _run(doc, source: str, output_dir: Path) -> dict:
     json_dir = output_dir / "json"
     json_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'─' * 60}")
-    print(f"  Documento: {fonte}")
+    print(f"  Documento: {source}")
     print(f"{'─' * 60}")
 
     # 1. Chunking
     print("\n[1/2] Chunking semântico")
-    chunks = chunk_por_headers(doc, codigo_aviso=fonte, fonte=fonte)
+    chunks = chunk_by_headers(doc, grant_code=source, source=source)
 
     cats: dict[str, int] = {}
     for c in chunks:
-        cats[c["categoria"]] = cats.get(c["categoria"], 0) + 1
+        cats[c["category"]] = cats.get(c["category"], 0) + 1
     for cat, n in sorted(cats.items()):
         print(f"  [{cat}] {n} secção(ões)")
     print(f"  Total: {len(chunks)} chunks")
 
     # Chunks sem categoria são classificados pelo LLM antes de seguir para os prompts
-    client = criar_cliente()
-    outros = [c for c in chunks if c["categoria"] == "outros"]
+    client = create_client()
+    outros = [c for c in chunks if c["category"] == "outros"]
     if outros:
         print(f"\n  [Router] {len(outros)} chunks ambíguos → LLM")
-        routed = await classificar_chunks_ambiguos(client, outros)
+        routed = await classify_ambiguous_chunks(client, outros)
         n_reclassificados = 0
         for chunk in chunks:
-            if chunk["categoria"] != "outros":
+            if chunk["category"] != "outros":
                 continue
             cats_llm = routed.get(str(chunk.get("chunk_index", "")), [])
             if cats_llm and cats_llm[0] not in ("ignorar", "outros"):
-                chunk["categoria"] = cats_llm[0]
+                chunk["category"] = cats_llm[0]
                 n_reclassificados += 1
         print(f"  [Router] {n_reclassificados}/{len(outros)} reclassificados")
 
     # Chunks que ficaram sem categoria vão como fallback para P1
-    fallback = [c for c in chunks if c["categoria"] == "outros"]
+    fallback = [c for c in chunks if c["category"] == "outros"]
 
     # Distribui os chunks pelos 6 prompts conforme as categorias do mapping_config.json
-    p1_chunks = [c for c in chunks if c["categoria"] in CATS_P1] + fallback
-    p2_chunks = [c for c in chunks if c["categoria"] in CATS_P2]
-    p3_chunks = [c for c in chunks if c["categoria"] in CATS_P3]
-    p4_chunks = [c for c in chunks if c["categoria"] in CATS_P4]
-    p5_chunks = [c for c in chunks if c["categoria"] in CATS_P5]
-    p6_chunks = [c for c in chunks if c["categoria"] in CATS_P6]
+    p1_chunks = [c for c in chunks if c["category"] in CATS_P1] + fallback
+    p2_chunks = [c for c in chunks if c["category"] in CATS_P2]
+    p3_chunks = [c for c in chunks if c["category"] in CATS_P3]
+    p4_chunks = [c for c in chunks if c["category"] in CATS_P4]
+    p5_chunks = [c for c in chunks if c["category"] in CATS_P5]
+    p6_chunks = [c for c in chunks if c["category"] in CATS_P6]
 
     # Garante que anexos com critérios e legislação chegam sempre aos prompts certos,
     # mesmo que o chunker os tenha categorizado incorrectamente
     _ids_p4 = {id(c) for c in p4_chunks}
     _ids_p1 = {id(c) for c in p1_chunks}
     for c in chunks:
-        if not c.get("is_anexo"):
+        if not c.get("is_annex"):
             continue
-        txt = (c.get("titulo", "") + " " + c.get("texto", "")[:300]).lower()
+        txt = (c.get("title", "") + " " + c.get("text", "")[:300]).lower()
         if id(c) not in _ids_p4 and any(kw in txt for kw in (
             "grelha", "referencial de mérito", "critérios de seleção",
             "critérios de avaliação", "metodologia de avaliação", "ponderaç",
@@ -138,108 +138,108 @@ async def _run(doc, fonte: str, output_dir: Path) -> dict:
         )):
             p1_chunks.append(c)
 
-    # 2. OpenAI — P1 primeiro para obter o codigo_aviso, depois P2–P6 em paralelo
+    # 2. OpenAI — P1 primeiro para obter o notice_code, depois P2–P6 em paralelo
     print("\n[2/2] OpenAI")
 
-    r1 = await chamar_openai(client, SYSTEM_PROMPT_1, p1_chunks, "P1 Identificação", P1_MODEL)
+    r1 = await call_openai(client, SYSTEM_PROMPT_1, p1_chunks, "P1 Identificação", P1_MODEL)
 
-    codigo_aviso = extrair_codigo_aviso(r1)
-    if codigo_aviso:
-        codigo_aviso = normalizar_codigo_aviso(codigo_aviso)
-        print(f"  Âncora: {codigo_aviso!r}")
+    notice_code = extract_grant_code(r1)
+    if notice_code:
+        notice_code = normalize_grant_code(notice_code)
+        print(f"  Âncora: {notice_code!r}")
     else:
-        print("  AVISO: codigo_aviso não encontrado em P1")
+        print("  WARNING: grant_code not found in P1")
 
     print("\n  P2–P6 em paralelo ...")
     t = time.time()
     r2, r3, r4, r5, r6 = await asyncio.gather(
-        chamar_openai(client, injetar_ancora(SYSTEM_PROMPT_2, codigo_aviso), p2_chunks, "P2 Território+Fases",     P2_MODEL),
-        chamar_openai(client, injetar_ancora(SYSTEM_PROMPT_3, codigo_aviso), p3_chunks, "P3 Taxas+Pagamentos",     P3_MODEL),
-        chamar_openai(client, injetar_ancora(SYSTEM_PROMPT_4, codigo_aviso), p4_chunks, "P4 Critérios+Grelhas",    P4_MODEL),
-        chamar_openai(client, injetar_ancora(SYSTEM_PROMPT_5, codigo_aviso), p5_chunks, "P5 Despesas+Indicadores", P5_MODEL),
-        chamar_openai(client, injetar_ancora(SYSTEM_PROMPT_6, codigo_aviso), p6_chunks, "P6 Documentos",           P6_MODEL),
+        call_openai(client, inject_anchor(SYSTEM_PROMPT_2, notice_code), p2_chunks, "P2 Território+Fases",     P2_MODEL),
+        call_openai(client, inject_anchor(SYSTEM_PROMPT_3, notice_code), p3_chunks, "P3 Taxas+Pagamentos",     P3_MODEL),
+        call_openai(client, inject_anchor(SYSTEM_PROMPT_4, notice_code), p4_chunks, "P4 Critérios+Grelhas",    P4_MODEL),
+        call_openai(client, inject_anchor(SYSTEM_PROMPT_5, notice_code), p5_chunks, "P5 Despesas+Indicadores", P5_MODEL),
+        call_openai(client, inject_anchor(SYSTEM_PROMPT_6, notice_code), p6_chunks, "P6 Documentos",           P6_MODEL),
     )
     print(f"\n  Concluído em {time.time()-t:.1f}s")
 
     # Merge e normalização final
     print("\n  Merge:")
-    final = merge(r1, r2, r3, r4, r5, r6)
-    final = normalizar_codigos_aviso_json(final)
+    result = merge(r1, r2, r3, r4, r5, r6)
+    result = normalize_grant_codes_json(result)
 
     # P7 — enriquecer com Anexos + preencher campos vazios do corpo
-    anexo_chunks = [
+    annex_chunks = [
         c for c in chunks
-        if c.get("is_anexo") and c.get("categoria") != "ignorar"
+        if c.get("is_annex") and c.get("category") != "ignorar"
     ]
 
-    campos_vazios = [k for k, v in final["Aviso"].items() if v in (None, [], "")]
-    corpo_chunks = _chunks_relevantes_para_vazios(chunks, campos_vazios)
+    empty_fields = [k for k, v in result["Grant"].items() if v in (None, [], "")]
+    body_chunks = _chunks_for_empty_fields(chunks, empty_fields)
 
-    p7_chunks = anexo_chunks + corpo_chunks
+    p7_chunks = annex_chunks + body_chunks
 
     if p7_chunks:
-        campos_antes = _contar_vazios(final)
-        print(f"\n  [P7] {len(anexo_chunks)} Anexos + {len(corpo_chunks)} corpo | {campos_antes} campos vazios")
-        json_completo = json.dumps(final, ensure_ascii=False, indent=2)
-        campos_vazios_str = ", ".join(f"`{c}`" for c in campos_vazios) if campos_vazios else "nenhum"
+        fields_before = _count_empty_fields(result)
+        print(f"\n  [P7] {len(annex_chunks)} Anexos + {len(body_chunks)} corpo | {fields_before} campos vazios")
+        json_completo = json.dumps(result, ensure_ascii=False, indent=2)
+        empty_fields_str = ", ".join(f"`{c}`" for c in empty_fields) if empty_fields else "nenhum"
         system_p7 = (
             SYSTEM_PROMPT_7
-            + f'\n\nCAMPOS VAZIOS A TENTAR PREENCHER: {campos_vazios_str}'
+            + f'\n\nCAMPOS VAZIOS A TENTAR PREENCHER: {empty_fields_str}'
             + f'\n\nJSON ACTUAL (referência — devolve apenas o que alterares):\n{json_completo}'
         )
-        r7 = await chamar_openai(client, system_p7, p7_chunks, "P7 Enriquecer Anexos", P7_MODEL)
-        alteracoes = r7.get("alteracoes", {}) if isinstance(r7, dict) else {}
-        if alteracoes:
-            aviso_atualizados = []
-            for campo, valor in alteracoes.get("Aviso", {}).items():
-                if valor in (None, [], ""):
+        r7 = await call_openai(client, system_p7, p7_chunks, "P7 Enriquecer Anexos", P7_MODEL)
+        changes = r7.get("changes", {}) if isinstance(r7, dict) else {}
+        if changes:
+            updated_fields = []
+            for field, value in changes.get("Grant", {}).items():
+                if value in (None, [], ""):
                     continue
-                campo_atual = final["Aviso"].get(campo)
+                current_value = result["Grant"].get(field)
                 # listas: P7 devolve sempre a versão merged (existentes + novos) → aplica sempre
                 # escalares: só preenche se estiver vazio
-                if isinstance(valor, list) or campo_atual in (None, [], ""):
-                    final["Aviso"][campo] = valor
-                    aviso_atualizados.append(campo)
-            listas_atualizadas = []
-            for chave in ("Area_Abrangida", "Fase_Area", "Metodologia_Avaliacao", "Taxa_Financiamento", "Limite_Despesa"):
-                if alteracoes.get(chave):
-                    final[chave] = alteracoes[chave]
-                    listas_atualizadas.append(chave)
-            final = normalizar_codigos_aviso_json(final)
-            campos_depois = _contar_vazios(final)
-            if aviso_atualizados:
-                print(f"  [P7] Aviso preencheu: {aviso_atualizados}")
-            if listas_atualizadas:
-                print(f"  [P7] Listas atualizadas: {listas_atualizadas}")
-            print(f"  [P7] {campos_antes - campos_depois} campos Aviso preenchidos ({campos_depois} ainda vazios)")
+                if isinstance(value, list) or current_value in (None, [], ""):
+                    result["Grant"][field] = value
+                    updated_fields.append(field)
+            updated_lists = []
+            for key in ("CoveredArea", "PhaseArea", "EvaluationMethodology", "FinancingRate", "ExpenseLimit"):
+                if changes.get(key):
+                    result[key] = changes[key]
+                    updated_lists.append(key)
+            result = normalize_grant_codes_json(result)
+            fields_after = _count_empty_fields(result)
+            if updated_fields:
+                print(f"  [P7] Aviso preencheu: {updated_fields}")
+            if updated_lists:
+                print(f"  [P7] Listas atualizadas: {updated_lists}")
+            print(f"  [P7] {fields_before - fields_after} campos Aviso preenchidos ({fields_after} ainda vazios)")
         else:
             print("  [P7] Sem alterações — mantém resultado do merge")
 
-        nao_capturado = r7.get("nao_capturado", []) if isinstance(r7, dict) else []
-        if nao_capturado:
-            final["Aviso"]["aprofundar"] = nao_capturado
-            print(f"  [P7] {len(nao_capturado)} temas para aprofundar → Aviso.aprofundar")
+        not_captured = r7.get("not_captured", []) if isinstance(r7, dict) else []
+        if not_captured:
+            result["Grant"]["to_explore"] = not_captured
+            print(f"  [P7] {len(not_captured)} temas para aprofundar → Grant.to_explore")
     else:
         print("\n  [P7] Sem chunks relevantes — skipped")
 
-    json_file = json_dir / f"{fonte}.json"
-    json_file.write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
+    json_file = json_dir / f"{source}.json"
+    json_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n  JSON guardado: {json_file}")
 
-    return final
+    return result
 
 
-def run_pipeline(doc, fonte: str, output_dir: str = "output") -> dict:
+def run_pipeline(doc, source: str, output_dir: str = "output") -> dict:
     """
     Ponto de entrada principal.
 
     Parâmetros:
         doc        — DoclingDocument devolvido por result.document após _docling.convert()
-        fonte      — nome do documento (ex: nome do PDF sem extensão)
+        source     — nome do documento (ex: nome do PDF sem extensão)
         output_dir — pasta onde guardar o JSON resultante
 
     Exemplo:
         result = _docling.convert("aviso.pdf")
         dados  = run_pipeline(result.document, "aviso", output_dir="output")
     """
-    return asyncio.run(_run(doc, fonte, Path(output_dir)))
+    return asyncio.run(_run(doc, source, Path(output_dir)))

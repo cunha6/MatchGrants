@@ -112,10 +112,10 @@ def _parse_listing(html: str) -> list[dict]:
 
         results.append({
             "url": url,
-            "titulo": title,
+            "title": title,
             "estados": status,
-            "codigo_aviso": reference,
-            "fim_candidatura": deadline,
+            "grant_code": reference,
+            "closing_date": deadline,
         })
     return results
 
@@ -123,7 +123,7 @@ def _parse_listing(html: str) -> list[dict]:
 def _parse_detail(html: str, url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
     data: dict = {"url": url}
-    data["origem"] = "Compete2030"
+    data["source"] = "Compete2030"
 
     main_element = soup.find("main")
     div_date = main_element.find("div", class_="date-badges")
@@ -143,7 +143,7 @@ def _parse_detail(html: str, url: str) -> dict:
                 data["data_inicio"] = m.group(0)
                 break
 
-    data["fases"] = _parse_fases(main_element)
+    data["phases"] = _parse_phases(main_element)
 
     info: dict[str, str] = {}
     if main_element:
@@ -218,12 +218,12 @@ def _parse_detail(html: str, url: str) -> dict:
         docs.sort(key=_doc_order)
 
     data["documentos"] = docs
-    data["ultimo_aviso"] = None
+    data["latest_notice"] = None
     if docs:
         info = _pdf_info(docs[0]["url"])
         if info["paginas"] > 5 and info["natureza"] != "convite":
-            data["ultimo_aviso"] = {"nome": docs[0]["nome"], "url": docs[0]["url"]}
-        data["natureza_aviso"] = info["natureza"]
+            data["latest_notice"] = {"nome": docs[0]["nome"], "url": docs[0]["url"]}
+        data["notice_nature"] = info["natureza"]
 
     return data
 
@@ -242,23 +242,23 @@ def _extract_date_hour(p_el) -> str:
     return date + hour
 
 
-def _parse_fases(main_element: Tag) -> list[dict]:
-    fases = []
+def _parse_phases(main_element: Tag) -> list[dict]:
+    phases = []
 
-    for fase_div in main_element.find_all("div", class_="fases"):
+    for fase_div in main_element.find_all("div", class_="phases"):
         top_fase = fase_div.find("div", class_="fase-top")
         name = ""
         if top_fase:
             name_p = top_fase.find("p")
             name = _clean(name_p.get_text()) if name_p else ""
 
-        fases.append({
+        phases.append({
             "nome": name,
             "data_inicio": _extract_date_hour(fase_div.find("p", class_="fase-start")),
             "data_fim": _extract_date_hour(fase_div.find("p", class_="fase-end")),
         })
 
-    if not fases:
+    if not phases:
         btn = main_element.find("button", class_="btn-calendar")
         if btn:
             start_date = btn.get("data-date", "")
@@ -271,13 +271,13 @@ def _parse_fases(main_element: Tag) -> list[dict]:
                     if m:
                         end_hour = f" {m.group(1)}:00h"
                     break
-            fases.append({
+            phases.append({
                 "nome": "Candidatura",
                 "data_inicio": start_date,
                 "data_fim": end_date + end_hour,
             })
 
-    return fases
+    return phases
 
 
 def _badges(el: Tag) -> list[str]:
