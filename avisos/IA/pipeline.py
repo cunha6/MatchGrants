@@ -1,7 +1,7 @@
 """
 Orquestração do pipeline: chunking -> OpenAI (6 prompts) -> merge -> JSON.
 
-Ponto de entrada: run_pipeline(doc, source, output_dir)
+Ponto de entrada: run_pipeline(markdown, source, output_dir)
 """
 
 import asyncio
@@ -9,11 +9,11 @@ import json
 import time
 from pathlib import Path
 
-from .chunker import chunk_by_headers, CATS_P1, CATS_P2, CATS_P3, CATS_P4, CATS_P5, CATS_P6
+from .chunker import chunk_by_markdown, CATS_P1, CATS_P2, CATS_P3, CATS_P4, CATS_P5, CATS_P6
 from .merge import merge
 from .normalizers import extract_grant_code, inject_anchor, normalize_grant_code, normalize_grant_codes_json
-from .openai_client import classify_ambiguous_chunks, call_openai, create_client
-from .prompts import SYSTEM_PROMPT_1, SYSTEM_PROMPT_2, SYSTEM_PROMPT_3, SYSTEM_PROMPT_4, SYSTEM_PROMPT_5, SYSTEM_PROMPT_6, SYSTEM_PROMPT_7
+from .openai_client import classify_ambiguous_chunks, call_openai, call_openai_text, create_client
+from .prompts import SYSTEM_PROMPT_1, SYSTEM_PROMPT_2, SYSTEM_PROMPT_3, SYSTEM_PROMPT_4, SYSTEM_PROMPT_5, SYSTEM_PROMPT_6, SYSTEM_PROMPT_7, SYSTEM_PROMPT_CONSOLIDATE
 
 # Modelo usado em cada prompt
 P7_MODEL = "gpt-5-mini-2025-08-07"
@@ -24,57 +24,9 @@ P4_MODEL = "gpt-5.4"
 P5_MODEL = "gpt-4o-mini"
 P6_MODEL = "gpt-4o-mini"
 
-
-def _count_empty_fields(result: dict) -> int:
-    return sum(1 for v in result.get("Grant", {}).values() if v in (None, [], ""))
-
-
 _STOPWORDS = {"de", "da", "do", "dos", "das", "e", "em", "a", "o", "por", "para", "ao", "com"}
 
-def _chunks_for_empty_fields(chunks: list[dict], empty_fields: list[str]) -> list[dict]:
-    """Devolve chunks do corpo (não-Anexo) mais relevantes para os campos vazios.
-
-    Pontua cada chunk pelo número de keywords dos nomes dos campos vazios que
-    aparecem no título da secção ou na categoria do chunk.
-    """
-    if not empty_fields:
-        return []
-
-    keywords = {
-        w.lower()
-        for field in empty_fields
-        for w in field.split("_")
-        if w not in _STOPWORDS and len(w) > 2
-    }
-
-    scored: list[tuple[int, dict]] = []
-    for c in chunks:
-        if c.get("is_annex") or c.get("category") == "ignorar":
-            continue
-        haystack = (
-            (c.get("section") or c.get("titulo") or "")
-            + " "
-            + (c.get("category") or "")
-            + " "
-            + (c.get("text") or "")[:200]
-        ).lower()
-        score = sum(1 for kw in keywords if kw in haystack)
-        if score > 0:
-            scored.append((score, c))
-
-    scored.sort(key=lambda x: -x[0])
-    seen: set[int] = set()
-    result: list[dict] = []
-    for _, c in scored:
-        cid = id(c)
-        if cid not in seen:
-            seen.add(cid)
-            result.append(c)
-    return result
-
-
-
-async def _run(doc, source: str, output_dir: Path) -> dict:
+async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None = None) -> dict:
     json_dir = output_dir / "json"
     json_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,7 +36,7 @@ async def _run(doc, source: str, output_dir: Path) -> dict:
 
     # 1. Chunking
     print("\n[1/2] Chunking semântico")
-    chunks = chunk_by_headers(doc, grant_code=source, source=source)
+    chunks = chunk_by_markdown(markdown, grant_code=source, source=source)
 
     cats: dict[str, int] = {}
     for c in chunks:
@@ -93,50 +45,50 @@ async def _run(doc, source: str, output_dir: Path) -> dict:
         print(f"  [{cat}] {n} secção(ões)")
     print(f"  Total: {len(chunks)} chunks")
 
-    # Chunks sem categoria são classificados pelo LLM antes de seguir para os prompts
+    # Routing multi-label: o LLM classifica TODOS os chunks. A categoria por keyword
+    # (chunker) é unida com as categorias do LLM — um chunk pode pertencer a vários prompts.
     client = create_client()
-    outros = [c for c in chunks if c["category"] == "outros"]
-    if outros:
-        print(f"\n  [Router] {len(outros)} chunks ambíguos → LLM")
-        routed = await classify_ambiguous_chunks(client, outros)
-        n_reclassificados = 0
-        for chunk in chunks:
-            if chunk["category"] != "outros":
-                continue
-            cats_llm = routed.get(str(chunk.get("chunk_index", "")), [])
-            if cats_llm and cats_llm[0] not in ("ignorar", "outros"):
-                chunk["category"] = cats_llm[0]
-                n_reclassificados += 1
-        print(f"  [Router] {n_reclassificados}/{len(outros)} reclassificados")
+    print(f"\n  [Router] a classificar {len(chunks)} chunks → LLM")
+    routed = await classify_ambiguous_chunks(client, chunks)
+    for chunk in chunks:
+        labels: set[str] = set()
+        kw = chunk.get("category")
+        if kw and kw not in ("outros", "ignorar"):
+            labels.add(kw)
+        for lc in routed.get(str(chunk.get("chunk_index", "")), []):
+            if lc not in ("outros", "ignorar"):
+                labels.add(lc)
+        chunk["categories"] = labels
 
-    # Chunks que ficaram sem categoria vão como fallback para P1
-    fallback = [c for c in chunks if c["category"] == "outros"]
+    # Chunks sem qualquer categoria → fallback para P1 (rede de segurança)
+    fallback = [c for c in chunks if not c["categories"]]
+    n_multi = sum(1 for c in chunks if len(c["categories"]) > 1)
+    print(f"  [Router] {n_multi} chunks multi-categoria, {len(fallback)} sem categoria (→P1)")
 
-    # Distribui os chunks pelos 6 prompts conforme as categorias do mapping_config.json
-    p1_chunks = [c for c in chunks if c["category"] in CATS_P1] + fallback
-    p2_chunks = [c for c in chunks if c["category"] in CATS_P2]
-    p3_chunks = [c for c in chunks if c["category"] in CATS_P3]
-    p4_chunks = [c for c in chunks if c["category"] in CATS_P4]
-    p5_chunks = [c for c in chunks if c["category"] in CATS_P5]
-    p6_chunks = [c for c in chunks if c["category"] in CATS_P6]
+    # Distribui os chunks pelos 6 prompts por interseção de categorias
+    p1_chunks = [c for c in chunks if c["categories"] & CATS_P1] + fallback
+    p2_chunks = [c for c in chunks if c["categories"] & CATS_P2]
+    p3_chunks = [c for c in chunks if c["categories"] & CATS_P3]
+    p4_chunks = [c for c in chunks if c["categories"] & CATS_P4]
+    p5_chunks = [c for c in chunks if c["categories"] & CATS_P5]
+    p6_chunks = [c for c in chunks if c["categories"] & CATS_P6]
 
-    # Garante que anexos com critérios e legislação chegam sempre aos prompts certos,
-    # mesmo que o chunker os tenha categorizado incorrectamente
-    _ids_p4 = {id(c) for c in p4_chunks}
-    _ids_p1 = {id(c) for c in p1_chunks}
+    # Rede de segurança final: garante que anexos temáticos chegam SEMPRE ao prompt certo,
+    # mesmo que keyword e LLM tenham falhado. Cada anexo é encaminhado por conteúdo.
+    _ANNEX_GUARANTEE = (
+        (("grelha", "referencial de mérito", "critérios de seleção", "critérios de avaliação",
+          "metodologia de avaliação", "ponderaç", "subcritério"), p4_chunks),
+        (("legislação", "regulamento", "decreto-lei", "portaria", "diploma"), p1_chunks),
+        (("documentos necessários", "memória descritiva", "documentos a apresentar"), p6_chunks),
+        (("despesa", "custos elegíveis", "ocs", "indicador"), p5_chunks),
+    )
     for c in chunks:
         if not c.get("is_annex"):
             continue
         txt = (c.get("title", "") + " " + c.get("text", "")[:300]).lower()
-        if id(c) not in _ids_p4 and any(kw in txt for kw in (
-            "grelha", "referencial de mérito", "critérios de seleção",
-            "critérios de avaliação", "metodologia de avaliação", "ponderaç",
-        )):
-            p4_chunks.append(c)
-        if id(c) not in _ids_p1 and any(kw in txt for kw in (
-            "legislação", "regulamento", "decreto-lei", "portaria", "diploma",
-        )):
-            p1_chunks.append(c)
+        for keywords, target in _ANNEX_GUARANTEE:
+            if id(c) not in {id(x) for x in target} and any(kw in txt for kw in keywords):
+                target.append(c)
 
     # 2. OpenAI — P1 primeiro para obter o notice_code, depois P2–P6 em paralelo
     print("\n[2/2] OpenAI")
@@ -222,24 +174,92 @@ async def _run(doc, source: str, output_dir: Path) -> dict:
     else:
         print("\n  [P7] Sem chunks relevantes — skipped")
 
+    if extra:
+        result.update(extra)
+
     json_file = json_dir / f"{source}.json"
     json_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n  JSON guardado: {json_file}")
 
     return result
 
+def _chunks_for_empty_fields(chunks: list[dict], empty_fields: list[str]) -> list[dict]:
+    """Devolve chunks do corpo (não-Anexo) mais relevantes para os campos vazios.
 
-def run_pipeline(doc, source: str, output_dir: str = "output") -> dict:
+    Pontua cada chunk pelo número de keywords dos nomes dos campos vazios que
+    aparecem no título da secção ou na categoria do chunk.
+    """
+    if not empty_fields:
+        return []
+
+    keywords = {
+        w.lower()
+        for field in empty_fields
+        for w in field.split("_")
+        if w not in _STOPWORDS and len(w) > 2
+    }
+
+    scored: list[tuple[int, dict]] = []
+    for c in chunks:
+        if c.get("is_annex") or c.get("category") == "ignorar":
+            continue
+        data = (
+            (c.get("section") or c.get("titulo") or "")
+            + " "
+            + (c.get("category") or "")
+            + " "
+            + (c.get("text") or "")[:200]
+        ).lower()
+        score = sum(1 for kw in keywords if kw in data)
+        if score > 0:
+            scored.append((score, c))
+
+    scored.sort(key=lambda x: -x[0])
+    seen: set[int] = set()
+    result: list[dict] = []
+    for _, c in scored:
+        cid = id(c)
+        if cid not in seen:
+            seen.add(cid)
+            result.append(c)
+    return result
+
+
+def run_pipeline(markdown: str, source: str, output_dir: str = "output", extra: dict | None = None) -> dict:
     """
     Ponto de entrada principal.
 
     Parâmetros:
-        doc        — DoclingDocument devolvido por result.document após _docling.convert()
+        markdown   — texto markdown do aviso (já convertido/consolidado)
         source     — nome do documento (ex: nome do PDF sem extensão)
         output_dir — pasta onde guardar o JSON resultante
+        extra      — dados a juntar ao JSON final (ex: lista de anexos url+nome)
 
     Exemplo:
-        result = _docling.convert("aviso.pdf")
-        dados  = run_pipeline(result.document, "aviso", output_dir="output")
+        markdown = converter pdf -> markdown
+        dados    = run_pipeline(markdown, "aviso", output_dir="output")
     """
-    return asyncio.run(_run(doc, source, Path(output_dir)))
+    return asyncio.run(_run(markdown, source, Path(output_dir), extra))
+
+
+async def _consolidate(base_md: str, amendment_mds: list[str]) -> str:
+    client = create_client()
+    parts = [f"TEXTO BASE:\n{base_md}"]
+    for i, amd in enumerate(amendment_mds, 1):
+        parts.append(f"DOCUMENTO DE ALTERAÇÃO {i}:\n{amd}")
+    user = "\n\n=====\n\n".join(parts)
+    return await call_openai_text(
+        client, SYSTEM_PROMPT_CONSOLIDATE, user, "Consolidação", P1_MODEL
+    )
+
+def _count_empty_fields(result: dict) -> int:
+    return sum(1 for v in result.get("Grant", {}).values() if v in (None, [], ""))
+
+def consolidate_markdowns(base_md: str, amendment_mds: list[str]) -> str:
+    """
+    Aplica os documentos de alteração (diffs) sobre o markdown base e devolve o
+    markdown consolidado. Se não houver alterações, devolve o base inalterado.
+    """
+    if not amendment_mds:
+        return base_md
+    return asyncio.run(_consolidate(base_md, amendment_mds))

@@ -203,7 +203,7 @@ def _pdf_info(url: str) -> dict:
         r.raise_for_status()
         if not r.content.startswith(b"%PDF"):
             return {"paginas": 0, "natureza": None}
-        reader = PdfReader(io.BytesIO(r.content))
+        reader = PdfReader(io.BytesIO(r.content)) #Leitura em memória do PDF
         text = " ".join(p.extract_text() or "" for p in reader.pages[:5]).lower()
         natureza = "convite" if "convite" in text else None
         return {"paginas": len(reader.pages), "natureza": natureza}

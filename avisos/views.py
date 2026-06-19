@@ -20,7 +20,6 @@ def grants_compete(request):
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
 
-
 def grants_portugal(request):
     try:
         data = service.scrape_portugal()

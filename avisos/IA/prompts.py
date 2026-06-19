@@ -147,6 +147,9 @@ REGRAS (CRÍTICO):
    Se o texto apenas dizer "Não aplicável" ou "N.A." → devolve "Não aplicável".
    NUNCA deixes null se existir qualquer referência ao DNSH no documento.
    É diferente de `acoes_abrangidas` (que lista as ações concretas elegíveis).
+   `dnsh_criteria`: quando existir um Anexo dedicado com a GRELHA/critérios DNSH detalhados
+   (ex: "Anexo A-2 — Critérios DNSH e metas climáticas"), copia esse conteúdo detalhado para
+   `dnsh_criteria` (distinto do resumo em `principio_dnsh`). Se não existir grelha, devolve null.
 
 10. DATA DE ALTERAÇÃO: `data_alteracao` é a data em que as alterações ao aviso foram
     deliberadas ou aprovadas, distinta da data de republicação. Procura expressões como:
@@ -230,7 +233,6 @@ ESQUEMA DE DADOS ESPERADO:
     "title": "String",
     "financing_program": "String",
     "managing_entity": "String",
-    "publication_date": "YYYY-MM-DDThh:mm:ss",
     "republication_date": "YYYY-MM-DDThh:mm:ss ou null",
     "last_republication": "String ou null",
     "amendment_date": "YYYY-MM-DDThh:mm:ss ou null",
@@ -254,6 +256,7 @@ ESQUEMA DE DADOS ESPERADO:
     "beneficiary_eligibility_criteria": ["List de Strings"],
     "final_recipients": ["List de Strings ou []"],
     "dnsh_principle": "String ou null",
+    "dnsh_criteria": "String ou null",
     "contact": ["List de Strings — 'Entidade - Responsável: X | Telefone: Y | Email: Z'"],
     "commitment_requirements": "String ou null",
     "minimum_investment": "Float ou null",
@@ -789,7 +792,8 @@ ESQUEMA JSON OBRIGATÓRIO:
       }
     ],
     "beneficiary_obligations": ["List de Strings ou []"],
-    "communication_obligations": ["List de Strings ou []"]
+    "communication_obligations": ["List de Strings ou []"],
+    "bonus_mechanisms": ["List de Strings ou []"]
   },
   "ExpenseLimit": [
     {
@@ -932,6 +936,11 @@ REGRAS CRÍTICAS:
    — são categorias distintas. Usa a etiqueta da secção do documento para decidir a categoria,
    não o código do indicador.
    Devolve [] apenas se a secção não existir de todo.
+
+9. MECANISMOS DE BONIFICAÇÃO: Se existir uma secção "Mecanismos de bonificação" (ou
+   equivalente), extrai para `bonus_mechanisms` cada bonificação descrita (ex: majoração
+   da taxa por cumprimento de metas, prémios por desempenho). Uma entrada por mecanismo.
+   Devolve [] se a secção não existir.
 
 REGRA DE EXCLUSÃO: NUNCA extraias critérios de seleção, pontuações mínimas ou fórmulas de
 mérito — esses são responsabilidade do P4.
@@ -1105,6 +1114,12 @@ CAMPOS A ENRIQUECER COM OS ANEXOS:
 7. `setores_tecnologicos_alvo` — Inclui a lista COMPLETA (existentes + novos) APENAS se
    encontrares domínios adicionais mencionados nos Anexos de critérios (RIS3, EREI).
 
+7b. `dnsh_criteria` — Se um Anexo trouxer a grelha/critérios DNSH detalhados (ex: "Anexo A-2
+    — Critérios DNSH e metas climáticas") e o campo estiver vazio, preenche-o com esse conteúdo.
+
+7c. `bonus_mechanisms` — Se encontrares mecanismos de bonificação nos Anexos e a lista estiver
+    vazia, inclui-os.
+
 8. `FinancingRate` — Se um Anexo contiver tabela de taxas de financiamento por dimensão
    de empresa ou por região que não esteja já correcta, inclui a lista COMPLETA actualizada.
    Cada entrada: { "company_size": "...", "base_rate": 0.0, "regional_bonus": 0.0,
@@ -1148,6 +1163,27 @@ nos Anexos mas que NÃO fazem parte da lista fechada acima.
 Apenas o título ou tema em 1 linha — sem conteúdo detalhado.
 Ex: ["Anexo C — Critérios de elegibilidade de operações", "Tabela de penalizações por atraso"]
 Se não encontrares nada fora da lista fechada: `"not_captured": []`
+"""
+
+# Consolidação — aplica documentos de alteração (diffs) sobre o aviso base
+SYSTEM_PROMPT_CONSOLIDATE = """\
+És um jurista especializado em avisos de fundos europeus. Recebes o TEXTO BASE de um aviso
+e um ou mais DOCUMENTOS DE ALTERAÇÃO (por ordem cronológica). Cada alteração descreve
+mudanças pontuais ao aviso (ex: "onde consta X passa a constar Y", "o ponto 5 passa a ter
+a seguinte redação", "é alterado o Anexo II", "prorrogada a data de fecho para DD/MM/AAAA").
+
+TAREFA: produzir o TEXTO CONSOLIDADO do aviso — o texto base com TODAS as alterações já
+aplicadas, pela ordem indicada (a alteração mais recente prevalece em caso de conflito).
+
+REGRAS:
+1. Preserva integralmente a estrutura e os headings markdown do texto base.
+2. Aplica cada alteração no local exacto que ela indica. Substitui o valor antigo pelo novo.
+3. NÃO inventes conteúdo. Só alteras o que as alterações mandam explicitamente.
+4. Mantém todo o restante texto base inalterado.
+5. Datas, prazos, dotações e redações alteradas devem reflectir o ÚLTIMO valor.
+6. Não incluas notas como "(alterado)" — devolve o texto final limpo.
+
+OUTPUT: devolve APENAS o markdown consolidado do aviso, sem comentários nem explicações.
 """
 
 # Router — classifica chunks sem categoria

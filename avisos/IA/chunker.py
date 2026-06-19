@@ -1,18 +1,20 @@
-"""Divide o DoclingDocument em chunks semânticos: 1 chunk por secção, via HierarchicalChunker."""
+"""Divide markdown em chunks semânticos: 1 chunk por secção de heading."""
 
 import json
 import re
-import unicodedata
 from pathlib import Path
-from typing import Any
 
-from docling.chunking import HierarchicalChunker
 from .normalizers import normalize_text
 from ..Docling.docling_ocr import _clean_ocr
 
 normalize = normalize_text
 
 _CONFIG_PATH = Path(__file__).parent / "mapping_config.json"
+
+_MD_HEADER_RE = re.compile(r'^(#{1,6})\s+(.*?)\s*#*$')
+
+# Enumeradores de subcritério de grelha: "A)", "A.1.", "B.1", "C)", "D.2."...
+_CRITERION_ENUM_RE = re.compile(r'^[A-H](\.\d+)*[.)]')
 
 
 def load_mapping(config_path: Path | str | None = None) -> tuple[dict, dict]:
@@ -41,8 +43,6 @@ CATS_P4 = _get_prompt_categories("P4")
 CATS_P5 = _get_prompt_categories("P5")
 CATS_P6 = _get_prompt_categories("P6")
 
-_chunker = HierarchicalChunker()
-
 _HARD_SPLIT_CATEGORIAS = {
     "documentos_requisitos",
     "operacoes_elegibilidade",
@@ -50,20 +50,19 @@ _HARD_SPLIT_CATEGORIAS = {
 }
 _HARD_SPLIT_MIN_CHARS = 800
 
+# Formas de rótulo de tipologia/ação (lista única, partilhada pelos dois regexes abaixo).
+# "Ação tipo a)" já traz o seu delimitador ')'; as outras precisam de ':'/'-' no split.
+_ACAO_FORM_ACAO = r'(?:Para a )?[Aa][çc][ãa]o tipo [a-zA-Z]\)'
+_ACAO_FORM_OUTRAS = r'Tipologia [a-zA-Z0-9\.\-]+|Componente [A-Z0-9]|Medida [0-9\.]+'
+
+# Split: onde cortar — rótulo no início de linha (as "outras" exigem ':'/'-' a seguir).
 _HARD_SPLIT_PATTERN = re.compile(
-    r'\n(?=(?:'
-    r'(?:Para a )?[Aa][çc][ãa]o tipo [a-zA-Z]\)'
-    r'|Tipologia [a-zA-Z0-9\.\-]+\s*[\:\-]'
-    r'|Componente [A-Z0-9]\s*[\:\-]'
-    r'|Medida [0-9\.]+\s*[\:\-]'
-    r'))',
+    rf'\n(?=(?:{_ACAO_FORM_ACAO}|(?:{_ACAO_FORM_OUTRAS})\s*[:\-]))',
     re.IGNORECASE,
 )
+# Extração: só o nome do rótulo dentro de um bloco já cortado (sem delimitador).
 _ACAO_LABEL_PATTERN = re.compile(
-    r'((?:Para a )?[Aa][çc][ãa]o tipo [a-zA-Z]\)'
-    r'|Tipologia [a-zA-Z0-9\.\-]+'
-    r'|Componente [A-Z0-9]'
-    r'|Medida [0-9\.]+)',
+    rf'({_ACAO_FORM_ACAO}|{_ACAO_FORM_OUTRAS})',
     re.IGNORECASE,
 )
 
@@ -77,6 +76,7 @@ def _hard_split(
     prompt_source: str,
     page_start: int,
     page_end: int,
+    is_annex: bool = False,
 ) -> list[dict]:
     blocks = _HARD_SPLIT_PATTERN.split(text)
     if len(blocks) <= 1:
@@ -108,7 +108,7 @@ def _hard_split(
             "source":        source,
             "page_start":    page_start,
             "page_end":      page_end,
-            "is_annex":      "anexo" in normalize_text(title),
+            "is_annex":      is_annex,
             "text":          enriched_text,
         })
 
@@ -127,10 +127,11 @@ def _hard_split(
 #          e só usa letra do Anexo como último recurso
 # ---------------------------------------------------------------------------
 
-# Regras semânticas por conteúdo do título — ordem: mais específica primeiro
+# Regras semânticas por conteúdo do título — ordem: mais específica primeiro.
+# IMPORTANTE: regras de CONTEÚDO têm prioridade sobre "ignorar". Um subcritério como
+# "A.1 Alinhamento às prioridades da RIS3" (dentro de "Anexo A-3 Critérios de seleção")
+# tem de ir para criterios_indicadores, não ser descartado por conter "RIS3".
 _ANEXO_CONTENT_RULES: list[tuple[re.Pattern, str]] = [
-    # IGNORAR — estratégia/enquadramento sem valor de extração
-    (re.compile(r'ris\s*3|ris3|estrategia\s+de\s+especializacao|smart\s+specialisation', re.I), "ignorar"),
     # INSTRUMENTOS TERRITORIAIS — mapas, delimitações geográficas ITI/DLBC/PDUI
     (re.compile(r'territ[oó]rio\s+iti|delimitac|mapa\s+territ|pdui|dlbc|cim\b|amp\b|nuts\s+iii', re.I), "instrumentos_territoriais"),
     # CRITÉRIOS — grelha de avaliação/seleção/mérito
@@ -147,27 +148,10 @@ _ANEXO_CONTENT_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r'orientac|receitas|projetos?\s+geradores', re.I), "operacoes_elegibilidade"),
 ]
 
-
-def _get_annex_category(header: str) -> str | None:
-    """
-    Classifica anexos EXCLUSIVAMENTE pelo conteúdo semântico do título.
-    Não usa a letra do Anexo como critério — isso é frágil e varia por aviso.
-    Retorna None se nenhuma keyword semântica fizer match (vai para mapeamento geral).
-    """
-    h_raw = header.strip()
-    h_norm = normalize(h_raw)
-
-    if not (h_norm.startswith("anexo") or h_norm.startswith("annex")):
-        return None
-
-    for pattern, cat in _ANEXO_CONTENT_RULES:
-        if pattern.search(h_norm):
-            return cat
-
-    # Sem match semântico: retorna None e deixa o mapeamento geral decidir
-    # (melhor do que assumir uma categoria errada por letra)
-    return None
-
+# Só descartado quando NENHUMA regra de conteúdo bate — um anexo puramente de estratégia.
+_ANEXO_IGNORE_RULE = re.compile(
+    r'ris\s*3|ris3|estrategia\s+de\s+especializacao|smart\s+specialisation', re.I
+)
 
 # ---------------------------------------------------------------------------
 # map_category — CORRIGIDA
@@ -177,15 +161,10 @@ def _get_annex_category(header: str) -> str | None:
 # categorias de índice maior.
 # Solução: match pelo comprimento da keyword (mais longa = mais específica).
 # ---------------------------------------------------------------------------
-
 def map_category(title: str, content: str = "") -> str:
     """
-    Classifica um chunk pela keyword mais longa (mais específica) que faça match,
-    em vez da primeira que fizer match por ordem de inserção no dict.
-    Resolve conflitos como:
-      - "enquadramento" (obj_enquadramento) vs "enquadramento em instrumentos" (instrumentos_territoriais)
-      - "norma" (legislacao) vs "normas técnicas" (operacoes_elegibilidade)
-      - "calendário" (financiamento_dotacao) vs "calendário de candidaturas" (processo_decisao)
+    Classifica um chunk pela keyword mais longa (mais específica) que faça match.
+    Prioridade: anexo (regras semânticas) → título → "ignorar" → conteúdo (fallback).
     """
     annex_cat = _get_annex_category(title)
     if annex_cat:
@@ -193,73 +172,118 @@ def map_category(title: str, content: str = "") -> str:
 
     title_n = normalize(title)
 
-    matches: list[tuple[int, str]] = []
-    for category, keywords in MAPEAMENTO.items():
-        for kw in keywords:
-            kw_n = normalize(kw)
-            if kw_n and kw_n in title_n:
-                matches.append((len(kw_n), category))
+    # 1. Título (sinal forte)
+    cat = _best_keyword_match(title_n)
+    if cat:
+        return cat
 
-    if matches:
-        matches.sort(key=lambda x: x[0], reverse=True)
-        return matches[0][1]
+    # 2. Ignorar — só quando é o único sinal do título (índice, preâmbulo, sumário...)
+    if any(normalize(kw) and normalize(kw) in title_n for kw in MAPEAMENTO.get("ignorar", [])):
+        return "ignorar"
 
+    # 3. Conteúdo (fallback fraco — só quando o título nada diz)
     if content:
-        content_n = normalize(content[:400])
-        content_matches: list[tuple[int, str]] = []
-        for category, keywords in MAPEAMENTO.items():
-            if category == "ignorar":
-                continue
-            for kw in keywords:
-                kw_n = normalize(kw)
-                if kw_n and kw_n in content_n:
-                    content_matches.append((len(kw_n), category))
-        if content_matches:
-            content_matches.sort(key=lambda x: x[0], reverse=True)
-            return content_matches[0][1]
+        cat = _best_keyword_match(normalize(content[:400]))
+        if cat:
+            return cat
 
     return "outros"
 
-
-def _pages_from_doc_items(doc_items: list[Any]) -> tuple[int, int]:
-    pages: list[int] = []
-    for item in doc_items:
-        for prov in (getattr(item, "prov", None) or []):
-            p = getattr(prov, "page_no", None)
-            if p:
-                pages.append(p)
-    if not pages:
-        return (0, 0)
-    return (min(pages), max(pages))
-
-
-def chunk_by_headers(
-    doc: Any,
-    grant_code: str,
-    source: str,
-) -> list[dict]:
+def _get_annex_category(header: str) -> str | None:
     """
-    Usa HierarchicalChunker para criar 1 chunk por secção do DoclingDocument.
+    Classifica anexos pelo conteúdo semântico do título (caminho completo de headings).
+    Regras de conteúdo têm prioridade; "ignorar" só quando é o único sinal.
+    Retorna None se nada fizer match (vai para o mapeamento geral).
     """
-    groups: dict[tuple, list] = {}
+    h_norm = normalize(header.strip())
 
-    for raw in _chunker.chunk(doc):
-        headings = raw.meta.headings or []
-        key = tuple(headings) if headings else ("Preâmbulo",)
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(raw)
+    if not (h_norm.startswith("anexo") or h_norm.startswith("annex")):
+        return None
 
+    for pattern, cat in _ANEXO_CONTENT_RULES:
+        if pattern.search(h_norm):
+            return cat
+
+    # Conteúdo não bateu — só agora consideramos descartar (anexo puro de estratégia)
+    if _ANEXO_IGNORE_RULE.search(h_norm):
+        return "ignorar"
+
+    return None
+
+
+def _best_keyword_match(data: str) -> str | None:
+    """
+    Categoria cuja keyword mais longa (mais específica) aparece em `data`.
+    Exclui "ignorar" (uma keyword curta de ignore nunca rouba conteúdo real).
+    """
+    best_cat, best_len = None, 0
+    for category, keywords in MAPEAMENTO.items():
+        if category == "ignorar":
+            continue
+        for kw in keywords:
+            kw_n = normalize(kw)
+            if kw_n and kw_n in data and len(kw_n) > best_len:
+                best_cat, best_len = category, len(kw_n)
+    return best_cat
+
+
+def _parse_markdown_sections(md_text: str) -> list[tuple[tuple[str, ...], str]]:
+    """
+    Divide o markdown em secções preservando a ancestralidade dos headings.
+    Devolve [(caminho_de_headings, texto), ...] pela ordem do documento.
+    Cada heading `#`..`######` empilha/desempilha por nível, tal como a hierarquia
+    que o HierarchicalChunker do docling produzia — mas a partir do markdown puro.
+    """
+    sections: list[tuple[tuple[str, ...], str]] = []
+    stack: list[tuple[int, str]] = []
+    current_key: tuple[str, ...] = ("Preâmbulo",)
+    buf: list[str] = []
+
+    def flush():
+        text = "\n".join(buf).strip()
+        if text:
+            sections.append((current_key, text))
+        buf.clear()
+
+    for line in md_text.splitlines():
+        m = _MD_HEADER_RE.match(line.strip())
+        if m:
+            flush()
+            level = len(m.group(1))
+            title = m.group(2).strip()
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, title))
+            current_key = tuple(t for _, t in stack) or (title,)
+        else:
+            buf.append(line)
+    flush()
+    return sections
+
+
+def chunk_by_markdown(md_text: str, grant_code: str, source: str) -> list[dict]:
+    """
+    Cria chunks semânticos a partir de markdown (1 chunk por secção de heading).
+    Independente do docling — testável e reutilizável para consolidação de documentos.
+    """
+    md_text = _clean_ocr(md_text)
     chunks: list[dict] = []
     active_category = "outros"
 
-    for key, raw_list in groups.items():
+    for key, text in _parse_markdown_sections(md_text):
+        # Caminho completo de headings (ancestralidade) para classificação;
+        # garante que sub-chunks herdam o contexto do pai (ex: "Anexo A-3 Critérios > A.1").
+        full_path = " > ".join(key)
         title = " > ".join(key[-2:]) if len(key) >= 2 else key[-1]
+        is_annex = "anexo" in normalize_text(full_path) or "annex" in normalize_text(full_path)
 
-        texts = [rc.text for rc in raw_list if rc.text and rc.text.strip()]
-        text = _clean_ocr("\n\n".join(texts))
+        detected_category = map_category(full_path, text)
 
-        detected_category = map_category(title, text)
+        # Subcritérios da grelha (A.1, A.2, B.1, C), D.2...) surgem como headers irmãos
+        # no markdown e perdem a ancestralidade "Critérios". Dentro da grelha, o
+        # enumerador de critério força criterios_indicadores (override de keyword genérica).
+        if active_category == "criterios_indicadores" and _CRITERION_ENUM_RE.match(key[-1].strip()):
+            detected_category = "criterios_indicadores"
 
         if detected_category == "ignorar":
             continue
@@ -269,9 +293,6 @@ def chunk_by_headers(
 
         if len(text) < 30:
             continue
-
-        all_doc_items = [item for rc in raw_list for item in rc.meta.doc_items]
-        page_start, page_end = _pages_from_doc_items(all_doc_items)
 
         primary_cat = detected_category if detected_category != "outros" else active_category
 
@@ -284,7 +305,7 @@ def chunk_by_headers(
             sub = _hard_split(
                 text=text, title=title, grant_code=grant_code, source=source,
                 category=primary_cat, prompt_source=prompt_source,
-                page_start=page_start, page_end=page_end,
+                page_start=0, page_end=0, is_annex=is_annex,
             )
             if sub:
                 for sc in sub:
@@ -300,9 +321,9 @@ def chunk_by_headers(
             "grant_code":    grant_code,
             "source":        source,
             "chunk_index":   len(chunks),
-            "page_start":    page_start,
-            "page_end":      page_end,
-            "is_annex":      "anexo" in normalize_text(title),
+            "page_start":    0,
+            "page_end":      0,
+            "is_annex":      is_annex,
             "text":          text,
         })
 

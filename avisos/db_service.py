@@ -1,8 +1,29 @@
+import re
+
 from .models import (
     Grant, BeneficiaryByAction, Phase, CoveredArea,
     PhaseArea, FinancingRate, ExpenseLimit, NonCompliancePenalty,
     EvaluationMethodology,
 )
+
+# Campos cuja fonte de verdade é o scrape do HTML. A IA nunca os sobrescreve.
+_HTML_LOCKED_FIELDS = (
+    "publication_date", "opening_date", "closing_date", "total_allocation",
+)
+
+
+def _parse_allocation(value) -> float | None:
+    """Converte a 'Dotação' do HTML em float. Pontos = separador de milhares (removidos),
+    vírgula = separador decimal. Ex: '1.500.000,50 €' -> 1500000.5. Se não der, None."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = re.sub(r"[^\d.,]", "", str(value)).replace(".", "").replace(",", ".")
+    try:
+        return float(cleaned) if cleaned else None
+    except ValueError:
+        return None
 
 _GRANT_AI_FIELDS = [
     "grant_code", "title", "financing_program", "managing_entity",
@@ -20,29 +41,52 @@ _GRANT_AI_FIELDS = [
     "contact", "payment_methods", "project_selection_criteria", "eligible_expenses",
     "ineligible_expenses", "output_indicators", "result_indicators",
     "monitoring_indicators", "beneficiary_obligations", "communication_obligations",
-    "application_documents", "to_explore",
+    "application_documents", "to_explore", "bonus_mechanisms", "dnsh_criteria",
 ]
 
 
 def save_scraped_grant(grant_dict: dict, source: str) -> Grant | None:
+    """Grava/atualiza os dados vindos do scrape do HTML (fonte de verdade).
+
+    Os campos em _HTML_LOCKED_FIELDS são sempre escritos com o valor mais recente do
+    HTML (overwrite) — é assim que uma prorrogação que muda a closing_date no HTML é
+    refletida na base de dados, mesmo que o PDF já tenha sido processado.
+    """
     url = grant_dict.get("url") or grant_dict.get("scraping_url")
+    grant_code = grant_dict.get("grant_code")
     if not url:
         return None
 
-    grant, _ = Grant.objects.get_or_create(
-        scraping_url=url,
-        defaults={"source": source},
-    )
+    # Match por scraping_url ou, em falha, por grant_code (re-scrape do mesmo aviso).
+    grant = Grant.objects.filter(scraping_url=url).first()
+    if grant is None and grant_code:
+        grant = Grant.objects.filter(grant_code=grant_code).first()
+    if grant is None:
+        grant = Grant(scraping_url=url, source=source)
+
     changed = False
     if source and not grant.source:
         grant.source = source
         changed = True
+    # grant_code/title: definidos uma vez (não mudam entre versões).
+    if grant_code and not grant.grant_code:
+        grant.grant_code = grant_code
+        changed = True
     if grant_dict.get("title") and not grant.title:
         grant.title = grant_dict["title"]
         changed = True
-    if grant_dict.get("grant_code") and not grant.grant_code:
-        grant.grant_code = grant_dict["grant_code"]
-        changed = True
+
+    # Campos HTML autoritativos: overwrite sempre que o HTML traga valor não-vazio.
+    for field in _HTML_LOCKED_FIELDS:
+        value = grant_dict.get(field)
+        if field == "total_allocation":
+            value = _parse_allocation(value)
+        if value in (None, "", []):
+            continue
+        if getattr(grant, field, None) != value:
+            setattr(grant, field, value)
+            changed = True
+
     if changed:
         grant.save()
     return grant
@@ -66,11 +110,22 @@ def save_ai_grant(
     if grant is None:
         grant = Grant(scraping_url=scraping_url or f"unknown:{grant_code}", source="")
 
+    # Aponta o scraping_url para o canónico mais recente (ex: nova republicação/alteração).
+    if scraping_url and grant.scraping_url != scraping_url:
+        grant.scraping_url = scraping_url
+
     for field in _GRANT_AI_FIELDS:
         value = aviso_data.get(field)
-        if value not in (None, [], ""):
-            if force_overwrite or getattr(grant, field, None) in (None, [], ""):
+        if value in (None, [], ""):
+            continue
+        current_empty = getattr(grant, field, None) in (None, [], "")
+        if field in _HTML_LOCKED_FIELDS:
+            # Campos HTML autoritativos: a IA só preenche como fallback quando o HTML
+            # não trouxe valor; nunca sobrescreve (mesmo com force_overwrite).
+            if current_empty:
                 setattr(grant, field, value)
+        elif force_overwrite or current_empty:
+            setattr(grant, field, value)
 
     if pdf_path:
         grant.pdf_path = pdf_path

@@ -1,8 +1,10 @@
+import io
 import os
 import re
 import urllib.parse
 import requests
 from datetime import datetime
+from pypdf import PdfReader
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -46,7 +48,22 @@ def find_existing_document(url: str | None, download_dir: str) -> str | None:
     )
 
 
-def download_document(url: str | None, download_dir: str, url_pagina: str = "") -> str | None:
+def _bytes_is_invitation(data: bytes, max_pages: int = 5) -> bool:
+    """True se aparecer 'convite' nas primeiras `max_pages` páginas do PDF (não é aviso)."""
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        text = " ".join((p.extract_text() or "") for p in reader.pages[:max_pages]).lower()
+        return "convite" in text
+    except Exception:
+        return False
+
+
+def download_pdf(url: str | None, download_dir: str, reject_invitations: bool = False) -> str | None:
+    """
+    Descarrega o PDF para memória (temporário), valida e — se `reject_invitations` —
+    verifica nas primeiras 5 páginas se é um convite. Só grava no disco (download
+    efetivo) se NÃO for convite. Devolve o caminho local ou None.
+    """
     if not url:
         return None
 
@@ -58,32 +75,32 @@ def download_document(url: str | None, download_dir: str, url_pagina: str = "") 
         print(f"Já existe: {original_name} — download ignorado.")
         return existing
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    extended_name = f"{timestamp}_{original_name}"
-    path = os.path.join(download_dir, extended_name)
     try:
-        print(f"A descarregar: {extended_name}...")
-        response = requests.get(url, stream=True, timeout=30)
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
-        with open(path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        data = response.content
 
-        with open(path, "rb") as f:
-            header = f.read(5)
-        if not header.startswith(b"%PDF"):
-            print(f"Ficheiro inválido (não é PDF): {extended_name} — removido.")
-            os.remove(path)
+        # Não é PDF (ex: link para anexo .docx/.zip) → passa à frente em silêncio
+        if not data.startswith(b"%PDF"):
             return None
 
-        convert(path, download_dir, url_origem=url_pagina or url)
+        # Convite → passa à frente em silêncio (nem aparece na consola)
+        if reject_invitations and _bytes_is_invitation(data):
+            return None
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(download_dir, f"{timestamp}_{original_name}")
+        with open(path, "wb") as f:
+            f.write(data)
+        print(f"Descarregado: {os.path.basename(path)}")
         return path
     except Exception as e:
         print(f"Erro: {e}")
         return None
 
 
-def convert(path: str | None, download_dir: str = "", url_origem: str = "") -> str | None:
+def pdf_to_markdown(path: str, download_dir: str = "") -> tuple[str, str] | None:
+    """Converte um PDF em markdown limpo e grava-o. Devolve (markdown, md_path) ou None."""
     subfolder = download_dir.split("/")[-1] if download_dir else ""
     md_dir = os.path.join("output", "markdown", subfolder) if subfolder else os.path.join("output", "markdown")
     os.makedirs(md_dir, exist_ok=True)
@@ -93,26 +110,38 @@ def convert(path: str | None, download_dir: str = "", url_origem: str = "") -> s
 
     with open(path, "rb") as f:
         if not f.read(5).startswith(b"%PDF"):
-            print(f"Ficheiro inválido (não é PDF): {os.path.basename(path)} — ignorado.")
             return None
 
     try:
         result = _docling.convert(path)
-        markdown = result.document.export_to_markdown()
-        markdown = _clean_ocr(markdown)
+        markdown = _clean_ocr(result.document.export_to_markdown())
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(markdown)
+        return markdown, md_path
     except Exception as e:
         print(f"Erro docling (conversão): {e}")
         return None
 
+
+def download_document(url: str | None, download_dir: str, url_pagina: str = "") -> str | None:
+    """Fluxo single-doc (compatibilidade): download → markdown → pipeline → BD."""
+    path = download_pdf(url, download_dir)
+    if not path:
+        return None
+
+    converted = pdf_to_markdown(path, download_dir)
+    if not converted:
+        return path
+    markdown, md_path = converted
+    source_name = os.path.splitext(os.path.basename(path))[0]
+
     try:
         from ..IA.pipeline import run_pipeline
-        ai_data = run_pipeline(result.document, source_name)
+        ai_data = run_pipeline(markdown, source_name)
         if ai_data:
             from ..db_service import save_ai_grant
-            save_ai_grant(ai_data, scraping_url=url_origem, pdf_path=path, markdown_path=md_path)
+            save_ai_grant(ai_data, scraping_url=url_pagina or url, pdf_path=path, markdown_path=md_path)
     except Exception as e:
         print(f"Error saving to database: {e}")
 
-    return md_path
+    return path

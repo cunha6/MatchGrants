@@ -22,6 +22,32 @@ def create_client() -> AsyncOpenAI:
     return AsyncOpenAI(api_key=api_key)
 
 
+async def call_openai_text(
+    client: AsyncOpenAI,
+    system_prompt: str,
+    user_content: str,
+    label: str,
+    model: str,
+    max_tokens: int = 16_384,
+) -> str:
+    """Envia um prompt de texto livre e devolve a resposta em texto (não-JSON)."""
+    t = time.time()
+    print(f"  [{label}] → {model}")
+    kwargs: dict = dict(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        max_completion_tokens=max_tokens,
+    )
+    if not any(model.startswith(p) for p in _MODELS_SEM_TEMP):
+        kwargs["temperature"] = 0
+    response = await client.chat.completions.create(**kwargs)
+    print(f"  [{label}] OK ({time.time()-t:.1f}s)")
+    return response.choices[0].message.content or ""
+
+
 async def call_openai(
     client: AsyncOpenAI,
     system_prompt: str,
@@ -93,7 +119,7 @@ async def classify_ambiguous_chunks(
                 {"role": "user",   "content": "\n".join(parts)},
             ],
             response_format={"type": "json_object"},
-            max_completion_tokens=1000,
+            max_completion_tokens=4000,
             temperature=0,
         )
         raw = response.choices[0].message.content or "{}"

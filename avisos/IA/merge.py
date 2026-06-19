@@ -23,41 +23,32 @@ def _first_non_null(*dicts: dict) -> dict:
 
 def merge(r1: dict, r2: dict, r3: dict, r4: dict, r5: dict, r6: dict) -> dict:
     p1_info, bpas = parse_p1(r1)
-    p2_info, phases, areas, fa         = parse_p2(r2)
-    p3_info, rates                     = parse_p3(r3)
-    p4_info, methodologies             = parse_p4(r4)
-    p5_info, limits, penalties         = parse_p5(r5)
-    p6_info                      = parse_p6(r6)
+    p2_info, phases, areas, fa = parse_p2(r2)
+    p3_info, rates = parse_p3(r3)
+    p4_info, methodologies = parse_p4(r4)
+    p5_info, limits, penalties = parse_p5(r5)
+    p6_info = parse_p6(r6)
 
-    # Validate each partial dict through the Grant model to get English-keyed dicts
-    p1_data = Grant.model_validate(p1_info).model_dump()
-    p2_data = Grant.model_validate(p2_info).model_dump()
-    p3_data = Grant.model_validate(p3_info).model_dump()
-    p4_data = Grant.model_validate(p4_info).model_dump()
-    p5_data = Grant.model_validate(p5_info).model_dump()
-    p6_data = p6_info  # already English-keyed from parse_p6
+    # Valida cada dict parcial pelo modelo Grant para obter chaves em inglês
+    p1_data, p2_data, p3_data, p4_data, p5_data = (
+        Grant.model_validate(info).model_dump()
+        for info in (p1_info, p2_info, p3_info, p4_info, p5_info)
+    )
+    p6_data = p6_info
 
     # Merge geral: campos de cada prompt são maioritariamente não-sobrepostos
     notice_data = _first_non_null(p1_data, p2_data, p3_data, p4_data, p5_data, p6_data)
 
-    # Caso especial: contact — P3 tem prioridade, P1 complementa sem duplicar
-    contact_p3 = p3_data.get("contact") or []
-    contact_p1 = p1_data.get("contact") or []
-    notice_data["contact"] = contact_p3 + [c for c in contact_p1 if c not in contact_p3]
+    # contact — P3 tem prioridade, P1 complementa; payment_methods acumula P3+P2.
+    # dict.fromkeys preserva a ordem e remove duplicados.
+    notice_data["contact"] = list(dict.fromkeys(
+        (p3_data.get("contact") or []) + (p1_data.get("contact") or [])
+    ))
+    notice_data["payment_methods"] = list(dict.fromkeys(
+        (p3_data.get("payment_methods") or []) + (p2_data.get("payment_methods") or [])
+    ))
 
-    # Para payment_methods — acumular de todos os prompts em vez de pegar o primeiro
-    payment_methods_p2 = p2_data.get("payment_methods") or []
-    payment_methods_p3 = p3_data.get("payment_methods") or []
-    # Deduplicar e combinar
-    seen = set()
-    combined = []
-    for item in payment_methods_p3 + payment_methods_p2:
-        if item not in seen:
-            seen.add(item)
-            combined.append(item)
-    notice_data["payment_methods"] = combined
-
-    # Merge application_documents from p6
+    # application_documents vêm do P6
     if p6_data.get("application_documents"):
         notice_data["application_documents"] = p6_data["application_documents"]
 

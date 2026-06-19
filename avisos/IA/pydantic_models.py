@@ -185,6 +185,9 @@ class Grant(_Base):
     communication_obligations:           CoercedList  = Field(default_factory=list, alias="obrigacoes_comunicacao")
     # P6 — documentos
     application_documents:               list[ApplicationDocument] = Field(default_factory=list, alias="documentos_candidatura")
+    # Campos adicionais de cobertura
+    bonus_mechanisms:                    CoercedList  = Field(default_factory=list)
+    dnsh_criteria:                       CoercedStr   = None
     # P7 — temas dos Anexos não capturados
     to_explore:                          CoercedList  = Field(default_factory=list, alias="aprofundar")
 
