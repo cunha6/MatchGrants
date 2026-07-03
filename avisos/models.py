@@ -34,7 +34,12 @@ class Grant(models.Model):
     program_priority = models.TextField(blank=True, null=True)
     intervention_type_code = models.TextField(blank=True, null=True)
     max_duration_months = models.IntegerField(null=True, blank=True)
-    eligible_cae_codes = models.JSONField(default=list, blank=True)
+    # Padrões CAE com wildcard ('*') normalizados pela IA, hierárquicos por prefixo:
+    # Divisão '64***', Grupo '651**', Classe '6512*', Subclasse '65124'.
+    # included_caes: se não vazio, SÓ estes são elegíveis. excluded_caes: tudo menos estes.
+    # Ambos vazios ⇒ sem restrição de CAE (qualquer CAE elegível).
+    included_caes = models.JSONField(default=list, blank=True)
+    excluded_caes = models.JSONField(default=list, blank=True)
     eligible_regions = models.JSONField(default=list, blank=True)
     expense_eligibility_start_date = models.TextField(blank=True, null=True)
     specific_objective = models.TextField(blank=True, null=True)
@@ -46,6 +51,9 @@ class Grant(models.Model):
     target_technology_sectors = models.JSONField(default=list, blank=True)
     application_submission = models.TextField(blank=True, null=True)
     beneficiary_eligibility_criteria = models.JSONField(default=list, blank=True)
+    # QUE operações são elegíveis (distinto de QUEM se pode candidatar, acima).
+    operation_eligibility_criteria = models.JSONField(default=list, blank=True)
+    admissibility_conditions = models.JSONField(default=list, blank=True)
     final_recipients = models.JSONField(default=list, blank=True)
     dnsh_principle = models.TextField(blank=True, null=True)
     commitment_requirements = models.TextField(blank=True, null=True)
@@ -112,6 +120,7 @@ class PhaseArea(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="phase_areas")
     phase_code = models.CharField(max_length=255, blank=True, null=True)
     area_code = models.CharField(max_length=255, blank=True, null=True)
+    fund_name = models.CharField(max_length=255, blank=True, null=True)
     budget_allocation = models.FloatField(null=True, blank=True)
     max_financing_rate = models.FloatField(null=True, blank=True)
 
@@ -156,6 +165,7 @@ class EvaluationMethodology(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="evaluation_methodologies")
     evaluation_code = models.CharField(max_length=255, blank=True, null=True)
     project_merit_formula = models.TextField(blank=True, null=True)
+    scoring_scale = models.TextField(blank=True, null=True)
     min_global_score = models.FloatField(null=True, blank=True)
     evaluation_criteria = models.JSONField(default=list, blank=True)
     tiebreaker_criteria = models.JSONField(default=list, blank=True)

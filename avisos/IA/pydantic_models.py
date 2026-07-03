@@ -144,7 +144,8 @@ class Grant(_Base):
     program_priority:                    CoercedStr   = Field(default=None, alias="prioridade_programa")
     intervention_type_code:              CoercedStr   = Field(default=None, alias="tipo_intervencao_codigo")
     max_duration_months:                 CoercedInt   = Field(default=None, alias="duracao_maxima_meses")
-    eligible_cae_codes:                  CoercedList  = Field(default_factory=list, alias="caes_elegiveis")
+    included_caes:                       CoercedList  = Field(default_factory=list, alias="caes_incluidos")
+    excluded_caes:                       CoercedList  = Field(default_factory=list, alias="caes_excluidos")
     eligible_regions:                    CoercedList  = Field(default_factory=list, alias="regioes_admissiveis")
     expense_eligibility_start_date:      CoercedStr   = Field(default=None, alias="data_inicio_elegibilidade_despesa")
     specific_objective:                  CoercedStr   = Field(default=None, alias="objetivo_especifico")
@@ -156,6 +157,8 @@ class Grant(_Base):
     target_technology_sectors:           CoercedList  = Field(default_factory=list, alias="setores_tecnologicos_alvo")
     application_submission:              CoercedStr   = Field(default=None, alias="submissao_candidaturas")
     beneficiary_eligibility_criteria:    CoercedList  = Field(default_factory=list, alias="criterios_elegibilidade_beneficiario")
+    operation_eligibility_criteria:      CoercedList  = Field(default_factory=list, alias="criterios_elegibilidade_operacao")
+    admissibility_conditions:            CoercedList  = Field(default_factory=list, alias="condicoes_admissibilidade")
     final_recipients:                    CoercedList  = Field(default_factory=list, alias="destinatarios_finais")
     dnsh_principle:                      CoercedStr   = Field(default=None, alias="principio_dnsh")
     commitment_requirements:             CoercedStr   = Field(default=None, alias="requisitos_compromisso")
@@ -238,6 +241,9 @@ class EvaluationMethodology(_Base):
     evaluation_code:        CoercedStr   = Field(default=None, alias="codigo_avaliacao")
     grant_code:             CoercedStr   = Field(default=None, alias="codigo_aviso")
     project_merit_formula:  CoercedStr   = Field(default=None, alias="formula_merito_projeto")
+    # Como se contabilizam os pontos: escala (ex: 1-5) + significado de cada nível +
+    # regras de arredondamento. Distinto da fórmula (que pondera os critérios).
+    scoring_scale:          CoercedStr   = Field(default=None, alias="escala_pontuacao")
     min_global_score:       CoercedFloat = Field(default=None, alias="pontuacao_minima_global")
     evaluation_criteria:    list[CriterioAvaliacao] = Field(default_factory=list, alias="criterios_avaliacao")
     tiebreaker_criteria:    CoercedList  = Field(default_factory=list, alias="criterios_desempate")
@@ -262,6 +268,9 @@ class PhaseArea(_Base):
     phase_code:          CoercedStr   = Field(default=None, alias="codigo_fase")
     area_code:           CoercedStr   = Field(default=None, alias="codigo_area")
     grant_code:          CoercedStr   = Field(default=None, alias="codigo_aviso")
+    # Fundo/rubrica desta linha de dotação (ex: "FSE+", "FEDER", "Dotação Global"). Permite
+    # distinguir a dotação por fundo (ex: 85%) da Dotação Global (100%) quando diferem.
+    fund_name:           CoercedStr   = Field(default=None, alias="nome_fundo")
     budget_allocation:   CoercedFloat = Field(default=None, alias="dotacao_orcamental")
     max_financing_rate:  CoercedFloat = Field(default=None, alias="taxa_financiamento_maxima")
 

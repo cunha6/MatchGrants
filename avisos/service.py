@@ -12,7 +12,7 @@ import os
 from .scrape_compete import scrape_compete2030_web
 from .scrape_portugal import scrape_portugal2030_web
 from .scrape_prr import scrape_prr_web
-from .Docling.converter import download_pdf, pdf_to_markdown, find_existing_document
+from .Docling.converter import download_pdf, pdf_to_markdown, find_existing_document, text_is_invitation
 from .IA.pipeline import run_pipeline, consolidate_markdowns
 from .documents import (
     classify_document, order_documents, needs_consolidation, amendment_ordinal,
@@ -75,6 +75,17 @@ def _store_documents(grant_rec, ordered: list[dict], canonical_url: str) -> None
     ])
 
 
+def _discard_files(*paths: str | None) -> None:
+    """Remove (best-effort) ficheiros de um aviso que decidimos NÃO processar (ex: convite)."""
+    for p in paths:
+        if not p:
+            continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def _process_grant(grant: dict, download_dir: str, source_label: str):
     """Processa um aviso: usa o aviso escolhido pelo scraper, consolida, extrai e persiste."""
     # Canónico = aviso que o scraper escolheu (bottom-up + código + words_search/reject).
@@ -99,20 +110,29 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     # Outros documentos primários (para consolidação de alterações e para registo)
     ordered = order_documents([d for d in _candidate_documents(grant) if d["url"] != canonical_url])
 
-    # Download efetivo (PDF novo, não está na pasta). Verificação de convite incluída;
-    # convite / não-PDF / erro → return sem criar qualquer registo.
+    # Download efetivo (PDF novo). O `reject_invitations` faz a verificação de convite
+    # BARATA e primeiro: lê a "Natureza do aviso" no texto do PDF (pypdf) ANTES de converter —
+    # convites detetáveis aqui devolvem None e nem chegam a ser convertidos nem gravados.
+    # não-PDF / erro / convite → return sem criar qualquer registo.
     path = download_pdf(canonical_url, download_dir, reject_invitations=True)
     if not path:
         return None
     source_name = os.path.splitext(os.path.basename(path))[0]
 
-    # PDF descarregado → agora grava os dados do HTML correspondente (cria o registo).
-    save_scraped_grant({**grant, "url": canonical_url}, source_label)
-
     converted = pdf_to_markdown(path, download_dir)
     if not converted:
         return None
     canonical_md, md_path = converted
+
+    # Rede de segurança: PDFs onde o texto cru saiu pobre (ex: capa mal extraída) e a Natureza
+    # só ficou legível depois da conversão. Se for convite, ignoramos e apagamos os ficheiros.
+    if text_is_invitation(canonical_md):
+        print(f"  [Convite] {source_name}: Natureza=convite — ignorado")
+        _discard_files(path, md_path)
+        return None
+
+    # É concurso → grava os dados do HTML correspondente (cria o registo).
+    save_scraped_grant({**grant, "url": canonical_url}, source_label)
 
     # Consolidação: se o canónico for um diff puro, aplicar sobre o documento base
     final_md = canonical_md
@@ -135,8 +155,13 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
             needs_review = True
             print(f"  [Consolidação] {source_name}: diff sem base — marcado needs_review")
 
-    # Anexos: não descarregados — apenas nome + url no JSON de saída
-    extra = {"annex_documents": [{"name": a["name"], "url": a["url"]} for a in annexes]}
+    # annex_documents: TODOS os documentos da página do aviso — apenas nome + url
+    # no JSON de saída (não são descarregados, ficam só para referência).
+    extra = {"annex_documents": [
+        {"name": d.get("nome", ""), "url": d["url"]}
+        for d in grant.get("documentos") or []
+        if d.get("url")
+    ]}
     ai_data = run_pipeline(final_md, source_name, extra=extra)
     # Só chegamos aqui quando o PDF canónico ainda não estava em disco — aviso novo ou
     # canonical mudou (republicação/alteração mais recente). Em ambos os casos os dados

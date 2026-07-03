@@ -5,7 +5,14 @@
 .env
 
 pdf_Avisos/
+pdf_Anuncios/
 output/
+
+# Artefactos de runtime da importação de anúncios
+anuncios_import.lock
+anuncios_import.pid
+
+dictionary_by_nif.json
 
 # Ambiente virtual
 venv/

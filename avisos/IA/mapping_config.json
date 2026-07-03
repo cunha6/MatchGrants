@@ -153,7 +153,15 @@
       "condições de atribuição de financiamento",
       "condições de atribuição",
       "atribuição de financiamento",
-      "taxa máxima de cofinanciamento"
+      "taxa máxima de cofinanciamento",
+      "metas de execução financeira", 
+      "taxa de execução", 
+      "execução financeira anual",
+      "meta financeira", 
+      "certificação de despesa", 
+      "n+2", 
+      "n+3", 
+      "% de execução"
     ],
     "financiamento_pagamentos": [
       "formas de pagamento",

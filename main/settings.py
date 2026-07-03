@@ -21,7 +21,15 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'avisos',
     'users',
+    'match',
+    'anuncios',
 ]
+
+# Chave da API nif.pt — lida do .env.
+NIF_KEY = os.getenv('NIF_KEY')
+
+# Token da API base.gov.pt (header _AcessToken) — lido do .env.
+BASE_KEY = os.getenv('BASE_KEY')
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -67,8 +75,17 @@ DATABASES = {
         'PASSWORD': os.getenv('DB_PASSWORD'),
         'HOST': os.getenv('DB_HOST'),
         'PORT': os.getenv('DB_PORT'),
-    }
+    },
+    # Base de dados só-leitura de enriquecimento por NIF (empregados, proveitos, região)
+    # carregada do dictionary_by_nif.json. SQLite indexado por NIF — 454k registos.
+    'nif': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'nif_data.sqlite3',
+    },
 }
+
+# Encaminha o modelo match.NifCompany para a BD 'nif'; tudo o resto vai para 'default'.
+DATABASE_ROUTERS = ['match.routers.NifRouter']
 
 LANGUAGE_CODE = 'pt-pt'
 TIME_ZONE = 'Europe/Lisbon'

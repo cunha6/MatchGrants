@@ -48,12 +48,38 @@ def find_existing_document(url: str | None, download_dir: str) -> str | None:
     )
 
 
+def text_is_invitation(text: str) -> bool:
+    """True se a Natureza/Modalidade do aviso for 'convite' (não queremos convites).
+
+    Deteção PRECISA: lê o valor do campo "Natureza do aviso" (na mesma linha ou nas linhas
+    logo a seguir ao rótulo) em vez de procurar a palavra 'convite' em qualquer sítio — assim
+    não rejeita concursos que apenas a mencionem, e apanha convites cujo documento se chama
+    "Aviso". Também aceita a frase direta "convite à apresentação de candidaturas".
+    """
+    if not text:
+        return False
+    low = text.lower()
+    m = re.search(r"natureza\s+do\s+aviso\s*[:\-]?\s*([^\n]*(?:\n\s*[^\n]+){0,2})", low)
+    if m:
+        seg = m.group(1)
+        i_conv, i_conc = seg.find("convite"), seg.find("concurso")
+        if i_conv != -1 and (i_conc == -1 or i_conv < i_conc):
+            return True
+        if i_conc != -1:
+            return False
+    return bool(re.search(r"convite\s+(?:à|a)\s+apresenta", low))
+
+
 def _bytes_is_invitation(data: bytes, max_pages: int = 5) -> bool:
-    """True se aparecer 'convite' nas primeiras `max_pages` páginas do PDF (não é aviso)."""
+    """True se a Natureza do aviso nas primeiras `max_pages` páginas indicar convite.
+
+    Verificação BARATA (texto do pypdf), feita no download ANTES da conversão Docling —
+    convites detetáveis aqui nem chegam a ser convertidos nem gravados em disco.
+    """
     try:
         reader = PdfReader(io.BytesIO(data))
-        text = " ".join((p.extract_text() or "") for p in reader.pages[:max_pages]).lower()
-        return "convite" in text
+        text = " ".join((p.extract_text() or "") for p in reader.pages[:max_pages])
+        return text_is_invitation(text)
     except Exception:
         return False
 

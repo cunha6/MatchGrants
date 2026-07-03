@@ -41,6 +41,20 @@ M5. "NÃO APLICÁVEL" ≠ null — DISTINÇÃO OBRIGATÓRIA:
    devolve a string "Não Aplicável", NÃO null.
    null nunca deve mascarar informação explicitamente negativa que está no documento.
 
+M6. CONTINUAÇÃO ENTRE PARÁGRAFOS — NÃO CORTAR INFORMAÇÃO:
+   O fim de um parágrafo NÃO é necessariamente o fim da ideia. Antes de fechar o valor
+   de um campo, LÊ o(s) parágrafo(s) seguinte(s): se continuarem a falar do MESMO assunto
+   (mesmo critério, mesma condição, mesma taxa, mesma obrigação), o valor do campo tem de
+   incluir também esse conteúdo.
+   • NUNCA te fiques pelas primeiras palavras ou pela primeira frase de uma secção — uma
+     condição importante aparece muitas vezes só no 2.º ou 3.º parágrafo (ex: uma exceção,
+     um limite, uma majoração, um prazo).
+   • Sinais de que o assunto continua: o parágrafo seguinte começa por "Adicionalmente",
+     "Sem prejuízo", "Contudo", "No entanto", "Acresce que", "Excetua-se", "Para o efeito";
+     o parágrafo anterior termina em ":"; seguem-se listas/alíneas (a), b), -, •).
+   • Concatena a informação contínua num único valor coerente em vez de reter só o início.
+   Regra prática: perde-se mais por cortar cedo do que por incluir uma frase de contexto a mais.
+
 """
 
 # P1 — Identificação, Metadados, Entidades e Enquadramento Estratégico
@@ -74,6 +88,16 @@ REGRAS (CRÍTICO):
    ultima_republicacao = número/identificador da versão atual (ex: "1.11", "v3", "Republicação 2"). As versões usam notação incremental (ex: 1.11 > 1.9).
    PROIBIDO: `ultima_republicacao` não pode ser um número de página (ex: "1/42", "3/35"). Se o documento não tiver tabela de versões com identificadores explícitos (ex: "v1.1", "Republicação 3"), usa null. Apenas preenche com o identificador de versão quando estiver inequivocamente presente (ex: coluna "Versão" numa tabela).
 
+1b. MODALIDADE / NATUREZA DO AVISO — VALOR NORMALIZADO (CRÍTICO):
+   `notice_modality` só pode ter um de DOIS valores, em minúsculas: "concurso" ou "convite".
+   Procura o campo "Natureza do aviso", "Modalidade do aviso" ou frases equivalentes
+   (ex: "Aviso para apresentação de candidaturas por concurso", "convite à apresentação
+   de candidaturas") e NORMALIZA:
+   - contém "concurso" / "por concurso" / "concorrencial" → "concurso"
+   - contém "convite" / "por convite" → "convite"
+   NÃO copies a frase longa; devolve apenas "concurso" ou "convite". Se a natureza não
+   for identificável no texto, devolve null (não inventes).
+
 2. FUNDO: Extrai o(s) nome(s) completo(s) do(s) fundo(s) financiador(es) em `nome_fundo` (ex: "Fundo Europeu de Desenvolvimento Regional (FEDER)"). Se multi-fundo, separa com " + ". Não extraias valores monetários por fundo — a dotação global é extraída noutra fase.
    Procura `nome_fundo` também em tabelas de Dotação com coluna "Fundo" (ex: linha "FEDER",
    "FSE+" numa tabela). Quando encontrares a sigla, expande para o nome completo:
@@ -86,7 +110,8 @@ REGRAS (CRÍTICO):
 
 3. REGIÕES ADMISSÍVEIS: Extrai apenas unidades NUTS II e NUTS III em `regioes_admissiveis` (ex: "NUTS II Norte", "NUTS III Ave", "Região Norte").
    PROIBIDO: NÃO incluas nomes de CIM (Comunidade Intermunicipal), AMP (Área Metropolitana do Porto) nem AMAL (Algarve) — esses pertencem à distribuição territorial financeira gerida noutro passo.
-   - CAES: Extrai Códigos CAE elegíveis se mencionados (ex: "62010") ou ["Todos"] se não houver restrição.
+   - CAES: ver a regra 14 — codifica os CAE em padrões wildcard nos campos
+     `included_caes`/`excluded_caes`. Ambos [] se não houver restrição de CAE.
    - ELEGIBILIDADE DE DESPESA: Procura data a partir da qual as despesas são aceites.
    Procura `regioes_admissiveis` também na secção "Área geográfica abrangida" e na secção
    "Área geográfica" da tabela de Dotação. Se o documento disser "NUTS II – Alentejo" ou
@@ -168,7 +193,54 @@ REGRAS (CRÍTICO):
 
 13. REGIÕES ADMISSÍVEIS — REGRA ABSOLUTA: `regioes_admissiveis` contém EXCLUSIVAMENTE designações NUTS II ou NUTS III. É ABSOLUTAMENTE PROIBIDO incluir nomes de CIM, AMP, AMAL ou qualquer subdivisão administrativa que não seja NUTS II/NUTS III.
 
-14. CAEs EXCLUÍDAS VS ELEGÍVEIS: Se o aviso indicar que TODOS os CAEs são elegíveis EXCETO uma lista, usa o formato `["Todos exceto: <lista separada por vírgulas>"]`. Se não houver restrição, usa `["Todos"]`.
+14. CAEs — NORMALIZAÇÃO EM PADRÕES WILDCARD (CRÍTICO, LEITURA OBRIGATÓRIA):
+    O CAE português é hierárquico por PREFIXO de 5 dígitos:
+      • Divisão   = 2 primeiros dígitos
+      • Grupo     = 3 primeiros dígitos
+      • Classe    = 4 primeiros dígitos
+      • Subclasse = código completo de 5 dígitos
+    Converte TODA a informação de CAE em padrões de EXATAMENTE 5 caracteres, onde '*'
+    significa "qualquer dígito a partir desta posição". A posição do primeiro '*' codifica
+    o nível:
+      • Divisão  64   → "64***"
+      • Grupo    651  → "651**"
+      • Classe   6512 → "6512*"
+      • Subclasse 65124 → "65124"   (sem '*', código exato)
+    O '*' é SEMPRE sufixo contíguo no fim. PROIBIDO '*' no meio (ex: "6*1**" é inválido).
+    Cada padrão tem SEMPRE 5 caracteres ao todo (dígitos + '*').
+
+    DOIS CAMPOS DE SAÍDA (preenche o(s) que se aplicar(em), o outro fica []):
+      • `included_caes`: lista positiva — quando o aviso diz que SÓ certos CAE são elegíveis
+        ("apenas os CAE...", "são elegíveis as atividades CAE..."). Se preenchido, qualquer
+        CAE fora desta lista NÃO é elegível.
+      • `excluded_caes`: lista de exclusão — quando o aviso diz "Todos EXCETO..." / "com
+        exceção de..." / "não são elegíveis os CAE...".
+    Se o aviso não tiver qualquer restrição de CAE: ambos [] (ambos vazios = qualquer CAE
+    elegível). Não existe campo de texto-resumo — toda a informação de CAE é codificada
+    nos padrões wildcard de included_caes/excluded_caes.
+
+    INTERPRETAÇÃO RIGOROSA DE INTERVALOS — DISTINÇÃO ABSOLUTA (não confundir):
+      • "Divisões 64 A 66" / "64 a 66" / "de 64 a 66" / "64-66" → INTERVALO FECHADO,
+        inclui TODOS os números entre os extremos: 64, 65 e 66
+        → ["64***", "65***", "66***"]
+      • "Divisões 64 E 66" / "64 e 66" / "64, 66" → APENAS os enumerados: 64 e 66
+        (NÃO inclui o 65) → ["64***", "66***"]
+    TESTE OBRIGATÓRIO antes de expandir: a palavra de ligação é "a"/"até"/"-" (intervalo)
+    ou "e"/","/"ou" (enumeração)? Lê com atenção — trocar "a" por "e" muda completamente
+    o conjunto de CAE excluídos. Na dúvida entre intervalo e enumeração, trata como
+    enumeração (NÃO inventes os números intermédios).
+    Quando o intervalo for de divisões, EXPANDE-O explicitamente para um padrão por cada
+    divisão (nunca devolvas "64-66" como um único item).
+
+    EXEMPLO COMPLETO:
+      Texto: "Todos exceto: Divisões 64 a 66; Subclasses 25301; 25302; 30130; Divisão 92"
+      → excluded_caes = ["64***","65***","66***","25301","25302","30130","92***"]
+      → included_caes = []
+
+    REGRAS FINAIS:
+      • Compara/escreve sempre os CAE como STRING (preserva zeros à esquerda, ex: "01111").
+      • Não inventes CAE que não estejam no texto. Se a fonte estiver ambígua/ilegível,
+        deixa esse padrão de fora.
 
 15. SUBMISSÃO DE CANDIDATURAS — TRANSCRIÇÃO OBRIGATÓRIA:
     Procura a secção "Apresentação" ou "Apresentação de candidaturas" e copia LITERALMENTE
@@ -180,17 +252,6 @@ REGRAS (CRÍTICO):
 
 17. OBJETIVO ESPECÍFICO: Extrai o código e descrição completos tal como aparecem na tabela
     de Dotação. NUNCA devolves null se a tabela tiver o campo "Objetivos específicos" preenchido.
-
-18. REGIME DE AUXÍLIO DE ESTADO — LIMPEZA DE TEXTO: Extrai do checkbox marcado (☒).
-    Se "Não Aplicável?" estiver marcado, o valor é "Não Aplicável" (sem "?").
-
-19. INVESTIMENTO MÍNIMO E MÁXIMO — LIMITES POR OPERAÇÃO INDIVIDUAL:
-    `investimento_minimo`: se o aviso definir um custo mínimo por operação (ex: "cada operação
-    deve ter um custo total superior a 200 mil euros", "investimento mínimo de X€ por projeto"),
-    extrai o valor numérico em euros. Esta informação aparece frequentemente nos critérios de
-    elegibilidade das candidaturas — lê-os com atenção. Não confundas com dotação global.
-    `investimento_maximo`: limite máximo por operação individual com linguagem explícita como
-    "apoio máximo por candidatura de X€". Se não definir explicitamente, devolve null.
 
 20. CONTACTOS DOS ORGANISMOS — FORMATO ESTRUTURADO:
     Para cada organismo intermédio que tenha contactos listados no aviso (telefone, email, morada,
@@ -226,6 +287,16 @@ REGRAS (CRÍTICO):
     como domínios transversais elegíveis, os três devem aparecer na lista.
     NUNCA devolves lista com apenas 1 item se o documento mencionar múltiplos domínios.
 
+23. ELEGIBILIDADE — TRÊS NÍVEIS DISTINTOS (não misturar):
+    • beneficiary_eligibility_criteria = QUEM se pode candidatar (natureza/forma jurídica,
+      situação tributária, certificações da entidade).
+    • operation_eligibility_criteria = QUE operações são elegíveis (custo mínimo por operação,
+      condições setoriais/CAE, efeito de incentivo, localização, atividades excluídas, duração,
+      número máximo de candidaturas).
+    • project_selection_criteria (P4) = como se PONTUA o mérito — NÃO é elegibilidade.
+    Lê a secção "Condições de elegibilidade das operações"/"Condições de acesso" e coloca cada
+    condição em operation_eligibility_criteria. NUNCA a misture com a do beneficiário.
+
 ESQUEMA DE DADOS ESPERADO:
 {
   "Grant_Part1": {
@@ -236,13 +307,14 @@ ESQUEMA DE DADOS ESPERADO:
     "republication_date": "YYYY-MM-DDThh:mm:ss ou null",
     "last_republication": "String ou null",
     "amendment_date": "YYYY-MM-DDThh:mm:ss ou null",
-    "notice_modality": "String ou null",
+    "notice_modality": "'concurso' | 'convite' | null (normalizado — nunca a frase longa)",
     "objective": "String ou null",
     "fund_name": "String ou null",
     "program_priority": "String ou null",
     "intervention_type_code": "String ou null",
     "max_duration_months": "Integer ou null",
-    "eligible_cae_codes": ["List de Strings"],
+    "included_caes": ["List de padrões wildcard de 5 chars, ex: '651**' — só estes elegíveis; [] se sem lista positiva"],
+    "excluded_caes": ["List de padrões wildcard de 5 chars, ex: '64***' — estes NÃO elegíveis; [] se sem exclusões"],
     "eligible_regions": ["List de Strings - NUTS II e/ou NUTS III admissíveis"],
     "expense_eligibility_start_date": "YYYY-MM-DDThh:mm:ss ou null",
     "specific_objective": "String ou null",
@@ -254,13 +326,13 @@ ESQUEMA DE DADOS ESPERADO:
     "target_technology_sectors": ["List de Strings ou []"],
     "application_submission": "String",
     "beneficiary_eligibility_criteria": ["List de Strings"],
+    "operation_eligibility_criteria": ["List de Strings — condições de elegibilidade/acesso das OPERAÇÕES"],
+    "admissibility_conditions": ["List de Strings — condições de aceitação/admissão da candidatura, ou []"],
     "final_recipients": ["List de Strings ou []"],
     "dnsh_principle": "String ou null",
     "dnsh_criteria": "String ou null",
     "contact": ["List de Strings — 'Entidade - Responsável: X | Telefone: Y | Email: Z'"],
-    "commitment_requirements": "String ou null",
-    "minimum_investment": "Float ou null",
-    "maximum_investment": "Float ou null"
+    "commitment_requirements": "String ou null"
   },
   "BeneficiaryByAction": [
     { "grant_code": "String", "action_type": "String", "entities": ["List de Strings"] }
@@ -329,6 +401,8 @@ REGRAS CRÍTICAS:
    (ex: duas tabelas separadas, ou texto com "para operações infraestruturais: X%" e "para
    operações não infraestruturais: Y%"). Se o documento tiver apenas uma série de metas sem
    essa distinção explícita, extrai as metas sem qualquer prefixo.
+   As metas saem SEMPRE em `financial_execution_targets` (lista estruturada), mesmo que o P1
+   também as resuma noutro campo. São destinos distintos e não se anulam.
 
 5. FASES: data_inicio (abertura do aviso) e data_fim (fecho da fase com hora, ex: T18:00:00).
 
@@ -372,6 +446,35 @@ REGRAS CRÍTICAS:
     Só crias múltiplas entradas por área se o aviso tiver dotações diferentes por fase
     (ex: "Fase 1: 500.000€", "Fase 2: 300.000€" para a mesma CIM).
 
+7. DOTAÇÃO POR FUNDO vs DOTAÇÃO GLOBAL — DUAS ENTRADAS DISTINTAS (CRÍTICO):
+   As tabelas de dotação distinguem frequentemente a comparticipação do FUNDO (ex: FSE+ a
+   85%) da DOTAÇÃO GLOBAL da operação (100%, = fundo + contrapartida nacional). Estas são
+   DUAS dotações diferentes e o JSON tem de as tornar EXPLÍCITAS: cria uma entrada de
+   PhaseArea por cada uma, usando o campo `nome_fundo` e um `codigo_fase` distinto.
+
+   Para cada área:
+   - Entrada do FUNDO: `nome_fundo` = sigla do fundo (ex: "FSE+", "FEDER"),
+     `dotacao_orcamental` = valor comparticipado pelo fundo,
+     `taxa_financiamento_maxima` = taxa do fundo (ex: 85.0),
+     `codigo_fase` = a sigla do fundo (ex: "FSE+").
+   - Entrada da DOTAÇÃO GLOBAL: `nome_fundo` = "Dotação Global",
+     `dotacao_orcamental` = valor total da operação,
+     `taxa_financiamento_maxima` = 100.0,
+     `codigo_fase` = "GLOBAL".
+
+   EXEMPLO (FSE+ 4.000.000,00€ a 85% e Dotação Global 4.705.882,34€ a 100%):
+     PhaseArea = [
+       { "codigo_fase": "FSE+",   "codigo_area": "A1", "nome_fundo": "FSE+",
+         "dotacao_orcamental": 4000000.00, "taxa_financiamento_maxima": 85.0 },
+       { "codigo_fase": "GLOBAL", "codigo_area": "A1", "nome_fundo": "Dotação Global",
+         "dotacao_orcamental": 4705882.34, "taxa_financiamento_maxima": 100.0 }
+     ]
+
+   REGRA DE SUPRESSÃO: só cria a entrada "Dotação Global" SE o valor global for DIFERENTE
+   da dotação do fundo. Se o aviso só indicar um valor (fundo = global, ou não há
+   contrapartida distinta), cria UMA única entrada com `nome_fundo` = fundo desse valor.
+   Multi-fundo: uma entrada por fundo + uma entrada "Dotação Global" (se diferir da soma).
+
 ESQUEMA DE DADOS ESPERADO:
 {
   "Grant": {
@@ -402,11 +505,12 @@ ESQUEMA DE DADOS ESPERADO:
   ],
   "PhaseArea": [
     {
-      "phase_code": "String — 'GLOBAL' se a tabela territorial não mencionar fases; nunca 'F1' por defeito",
+      "phase_code": "String — sigla do fundo (ex: 'FSE+') ou 'GLOBAL'; nunca 'F1' por defeito",
       "area_code": "String",
       "grant_code": "String",
+      "fund_name": "String — fundo desta linha (ex: 'FSE+', 'FEDER') ou 'Dotação Global'",
       "budget_allocation": "Float ou null",
-      "max_financing_rate": "Float ou null"
+      "max_financing_rate": "Float ou null (100.0 na linha da Dotação Global)"
     }
   ]
 }
@@ -426,24 +530,17 @@ REGRAS (CRÍTICO):
 1. TAXAS SÃO PERCENTAGENS: Extrai `taxa_base`, `majoracao_regional` e `taxa_maxima_global`
    separadamente como Float. Se variável, usa a string "Negociável".
 
-2. REGIME DE AUXÍLIOS DE ESTADO — LEITURA MULTI-FORMATO:
-   `regime_auxilio_estado` aparece em vários formatos conforme o aviso:
-   - Secção "Auxílios de Estado" com checkbox → extrai o regime do checkbox MARCADO (☒)
-     (ex: "Regulamento Geral de Isenção de Categoria", "Auxílios de minimis", "Não Aplicável")
-   - Campo "Regime de auxílio aplicável:" → extrai o valor
-   - Tabela com linha "Auxílio de Estado" → extrai a célula de valor
-   - Referência a "Regulamento (UE) n.º 651/2014" → "Regulamento Geral de Isenção de Categoria"
-   - "Não sujeito a regime de auxílios" → "Não Aplicável"
-   NUNCA deixes null quando a secção "Auxílios de Estado" existe no documento.
-   Identifica também o Artigo específico do RGBC se mencionado → `artigo_rgbc_aplicavel`.
-
-   PRIORIDADE ABSOLUTA DO CHECKBOX (CRÍTICO):
-   O checkbox marcado (☒) prevalece SEMPRE sobre qualquer referência textual ao regulamento.
-   Se ☒ Não Aplicável estiver marcado, o valor é "Não Aplicável" MESMO QUE o texto de
-   fundamentação logo a seguir mencione o RGIC, o artigo 27.º ou qualquer outro regulamento.
-   O texto de fundamentação explica PORQUÊ é "Não Aplicável" — não é o valor do campo.
-   TESTE OBRIGATÓRIO: "qual é o checkbox marcado com ☒?" → esse é o valor do campo.
-   Só uses o texto de fundamentação se não existir nenhum checkbox marcado.
+2. REGIME DE AUXÍLIOS — COERÊNCIA COM O ARTIGO (CRÍTICO):
+   Determina primeiro se existe um artigo/regulamento de enquadramento referido no texto.
+   - Se o texto referir um artigo do RGIC (ex: "artigo 27.º", "651/2014") OU "de minimis"
+     OU "regime de auxílios" aplicável — mesmo que de forma condicional ("sempre que se
+     conclua que constituem auxílio...") → o regime NÃO é "Não Aplicável".
+     Extrai: "Regulamento Geral de Isenção por Categoria (RGIC)" ou "De minimis" conforme o caso.
+   - Só usa "Não Aplicável" quando o documento afirma explicitamente que as operações NÃO
+     constituem auxílio de Estado E não refere nenhum artigo de enquadramento.
+   REGRA DE CONSISTÊNCIA OBRIGATÓRIA: se `applicable_gber_article` ficar preenchido,
+   `state_aid_regime` NÃO pode ser "Não Aplicável". Os dois campos são logicamente acoplados.
+   Como a fonte é OCR de imagem, NÃO confies no glifo de checkbox isolado — decide pelo texto.
 
 3. AUTOFINANCIAMENTO: Verifica se é exigida percentagem mínima de capitais próprios.
 
@@ -597,7 +694,8 @@ ESQUEMA JSON OBRIGATÓRIO:
     {
       "evaluation_code": "String",
       "grant_code": "String",
-      "project_merit_formula": "String ou null",
+      "project_merit_formula": "String ou null — NUNCA pesos iguais fabricados; null se não explícito",
+      "scoring_scale": "String ou null — escala/rubrica dos pontos (ex: 1-5 e significado de cada nível)",
       "min_global_score": "Float ou null",
       "_verificacao": {
         "nivel1": "String — ex: 'A(60.0) + B(40.0) = 100.0 ✓'",
@@ -731,13 +829,23 @@ REGRAS CRÍTICAS:
    TIPO CONSISTENTE: `pontuacao_minima_criterio_exclusao` é SEMPRE Boolean (true ou false),
    NUNCA null. Todos os critérios devem ter este campo preenchido.
 
-4b. FÓRMULA DE MÉRITO — APENAS COM CRITÉRIOS DE NÍVEL 1:
+4b. FÓRMULA DE MÉRITO — SÓ A PARTIR DE DADOS EXPLÍCITOS (NUNCA FABRICAR):
    A fórmula usa EXCLUSIVAMENTE os critérios de nível 1 (A, B, C…) e os seus pesos absolutos.
    CORRECTO: "MP = 0.65×A + 0.35×B"
    ERRADO:   "MP = 0.25×A1 + 0.10×A2 + 0.30×A3 + ..."
-   Se existir fórmula explícita no documento: copia-a.
-   Se não existir: constrói com os pesos de nível 1 divididos por 100.
-   Se existir escala definida: acrescenta " | Escala: X-Y-Z".
+   ORDEM DE DECISÃO OBRIGATÓRIA:
+   1) Existe fórmula explícita no texto (ex: "MP = 0,30A + 0,25B + 0,20C + 0,25D")? → copia-a
+      EXATAMENTE.
+   2) Senão, os PESOS de nível 1 estão explícitos numa grelha/tabela? → constrói a fórmula
+      com esses pesos (coeficiente = peso/100).
+   3) Senão (nem fórmula nem pesos de nível 1 explícitos no documento) → `project_merit_formula` = null.
+   PROIBIDO ABSOLUTO — NÃO INVENTAR PESOS IGUAIS: nunca escrevas "MP = 0.25A + 0.25B + 0.25C
+   + 0.25D" (ou qualquer distribuição uniforme) só porque existem N critérios de nível 1 e o
+   documento não indica os pesos. A distribuição igualitária NUNCA se assume ao nível 1.
+   (Só se assume distribuição igual ENTRE SUBCRITÉRIOS do mesmo pai, e apenas quando a regra
+   0c o permitir.) Se souberes que "A, B, C, D são critérios de 1.º nível" mas não os pesos,
+   a fórmula é null — não a fabriques.
+   A escala de pontos NÃO entra na fórmula — vai para `scoring_scale` (ver regra 8).
 
 5. PONTUAÇÃO MÍNIMA GLOBAL:
    Procura "pontuação mínima para a seleção é de X", "MP mínimo de X".
@@ -752,6 +860,18 @@ REGRAS CRÍTICAS:
 
 7. NÃO EXTRAIR: penalizações de indicadores, metas financeiras, obrigações.
    Foca-te exclusivamente na grelha de pontuação dos critérios de seleção.
+
+8. ESCALA E CONTAGEM DOS PONTOS — CAMPO `scoring_scale` (OBRIGATÓRIO QUANDO EXISTE):
+   Além da fórmula (que PONDERA os critérios), o aviso descreve COMO se atribuem os pontos a
+   cada critério — normalmente uma escala (ex: 1 a 5) com o significado de cada nível, mais
+   regras de arredondamento. Copia essa descrição para `scoring_scale`.
+   Procura frases como "As pontuações dos critérios são atribuídas numa escala compreendida
+   entre 1 e 5, em que:" seguidas da lista dos níveis.
+   Exemplo de valor:
+     "Escala 1-5: 1-Muito insuficiente; 2-Insuficiente; 3-Suficiente; 4-Bom; 5-Muito bom.
+      O resultado do MP é arredondado às centésimas."
+   Inclui aqui também, quando existir, a explicação de como cada nível é contabilizado
+   (o que distingue um 3 de um 5). Se não houver escala descrita no texto: null.
 """
 
 # P5 — Elegibilidade de Despesas, Limites e Indicadores
@@ -793,7 +913,8 @@ ESQUEMA JSON OBRIGATÓRIO:
     ],
     "beneficiary_obligations": ["List de Strings ou []"],
     "communication_obligations": ["List de Strings ou []"],
-    "bonus_mechanisms": ["List de Strings ou []"]
+    "bonus_mechanisms": ["List de Strings ou []"],
+    "low_density_territories": ["List de Strings ou []"]
   },
   "ExpenseLimit": [
     {
@@ -893,6 +1014,11 @@ REGRAS CRÍTICAS:
 
    ESTRUTURA: Se o aviso definir limiares diferentes para territórios de baixa densidade,
    usa UM ÚNICO objecto com ambos os campos preenchidos.
+
+   2c. TERRITÓRIOS DE BAIXA DENSIDADE — EMISSÃO OBRIGATÓRIA:
+   Quando encontrares territórios de baixa densidade na secção de penalizações
+   (ex: "deliberação CIC n.º 31/2023"), preenche também `low_density_territories` com a
+   referência da fonte. [] se o conceito não for mencionado.
 
 3. META — REGRA ANTI-FABRICAÇÃO: O campo `meta` só pode ter:
    a) Valor explicitamente definido no aviso.

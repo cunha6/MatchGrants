@@ -16,13 +16,13 @@ from .openai_client import classify_ambiguous_chunks, call_openai, call_openai_t
 from .prompts import SYSTEM_PROMPT_1, SYSTEM_PROMPT_2, SYSTEM_PROMPT_3, SYSTEM_PROMPT_4, SYSTEM_PROMPT_5, SYSTEM_PROMPT_6, SYSTEM_PROMPT_7, SYSTEM_PROMPT_CONSOLIDATE
 
 # Modelo usado em cada prompt
-P7_MODEL = "gpt-5-mini-2025-08-07"
 P1_MODEL = "gpt-5-mini-2025-08-07"
 P2_MODEL = "gpt-4o-mini"
 P3_MODEL = "gpt-5.4-mini-2026-03-17"
 P4_MODEL = "gpt-5.4"
 P5_MODEL = "gpt-4o-mini"
 P6_MODEL = "gpt-4o-mini"
+P7_MODEL = "gpt-5-mini-2025-08-07"
 
 _STOPWORDS = {"de", "da", "do", "dos", "das", "e", "em", "a", "o", "por", "para", "ao", "com"}
 
@@ -81,6 +81,7 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
         (("legislação", "regulamento", "decreto-lei", "portaria", "diploma"), p1_chunks),
         (("documentos necessários", "memória descritiva", "documentos a apresentar"), p6_chunks),
         (("despesa", "custos elegíveis", "ocs", "indicador"), p5_chunks),
+        (("metas de execução", "execução financeira", "taxa de execução", "anexo 6"), p2_chunks),
     )
     for c in chunks:
         if not c.get("is_annex"):
@@ -183,21 +184,36 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
 
     return result
 
+# Termos PT por campo: os nomes de campo são EN mas o texto dos chunks é PT. Sem este mapa,
+# "financial_execution_targets".split("_") → {financial,execution,targets} nunca casa no
+# texto PT e o rescue do P7 fica morto.
+FIELD_PT_TERMS = {
+    "financial_execution_targets": ["metas de execução", "taxa de execução", "execução financeira"],
+    "state_aid_regime": ["auxílios de estado", "de minimis", "rgic", "651/2014"],
+    "low_density_territories": ["baixa densidade", "territórios de baixa densidade"],
+    "required_self_financing_limit": ["capitais próprios", "autofinanciamento"],
+    "maximum_investment": ["apoio máximo", "investimento máximo", "máximo por candidatura"],
+    "monitoring_indicators": ["indicadores de acompanhamento"],
+}
+
+
+def _field_search_terms(field: str) -> list[str]:
+    """Termos PT a procurar para um campo vazio (fallback aos tokens >2 chars do nome)."""
+    if field in FIELD_PT_TERMS:
+        return FIELD_PT_TERMS[field]
+    return [w.lower() for w in field.split("_") if w not in _STOPWORDS and len(w) > 2]
+
+
 def _chunks_for_empty_fields(chunks: list[dict], empty_fields: list[str]) -> list[dict]:
     """Devolve chunks do corpo (não-Anexo) mais relevantes para os campos vazios.
 
-    Pontua cada chunk pelo número de keywords dos nomes dos campos vazios que
-    aparecem no título da secção ou na categoria do chunk.
+    Pontua cada chunk pelo número de termos PT (de FIELD_PT_TERMS) dos campos vazios
+    que aparecem no título/categoria/texto do chunk.
     """
     if not empty_fields:
         return []
 
-    keywords = {
-        w.lower()
-        for field in empty_fields
-        for w in field.split("_")
-        if w not in _STOPWORDS and len(w) > 2
-    }
+    terms = {t for field in empty_fields for t in _field_search_terms(field)}
 
     scored: list[tuple[int, dict]] = []
     for c in chunks:
@@ -210,7 +226,7 @@ def _chunks_for_empty_fields(chunks: list[dict], empty_fields: list[str]) -> lis
             + " "
             + (c.get("text") or "")[:200]
         ).lower()
-        score = sum(1 for kw in keywords if kw in data)
+        score = sum(1 for t in terms if t in data)
         if score > 0:
             scored.append((score, c))
 

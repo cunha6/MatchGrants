@@ -23,6 +23,7 @@ services:
     container_name: matchgrants
     command: >
       sh -c "python manage.py migrate &&
+             python manage.py migrate --database=nif &&
              python manage.py runserver 0.0.0.0:8000"
     volumes:
       - .:/app
