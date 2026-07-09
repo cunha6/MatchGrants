@@ -58,6 +58,35 @@ def normalize_grant_codes_json(final: dict) -> dict:
     return final
 
 
+# "p.p." / "p.p" / "pontos percentuais" → "%": o utilizador quer SEMPRE "%", nunca "p.p".
+# O lookbehind (?<![a-zA-Z]) evita apanhar "pp" no meio de palavras (ex: "supply", "app").
+_PP_PATTERNS = [
+    (re.compile(r"pontos?\s+percentuais?", re.IGNORECASE), "%"),
+    (re.compile(r"ponto\s+percentual", re.IGNORECASE), "%"),
+    (re.compile(r"(?<![a-zA-Z])p\.\s?p\.?", re.IGNORECASE), "%"),  # "p.p.", "p.p", "5p.p."
+]
+
+
+def _pp_str(text: str) -> str:
+    if "://" in text:  # é um URL — não lhe tocar (evita corromper links)
+        return text
+    for pat, repl in _PP_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+
+def normalize_pp_to_percent(obj):
+    """Substitui 'p.p'/'pontos percentuais' por '%' em TODAS as strings do JSON (recursivo).
+    Aplica-se ao resultado final para que tanto o JSON como a BD fiquem sempre com '%'."""
+    if isinstance(obj, str):
+        return _pp_str(obj)
+    if isinstance(obj, list):
+        return [normalize_pp_to_percent(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: normalize_pp_to_percent(v) for k, v in obj.items()}
+    return obj
+
+
 def normalize_text(text: str) -> str:
     """Remove acentos, converte para lowercase e limpa espaços extras."""
     if not text:

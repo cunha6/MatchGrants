@@ -46,27 +46,53 @@ def _matches_any_pattern(client_caes: set[str], patterns) -> bool:
     return any(_cae_matches_pattern(cae, p) for cae in client_caes for p in pats)
 
 
+def _pattern_specificity(cae: str, patterns) -> int:
+    """Comprimento do PREFIXO mais específico (mais longo) entre os `patterns` que batem no
+    `cae`; -1 se nenhum bater. Ex: cae '91100' vs '911**' → 3; vs '91***' → 2."""
+    best = -1
+    for p in patterns or []:
+        s = str(p).strip()
+        star = s.find("*")
+        prefix = s if star == -1 else s[:star]
+        if prefix.isdigit() and str(cae).startswith(prefix):
+            best = max(best, len(prefix))
+    return best
+
+
 def match_cae(client: dict, opportunity: dict) -> bool:
     """O CAE (principal ou secundário) do cliente é elegível na oportunidade.
 
-    Usa os padrões wildcard hierárquicos normalizados pela extração:
-    - `included_caes`: se não vazio, SÓ os CAE que batem nestes padrões são elegíveis.
-    - `excluded_caes`: o CAE deixa de ser elegível se bater num destes padrões.
-    - ambos vazios ⇒ sem restrição de CAE ⇒ elegível (equivale ao antigo "Todos").
-    Regra final: elegível ⇔ (included vazio OU bate em included) E NÃO bate em excluded.
+    Padrões wildcard hierárquicos + regra do PREFIXO MAIS ESPECÍFICO GANHA (permite
+    exceções em qualquer sentido):
+    - "Divisão 91 elegível, EXCETO Grupo 911": included=['91***'], excluded=['911**'].
+      Um CAE '91100' bate em ambos, mas '911**' (mais específico) é excluído → NÃO elegível;
+      '91200' só bate no incluído → elegível.
+    - "Divisão 91 EXCLUÍDA, exceto Grupo 911": excluded=['91***'], included=['911**'].
+      '91100' → o incluído '911**' é mais específico → elegível; '91200' → só excluído → não.
+    - ambos vazios ⇒ sem restrição ⇒ elegível.
+    Elegível ⇔ existe um CAE do cliente cuja regra mais específica é uma inclusão (ou que não
+    bate em nenhuma exclusão, quando não há lista positiva).
     """
     client_caes = {str(c).strip() for c in (client.get("cae_codes") or []) if c}
     if not client_caes:
         return False
 
-    included = opportunity.get("included_caes") or []
-    excluded = opportunity.get("excluded_caes") or []
+    included = [p for p in (opportunity.get("included_caes") or []) if p]
+    excluded = [p for p in (opportunity.get("excluded_caes") or []) if p]
+    if not included and not excluded:
+        return True
 
-    if _matches_any_pattern(client_caes, excluded):
-        return False
-    if included:
-        return _matches_any_pattern(client_caes, included)
-    return True
+    for cae in client_caes:
+        inc = _pattern_specificity(cae, included)   # -1 se não bater em nenhum incluído
+        exc = _pattern_specificity(cae, excluded)   # -1 se não bater em nenhum excluído
+        if exc == -1:
+            # Não é excluído: elegível se não há lista positiva, ou se bate nela.
+            if not included or inc != -1:
+                return True
+        elif inc > exc:
+            # É excluído, mas uma inclusão MAIS ESPECÍFICA reintegra-o (exceção).
+            return True
+    return False
 
 
 def match_location(client: dict, opportunity: dict) -> bool:

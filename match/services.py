@@ -23,6 +23,11 @@ from .scoring_rules import (
     SCORING_CONFIG, MAX_SCORE, _normalize, classify_dimension, is_eligible,
     missing_required_fields,
 )
+from . import embeddings
+from .ranking import (
+    active_phase_id, company_area_id, effective_budget_rate,
+    max_financing_rate_from_rates,
+)
 
 
 def promote_viewer_to_client(nif: str) -> dict | None:
@@ -71,6 +76,30 @@ def _to_date(value):
         return date.fromisoformat(str(value)[:10])
     except ValueError:
         return None
+
+
+def _company_query_text(metadata: dict) -> str:
+    """Texto RICO do cliente para a pesquisa semântica — junta tudo o que o descreve:
+    atividade + nome + tipo de entidade + CAE + localização (região/concelho/cidade/morada).
+
+    A `activity` (descrição do nif.pt) é o sinal semântico mais forte; os restantes campos
+    acrescentam contexto (setor via CAE, afinidade regional via localização). Quando a atividade
+    vem vazia, o resto garante que a semântica tem sempre com que trabalhar."""
+    parts: list[str] = []
+    activity = (metadata.get("activity") or "").strip()
+    if activity:
+        parts.append(activity)
+    if metadata.get("name"):
+        parts.append(str(metadata["name"]))
+    if metadata.get("entity_type"):
+        parts.append(str(metadata["entity_type"]))
+    caes = [str(c) for c in (metadata.get("cae_codes") or []) if c]
+    if caes:
+        parts.append("CAE: " + ", ".join(caes))
+    loc = [str(metadata.get(f)) for f in ("region", "county", "city", "address") if metadata.get(f)]
+    if loc:
+        parts.append("Localização: " + ", ".join(loc))
+    return "\n".join(parts)
 
 
 # Código de natureza jurídica (structure.nature do nif.pt) → descrição legível.
@@ -253,7 +282,7 @@ class NifMatchingService:
 
     # --- Motor de matching -----------------------------------------------
 
-    def process_matches(self, client_metadata: dict) -> list[dict]:
+    def process_matches(self, client_metadata: dict, activity_vec: list[float] | None = None) -> list[dict]:
         """Cruza os metadados do cliente com as oportunidades ativas.
 
         FILTRO RÍGIDO DE ELEGIBILIDADE: só entram na lista as oportunidades para as
@@ -262,9 +291,18 @@ class NifMatchingService:
         e aviso só para o Norte, ou CAE fora do âmbito, ou micro empresa num aviso só
         para grandes) para a oportunidade nem sequer aparecer.
 
-        Para as elegíveis calcula ainda o score (SCORING_CONFIG) e devolve a lista
-        ordenada do maior para o menor, com o detalhe da elegibilidade e do score.
+        ORDENAÇÃO (o que o utilizador vê no topo):
+          1) RELEVÂNCIA da atividade — procura semântica (embeddings) entre a atividade
+             da empresa (`activity_vec`) e o texto do aviso; mais direcionados ao topo.
+          2) TAXA de financiamento EFETIVA (maior primeiro).
+          3) DOTAÇÃO EFETIVA (maior primeiro).
+        A taxa/dotação efetivas são as da FASE ativa e da ÁREA da empresa (ver ranking).
         """
+        client_tokens = [
+            _normalize(client_metadata.get(f))
+            for f in ("region", "county", "city") if client_metadata.get(f)
+        ]
+
         results = []
         for grant in self._active_opportunities():
             opportunity = self._grant_to_opportunity(grant)
@@ -286,18 +324,61 @@ class NifMatchingService:
                     "points": points,
                 })
 
+            # Relevância semântica à atividade da empresa (None se sem embeddings).
+            relevance = self._grant_relevance(grant, activity_vec)
+
+            # Dotação/taxa efetivas p/ a fase ativa + área da empresa (ligação por FK id).
+            phase_id = active_phase_id(opportunity["phases"])
+            area_id = company_area_id(client_tokens, opportunity["covered_areas"])
+            budget, rate = effective_budget_rate(opportunity["phase_areas"], phase_id, area_id)
+            if budget is None:
+                budget = opportunity["total_allocation"]
+            if rate is None:
+                rate = max_financing_rate_from_rates(opportunity["financing_rates"])
+
             results.append({
                 "opportunity_id": opportunity["id"],
                 "grant_code": opportunity["grant_code"],
                 "title": opportunity["title"],
                 "score": score,
                 "max_score": MAX_SCORE,
+                "activity_relevance": relevance,
+                "effective_financing_rate": rate,
+                "effective_budget_allocation": budget,
+                "active_phase_id": phase_id,
+                "matched_area_id": area_id,
                 "eligibility": eligibility,
                 "breakdown": breakdown,
             })
 
-        results.sort(key=lambda r: r["score"], reverse=True)
+        # Atividade 1º, depois taxa, depois dotação — todos decrescentes.
+        results.sort(
+            key=lambda r: (
+                r["activity_relevance"] if r["activity_relevance"] is not None else -1.0,
+                r["effective_financing_rate"] if r["effective_financing_rate"] is not None else -1.0,
+                r["effective_budget_allocation"] if r["effective_budget_allocation"] is not None else -1.0,
+            ),
+            reverse=True,
+        )
         return results
+
+    @staticmethod
+    def _grant_relevance(grant: Grant, activity_vec: list[float] | None) -> float | None:
+        """Similaridade semântica entre a atividade do cliente e o texto do aviso (0..1),
+        ou None se não houver embeddings (sem API/atividade). Usa/atualiza a cache no Grant."""
+        if activity_vec is None:
+            return None
+        grant_vec = NifMatchingService._grant_embedding(grant)
+        if grant_vec is None:
+            return None
+        return embeddings.cosine(activity_vec, grant_vec)
+
+    @staticmethod
+    def _grant_embedding(grant: Grant) -> list[float] | None:
+        """Embedding do aviso, da cache (Grant.activity_embedding) quando o texto não mudou;
+        senão calcula-o e persiste (fallback à la carte, caso o aviso ainda não tenha sido
+        embebido ao gravar). None se não houver API/erro."""
+        return embeddings.ensure_grant_embedding(grant)
 
     @transaction.atomic
     def create_or_update_viewer(self, metadata: dict) -> User:
@@ -338,6 +419,7 @@ class NifMatchingService:
         profile.address = metadata.get("address") or profile.address
         profile.region = metadata.get("region") or profile.region
         profile.nature = metadata.get("nature")
+        profile.activity = metadata.get("activity") or profile.activity
         profile.capital = _to_decimal(metadata.get("capital"))
         profile.capital_currency = metadata.get("capital_currency")
         profile.phone = contacts.get("phone")
@@ -381,13 +463,17 @@ class NifMatchingService:
         if missing:
             raise MissingClientDataError(missing)
 
+        # Embedding do perfil do cliente (1 chamada) — atividade + CAE + localização + tipo.
+        # É a base da procura semântica que ordena os avisos mais enquadrados no topo.
+        activity_vec = embeddings.embed(_company_query_text(metadata))
+
         # `company` expõe os dados ricos do contribuinte; `matches` vem ordenado.
         company = {k: v for k, v in metadata.items() if k != "activity"}
         return {
             "company": company,
             "nif": metadata["nif"],
             "viewer_user_id": user.id,
-            "matches": self.process_matches(metadata),
+            "matches": self.process_matches(metadata, activity_vec),
         }
 
     @staticmethod
@@ -420,12 +506,18 @@ class NifMatchingService:
 
     @staticmethod
     def _active_opportunities():
-        """Oportunidades consideradas ativas: avisos já processados pela IA."""
-        return Grant.objects.filter(ai_processed=True)
+        """Oportunidades consideradas ativas: avisos já processados pela IA.
+
+        Faz prefetch das relações usadas pelo ranking (fases, áreas, dotações por
+        fase/área, taxas) para evitar N+1 queries por aviso.
+        """
+        return Grant.objects.filter(ai_processed=True).prefetch_related(
+            "phases", "covered_areas", "phase_areas", "financing_rates",
+        )
 
     @staticmethod
     def _grant_to_opportunity(grant: Grant) -> dict:
-        """Converte um Grant no dicionário normalizado que os matchers consomem."""
+        """Converte um Grant no dicionário normalizado que os matchers e o ranking consomem."""
         eligibility_parts = list(grant.beneficiary_eligibility_criteria or [])
         eligibility_parts += list(grant.final_recipients or [])
         return {
@@ -436,4 +528,23 @@ class NifMatchingService:
             "excluded_caes": grant.excluded_caes or [],
             "eligible_regions": grant.eligible_regions or [],
             "eligibility_text": _normalize(" | ".join(str(p) for p in eligibility_parts)),
+            # Dados para o ranking por dotação/taxa efetivas (fase ativa × área da empresa).
+            "total_allocation": grant.total_allocation,
+            "phases": [
+                {"id": p.id, "start_date": p.start_date, "end_date": p.end_date}
+                for p in grant.phases.all()
+            ],
+            "covered_areas": [
+                {"id": a.id, "geographic_area": a.geographic_area}
+                for a in grant.covered_areas.all()
+            ],
+            "phase_areas": [
+                {"phase_id": pa.phase_id, "area_id": pa.area_id, "fund_name": pa.fund_name,
+                 "budget_allocation": pa.budget_allocation, "max_financing_rate": pa.max_financing_rate}
+                for pa in grant.phase_areas.all()
+            ],
+            "financing_rates": [
+                {"max_global_rate": fr.max_global_rate, "base_rate": fr.base_rate}
+                for fr in grant.financing_rates.all()
+            ],
         }

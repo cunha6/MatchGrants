@@ -1,4 +1,8 @@
 from django.db import models
+from pgvector.django import VectorField
+
+# Dimensão dos embeddings OpenAI (text-embedding-3-small).
+EMBEDDING_DIM = 1536
 
 
 class Grant(models.Model):
@@ -9,7 +13,7 @@ class Grant(models.Model):
     ]
 
     # Scraping metadata
-    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, db_index=True)
+    source = models.CharField(max_length=100, choices=SOURCE_CHOICES, db_index=True)
     scraping_url = models.URLField(max_length=500, unique=True)
     pdf_path = models.CharField(max_length=500, blank=True)
     markdown_path = models.CharField(max_length=500, blank=True)
@@ -28,9 +32,9 @@ class Grant(models.Model):
     republication_date = models.TextField(blank=True, null=True)
     last_republication = models.TextField(blank=True, null=True)
     amendment_date = models.TextField(blank=True, null=True)
-    notice_modality = models.CharField(max_length=255, blank=True, null=True)
+    notice_modality = models.CharField(max_length=500, blank=True, null=True)
     objective = models.TextField(blank=True, null=True)
-    fund_name = models.CharField(max_length=255, blank=True, null=True)
+    fund_name = models.TextField(blank=True, null=True)  # multi-fundo (" + ") pode passar 255
     program_priority = models.TextField(blank=True, null=True)
     intervention_type_code = models.TextField(blank=True, null=True)
     max_duration_months = models.IntegerField(null=True, blank=True)
@@ -48,6 +52,8 @@ class Grant(models.Model):
     intermediate_bodies = models.JSONField(default=list, blank=True)
     applicable_legislation = models.JSONField(default=list, blank=True)
     regulatory_documents = models.JSONField(default=list, blank=True)
+    # Todos os documentos da página do aviso (nome + url) — referência; não são descarregados.
+    annex_documents = models.JSONField(default=list, blank=True)
     target_technology_sectors = models.JSONField(default=list, blank=True)
     application_submission = models.TextField(blank=True, null=True)
     beneficiary_eligibility_criteria = models.JSONField(default=list, blank=True)
@@ -90,6 +96,10 @@ class Grant(models.Model):
     dnsh_criteria = models.TextField(blank=True, null=True)
     # Marcado quando há alterações não consolidadas que precisam de revisão manual
     needs_review = models.BooleanField(default=False)
+    # Embedding (pgvector) para pesquisa semântica — gerado pela OpenAI, guardado/pesquisado
+    # no Postgres. activity_embedding_hash deteta quando o texto do aviso mudou e força recálculo.
+    activity_embedding = VectorField(dimensions=EMBEDDING_DIM, null=True, blank=True)
+    activity_embedding_hash = models.CharField(max_length=200, blank=True, default="")
 
     def __str__(self):
         return self.grant_code or self.title or f"Grant #{self.pk}"
@@ -103,8 +113,7 @@ class BeneficiaryByAction(models.Model):
 
 class Phase(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="phases")
-    phase_code = models.CharField(max_length=255, blank=True, null=True)
-    name = models.CharField(max_length=255, blank=True, null=True)
+    name = models.TextField(blank=True, null=True)
     start_date = models.TextField(blank=True, null=True)
     end_date = models.TextField(blank=True, null=True)
     access_condition = models.TextField(blank=True, null=True)
@@ -112,22 +121,28 @@ class Phase(models.Model):
 
 class CoveredArea(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="covered_areas")
-    area_code = models.CharField(max_length=255, blank=True, null=True)
     geographic_area = models.TextField(blank=True, null=True)
 
 
 class PhaseArea(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="phase_areas")
-    phase_code = models.CharField(max_length=255, blank=True, null=True)
-    area_code = models.CharField(max_length=255, blank=True, null=True)
-    fund_name = models.CharField(max_length=255, blank=True, null=True)
+    # Ligações REAIS (a BD gera os ids; sem códigos inventados). `phase`/`area` ficam null
+    # quando a dotação não é por fase (ex: dotação por fundo/global) ou não tem área específica.
+    phase = models.ForeignKey(Phase, on_delete=models.CASCADE, related_name="phase_areas",
+                              null=True, blank=True)
+    area = models.ForeignKey(CoveredArea, on_delete=models.CASCADE, related_name="phase_areas",
+                             null=True, blank=True)
+    fund_name = models.TextField(blank=True, null=True)
     budget_allocation = models.FloatField(null=True, blank=True)
     max_financing_rate = models.FloatField(null=True, blank=True)
+    # Repartição da dotação desta fase/área por território (ex: Baixa Densidade vs Outros).
+    # Lista de {"name": str, "budget": float}. Ex: [{"name":"Baixa Densidade","budget":40000000.0},
+    # {"name":"Outros Territórios","budget":60000000.0}].
+    distribution = models.JSONField(default=list, blank=True)
 
 
 class FinancingRate(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="financing_rates")
-    rate_code = models.CharField(max_length=255, blank=True, null=True)
     company_size = models.TextField(blank=True, null=True)
     aid_regime = models.TextField(blank=True, null=True)
     base_rate = models.TextField(blank=True, null=True)
@@ -139,7 +154,6 @@ class FinancingRate(models.Model):
 
 class ExpenseLimit(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="expense_limits")
-    limit_code = models.CharField(max_length=255, blank=True, null=True)
     expense_category = models.TextField(blank=True, null=True)
     applicable_ocs_methodology = models.TextField(blank=True, null=True)
     max_absolute_value = models.FloatField(null=True, blank=True)
@@ -150,12 +164,14 @@ class ExpenseLimit(models.Model):
 
 class NonCompliancePenalty(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="non_compliance_penalties")
-    penalty_code = models.CharField(max_length=255, blank=True, null=True)
     indicator_types = models.TextField(blank=True, null=True)
     compliance_grade_formula = models.TextField(blank=True, null=True)
     general_tolerance_threshold = models.FloatField(null=True, blank=True)
     low_density_tolerance_threshold = models.FloatField(null=True, blank=True)
     reduction_per_percentage_point = models.FloatField(null=True, blank=True)
+    # Escalões discretizados da penalização: cada faixa de Grau de Cumprimento com a sua
+    # redução em p.p. Ex: [{"grade_range": "] 70% - 65% ]", "reduction_pp": 0.5}, ...].
+    penalty_tiers = models.JSONField(default=list, blank=True)
     max_penalty_percentage = models.FloatField(null=True, blank=True)
     financing_revocation_threshold = models.FloatField(null=True, blank=True)
     rule_description = models.TextField(blank=True, null=True)
@@ -163,7 +179,6 @@ class NonCompliancePenalty(models.Model):
 
 class EvaluationMethodology(models.Model):
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="evaluation_methodologies")
-    evaluation_code = models.CharField(max_length=255, blank=True, null=True)
     project_merit_formula = models.TextField(blank=True, null=True)
     scoring_scale = models.TextField(blank=True, null=True)
     min_global_score = models.FloatField(null=True, blank=True)
@@ -183,7 +198,7 @@ class GrantDocument(models.Model):
         ("other", "Outro"),
     ]
     grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="documents")
-    doc_type = models.CharField(max_length=20, choices=DOC_TYPES, default="other", db_index=True)
+    doc_type = models.CharField(max_length=200, choices=DOC_TYPES, default="other", db_index=True)
     name = models.TextField(blank=True, null=True)
     url = models.URLField(max_length=500, blank=True)
     local_path = models.CharField(max_length=500, blank=True)

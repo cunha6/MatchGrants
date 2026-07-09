@@ -221,6 +221,23 @@ def _apply_profile(user: User, data) -> None:
     if defaults:
         profile, _ = UserProfile.objects.update_or_create(user=user, defaults=defaults)
         user.profile = profile  # refresh the reverse-relation cache (otherwise stale)
+        _fill_entity_size_from_sqlite(profile)
+
+
+def _fill_entity_size_from_sqlite(profile) -> None:
+    """Se a dimensão (entity_size) não foi indicada, vai buscá-la ao NifCompany (SQLite) pelo
+    NIF. Só preenche quando está em falta — um valor indicado manualmente prevalece.
+    Tolerante: se a BD 'nif' não existir/estiver por carregar, não faz nada."""
+    if profile.entity_size or not profile.nif:
+        return
+    try:
+        from match.models import NifCompany
+        company = NifCompany.objects.filter(nif=profile.nif).first()
+    except Exception:
+        company = None
+    if company and company.dimension:
+        profile.entity_size = company.dimension
+        profile.save(update_fields=["entity_size"])
 
 
 def _serialize(user: User) -> dict:

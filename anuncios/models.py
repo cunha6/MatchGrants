@@ -1,4 +1,8 @@
 from django.db import models
+from pgvector.django import VectorField
+
+# Dimensão dos embeddings OpenAI (text-embedding-3-small).
+EMBEDDING_DIM = 1536
 
 
 class Notice(models.Model):
@@ -96,6 +100,10 @@ class Notice(models.Model):
     # Active = still within the proposal deadline. Updated on import; the listing also
     # filters dynamically by date so expired notices are never shown.
     active = models.BooleanField(default=True, db_index=True, verbose_name="Active")
+
+    # Embedding (pgvector) para pesquisa semântica — gerado pela OpenAI.
+    activity_embedding = VectorField(dimensions=EMBEDDING_DIM, null=True, blank=True)
+    activity_embedding_hash = models.CharField(max_length=200, blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

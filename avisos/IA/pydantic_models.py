@@ -1,7 +1,20 @@
 """Pydantic models — validam e normalizam o output do LLM antes do merge."""
 
+import re
 from typing import Annotated, Any, Optional
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+
+# "300.000", "3.000.000", "25.000.000": ponto como separador de MILHARES (formato PT/EU).
+_THOUSANDS_DOTS = re.compile(r"-?\d{1,3}(\.\d{3})+")
+
+# Montantes por extenso (PT): "25 milhões" → 25e6, "300 mil" → 300e3, "2 mil milhões" → 2e9.
+# Ordem de teste importa: "mil milhões" antes de "milhão"; "milhar(es)" antes de "milhão"
+# (ambos contêm "milh"); "mil" isolado por último. O lookbehind (?<![a-zA-Z]) (em vez de \b)
+# permite o número colado à palavra ("25milhões") — o \b falha entre dígito e letra.
+_MIL_MILHOES_RE = re.compile(r"(?<![a-zA-Z])mil\s+milh\w*", re.IGNORECASE)   # mil milhões = 10^9
+_MILHAR_RE      = re.compile(r"(?<![a-zA-Z])milhar\w*", re.IGNORECASE)       # milhar/milhares = 10^3
+_MILHAO_RE      = re.compile(r"(?<![a-zA-Z])milh\w*", re.IGNORECASE)         # milhão/milhões = 10^6
+_MIL_RE         = re.compile(r"(?<![a-zA-Z])mil(?![a-zA-Z])", re.IGNORECASE)  # mil = 10^3
 
 
 # ---------------------------------------------------------------------------
@@ -13,15 +26,48 @@ def _float(v: Any) -> Optional[float]:
         return None
     if isinstance(v, (int, float)):
         return float(v)
-    s = str(v).strip().replace("€", "").replace("%", "").replace(" ", "")
-    if s.lower() in ("null", "none", "n/a", "-", ""):
+    s = str(v).strip().lower()
+    for junk in ("€", "euros", "eur", "%"):
+        s = s.replace(junk, "")
+    s = s.strip()
+    if s in ("null", "none", "n/a", "-", ""):
         return None
-    if "," in s and s.count(",") == 1 and s.index(",") > s.rfind("."):
+
+    # Montantes por extenso ("25 milhões", "1,5 milhão", "300 mil", "2 mil milhões",
+    # "inferior a 25 milhões euros" → o texto à volta já foi removido pelo prompt/chamador,
+    # mas mesmo que sobre "25 milhões", convertemos para o número).
+    mult = 1.0
+    if _MIL_MILHOES_RE.search(s):
+        mult = 1_000_000_000.0
+        s = _MIL_MILHOES_RE.sub(" ", s)
+    elif _MILHAR_RE.search(s):
+        mult = 1_000.0
+        s = _MILHAR_RE.sub(" ", s)
+    elif _MILHAO_RE.search(s):
+        mult = 1_000_000.0
+        s = _MILHAO_RE.sub(" ", s)
+    elif _MIL_RE.search(s):
+        mult = 1_000.0
+        s = _MIL_RE.sub(" ", s)
+
+    s = s.replace(" ", "")
+    if not s:
+        return None
+    if s.count(",") == 1 and s.rfind(",") > s.rfind("."):
+        # Vírgula ÚNICA e depois do último ponto = decimal PT ("1.000,50" → 1000.50).
         s = s.replace(".", "").replace(",", ".")
-    else:
+    elif "," in s:
+        # Múltiplas vírgulas (ou vírgula antes de ponto) = vírgulas são separador de milhares
+        # (formato US "1,234,567") → remove-as; os pontos ficam para a regra dos milhares.
         s = s.replace(",", "")
+        if _THOUSANDS_DOTS.fullmatch(s):
+            s = s.replace(".", "")
+    elif _THOUSANDS_DOTS.fullmatch(s):
+        # Sem vírgula e com pontos a separar grupos de 3 dígitos ("300.000" = 300000,
+        # NÃO 300.0). Sem estes pontos, "." é decimal (ex: "85.0", "4705882.34").
+        s = s.replace(".", "")
     try:
-        return float(s)
+        return float(s) * mult
     except ValueError:
         return None
 
@@ -105,6 +151,75 @@ class DocumentoRegulamentacao(_Base):
     url:  CoercedStr = None
 
 
+def _article_refs(v: Any) -> list[dict]:
+    """Normaliza `artigos` para lista de objetos {artigo, refere_se_a}.
+
+    Aceita também o formato legado (lista de strings) — cada string vira {"artigo": s}
+    sem descrição — para não partir dados/outputs antigos.
+    """
+    if not v:
+        return []
+    if isinstance(v, (str, dict)):
+        v = [v]
+    if not isinstance(v, list):
+        return []
+    out: list[dict] = []
+    for item in v:
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+        else:
+            s = str(item).strip()
+            if s and s.lower() not in ("null", "none"):
+                out.append({"artigo": s})
+    return out
+
+
+class ArticleRef(_Base):
+    # Um artigo/número específico de um diploma + a que se refere no aviso.
+    article:   CoercedStr = Field(default=None, alias="artigo")
+    refers_to: CoercedStr = Field(default=None, alias="refere_se_a")
+
+
+CoercedArticleList = Annotated[list[ArticleRef], BeforeValidator(_article_refs)]
+
+
+class LegislationRef(_Base):
+    # Diploma legal estruturado: nome do regulamento + artigos (cada um com a que se refere).
+    regulation_name: CoercedStr        = Field(default=None, alias="nome_regulamento")
+    articles:        CoercedArticleList = Field(default_factory=list, alias="artigos")
+    # Descrição geral do diploma — usar só quando o aviso não atribui os artigos a assuntos
+    # distintos (ou não cita artigos). Quando há artigos, a descrição vai em cada artigo.
+    refers_to:       CoercedStr        = Field(default=None, alias="refere_se_a")
+
+
+def _legislation_refs(v: Any) -> list[dict]:
+    """Normaliza `legislacao_aplicavel` para lista de objetos. Tolera o formato legado (lista
+    de strings) — cada string vira {"nome_regulamento": s} — para não rebentar o parse quando
+    o LLM devolve um diploma como texto simples em vez de objeto."""
+    if not v:
+        return []
+    if isinstance(v, (str, dict)):
+        v = [v]
+    if not isinstance(v, list):
+        return []
+    out: list[dict] = []
+    for item in v:
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+        else:
+            s = str(item).strip()
+            if s and s.lower() not in ("null", "none"):
+                out.append({"nome_regulamento": s})
+    return out
+
+
+CoercedLegislation = Annotated[list[LegislationRef], BeforeValidator(_legislation_refs)]
+
+
 class ApplicationDocument(_Base):
     name:                              CoercedStr  = Field(default=None, alias="nome")
     mandatory:                         CoercedBool = Field(default=None, alias="obrigatorio")
@@ -120,11 +235,57 @@ class OrganismoIntermedio(_Base):
 
 
 class CriterioAvaliacao(_Base):
-    criterion_code:              CoercedStr   = Field(default=None, alias="codigo_criterio")
+    # Rótulo do critério (A, A1, B1…) — é significativo (vem do documento), por isso é um
+    # "name", não um código inventado. Aceita `criterion_name` (nome do campo) e o alias
+    # antigo `codigo_criterio`.
+    # Estrutura EM ÁRVORE: cada critério pode ter `formula` (como se combina a partir dos
+    # seus filhos diretos, ex: "A = 0,6 A1 + 0,4 A2") e `subcriteria` (os filhos, aninhados).
+    criterion_name:              CoercedStr   = Field(default=None, alias="codigo_criterio")
     description:                 CoercedStr   = Field(default=None, alias="descricao")
+    formula:                     CoercedStr   = Field(default=None, alias="formula")
     weight:                      CoercedFloat = Field(default=None, alias="ponderacao")
     min_score:                   CoercedFloat = Field(default=None, alias="pontuacao_minima")
     is_exclusion_criterion:      Optional[bool] = Field(default=None, alias="pontuacao_minima_criterio_exclusao")
+    # Folha (sem filhos) → null (não []). Pai com filhos → lista aninhada.
+    subcriteria:                 Optional[list["CriterioAvaliacao"]] = Field(default=None, alias="subcriterios")
+
+    @field_validator("subcriteria", mode="before")
+    @classmethod
+    def _subcriteria_empty_to_none(cls, v):
+        return v or None
+
+
+def _expense_groups(v: Any) -> list[dict]:
+    """Normaliza despesas para lista de grupos {categoria, itens}.
+
+    Aceita o formato legado (lista de strings) → um único grupo sem categoria
+    ({"categoria": None, "itens": [...]}). Se já vier como lista de grupos (dicts),
+    passa-os à frente; strings soltas à mistura vão para um grupo sem categoria.
+    """
+    if not v:
+        return []
+    if isinstance(v, (str, dict)):
+        v = [v]
+    if not isinstance(v, list):
+        return []
+    dicts = [x for x in v if isinstance(x, dict)]
+    loose = [str(x).strip() for x in v
+             if not isinstance(x, dict) and x is not None and str(x).strip().lower() not in ("null", "none", "")]
+    groups = list(dicts)
+    if loose:
+        groups.append({"categoria": None, "itens": loose})
+    return groups
+
+
+class ExpenseGroup(_Base):
+    # Grupo de despesas, OPCIONALMENTE por categoria (ex: "Indústria", "Turismo") — genérico:
+    # a categoria é o rótulo que o aviso usar. `category` = null quando o aviso NÃO divide por
+    # categoria (caso mais comum: um único grupo com todas as despesas).
+    category: CoercedStr  = Field(default=None, alias="categoria")
+    items:    CoercedList = Field(default_factory=list, alias="itens")
+
+
+CoercedExpenseGroups = Annotated[list[ExpenseGroup], BeforeValidator(_expense_groups)]
 
 
 # Entidades finais
@@ -152,7 +313,7 @@ class Grant(_Base):
     operation_typology:                  CoercedStr   = Field(default=None, alias="tipologia_operacao")
     covered_actions:                     CoercedStr   = Field(default=None, alias="acoes_abrangidas")
     intermediate_bodies:                 list[OrganismoIntermedio] = Field(default_factory=list, alias="organismos_intermedios")
-    applicable_legislation:              CoercedList  = Field(default_factory=list, alias="legislacao_aplicavel")
+    applicable_legislation:              CoercedLegislation = Field(default_factory=list, alias="legislacao_aplicavel")
     regulatory_documents:                list[DocumentoRegulamentacao] = Field(default_factory=list, alias="documentos_regulamentacao")
     target_technology_sectors:           CoercedList  = Field(default_factory=list, alias="setores_tecnologicos_alvo")
     application_submission:              CoercedStr   = Field(default=None, alias="submissao_candidaturas")
@@ -179,8 +340,16 @@ class Grant(_Base):
     # P4 — avaliação
     project_selection_criteria:          CoercedList  = Field(default_factory=list, alias="criterios_selecao_projeto")
     # P5 — despesas e indicadores
-    eligible_expenses:                   CoercedList  = Field(default_factory=list, alias="despesas_elegiveis")
-    ineligible_expenses:                 CoercedList  = Field(default_factory=list, alias="despesas_nao_elegiveis")
+    eligible_expenses:                   CoercedExpenseGroups = Field(default_factory=list, alias="despesas_elegiveis")
+    ineligible_expenses:                 CoercedExpenseGroups = Field(default_factory=list, alias="despesas_nao_elegiveis")
+
+    @field_validator("eligible_expenses", "ineligible_expenses", mode="after")
+    @classmethod
+    def _drop_empty_expense_groups(cls, v):
+        # Remove grupos sem itens (ex: o shell "[{category:null, items:[]}]" que o LLM às vezes
+        # devolve quando não encontra despesas). Assim, "vazio" volta a ser [] — o que faz o
+        # rescue do P7 disparar (que ignora [] mas não [{...}]).
+        return [g for g in v if g.items]
     output_indicators:                   list[Indicador] = Field(default_factory=list, alias="indicadores_realizacao")
     result_indicators:                   list[Indicador] = Field(default_factory=list, alias="indicadores_resultados")
     monitoring_indicators:               list[Indicador] = Field(default_factory=list, alias="indicadores_acompanhamento")
@@ -202,7 +371,6 @@ class BeneficiaryByAction(_Base):
 
 
 class FinancingRate(_Base):
-    rate_code:                  CoercedStr   = Field(default=None, alias="codigo_taxa")
     grant_code:                 CoercedStr   = Field(default=None, alias="codigo_aviso")
     company_size:               CoercedStr   = Field(default=None, alias="dimensao_empresa")
     aid_regime:                 CoercedStr   = Field(default=None, alias="regime_auxilio")
@@ -214,7 +382,6 @@ class FinancingRate(_Base):
 
 
 class ExpenseLimit(_Base):
-    limit_code:                 CoercedStr   = Field(default=None, alias="codigo_limite")
     grant_code:                 CoercedStr   = Field(default=None, alias="codigo_aviso")
     expense_category:           CoercedStr   = Field(default=None, alias="rubrica_despesa")
     applicable_ocs_methodology: CoercedStr   = Field(default=None, alias="metodologia_ocs_aplicavel")
@@ -224,21 +391,26 @@ class ExpenseLimit(_Base):
     specific_conditions:        CoercedStr   = Field(default=None, alias="condicoes_especifica")
 
 
+class PenaltyTier(_Base):
+    grade_range:   CoercedStr   = Field(default=None, alias="faixa_grau_cumprimento")
+    reduction_pp:  CoercedFloat = Field(default=None, alias="reducao_pp")
+
+
 class NonCompliancePenalty(_Base):
-    penalty_code:                        CoercedStr   = Field(default=None, alias="codigo_penalizacao")
     grant_code:                          CoercedStr   = Field(default=None, alias="codigo_aviso")
     indicator_types:                     CoercedStr   = Field(default=None, alias="tipo_indicadores")
     compliance_grade_formula:            CoercedStr   = Field(default=None, alias="formula_grau_cumprimento")
     general_tolerance_threshold:         CoercedFloat = Field(default=None, alias="limiar_tolerancia_geral")
     low_density_tolerance_threshold:     CoercedFloat = Field(default=None, alias="limiar_tolerancia_baixa_densidade")
     reduction_per_percentage_point:      CoercedFloat = Field(default=None, alias="reducao_por_ponto_percentual")
+    # Escalões discretizados: uma entrada por faixa de GC (ex: '] 70% - 65% ]' → 0.5 p.p.).
+    penalty_tiers:                       list[PenaltyTier] = Field(default_factory=list, alias="escaloes_penalizacao")
     max_penalty_percentage:              CoercedFloat = Field(default=None, alias="penalizacao_maxima_percentual")
     financing_revocation_threshold:      CoercedFloat = Field(default=None, alias="limiar_revogacao_financiamento")
     rule_description:                    CoercedStr   = Field(default=None, alias="descricao_regra")
 
 
 class EvaluationMethodology(_Base):
-    evaluation_code:        CoercedStr   = Field(default=None, alias="codigo_avaliacao")
     grant_code:             CoercedStr   = Field(default=None, alias="codigo_aviso")
     project_merit_formula:  CoercedStr   = Field(default=None, alias="formula_merito_projeto")
     # Como se contabilizam os pontos: escala (ex: 1-5) + significado de cada nível +
@@ -264,6 +436,14 @@ class CoveredArea(_Base):
     geographic_area: CoercedStr = Field(default=None, alias="area_geografica")
 
 
+class TerritoryBudget(_Base):
+    # Sub-registo GENÉRICO de repartição de uma dotação: `name` é o rótulo tal como o aviso o
+    # dá (pode ser qualquer coisa — território, tipo de operação, etc.); `budget` fica no
+    # formato legível do aviso (ex: "40.000.000,00").
+    name:    CoercedStr = Field(default=None, alias="nome")
+    budget:  CoercedStr = Field(default=None, alias="dotacao")
+
+
 class PhaseArea(_Base):
     phase_code:          CoercedStr   = Field(default=None, alias="codigo_fase")
     area_code:           CoercedStr   = Field(default=None, alias="codigo_area")
@@ -273,6 +453,8 @@ class PhaseArea(_Base):
     fund_name:           CoercedStr   = Field(default=None, alias="nome_fundo")
     budget_allocation:   CoercedFloat = Field(default=None, alias="dotacao_orcamental")
     max_financing_rate:  CoercedFloat = Field(default=None, alias="taxa_financiamento_maxima")
+    # Repartição da dotação por território (ex: Baixa Densidade vs Outros Territórios).
+    distribution:        list[TerritoryBudget] = Field(default_factory=list, alias="distribuicao")
 
 
 # Parse functions — uma por prompt (P1–P6)

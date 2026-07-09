@@ -66,6 +66,7 @@ class UserProfile(models.Model):
 
     # --- Dados do nif.pt (preenchidos no matching via NIF) ---
     nature = models.CharField(max_length=10, blank=True, null=True)       # código natureza jurídica (COO, SA…)
+    activity = models.TextField(blank=True, null=True)                    # descrição da atividade (nif.pt), p/ match semântico
     capital = models.DecimalField(max_digits=18, decimal_places=2, blank=True, null=True)  # capital social
     capital_currency = models.CharField(max_length=10, blank=True, null=True)
     phone = models.CharField(max_length=50, blank=True, null=True)

@@ -1,11 +1,15 @@
 import io
+import os
 import re
+import sys
 import shutil
+import tempfile
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
+from selenium import webdriver
 from selenium.webdriver import Chrome
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -14,6 +18,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
+
+from .Docling.converter import text_is_invitation
 
 BASE_URL = "https://portugal2030.pt"
 LIST_URL = f"{BASE_URL}/avisos/"
@@ -28,9 +34,11 @@ _USER_AGENT = (
 _HEADERS = {"User-Agent": _USER_AGENT}
 
 _CHROME_ARGS = [
-    "--headless=new",
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
+    "--headless",              
+    "--no-sandbox",            
+    "--disable-dev-shm-usage", 
+    "--disable-gpu",           
+    "--disable-extensions",
     "--window-size=1920,1080",
     f"user-agent={_USER_AGENT}",
 ]
@@ -46,18 +54,26 @@ _KEY_MAP = {
 }
 
 
-def _build_driver() -> Chrome:
+def _build_driver() -> webdriver.Remote:
     opts = Options()
     for arg in _CHROME_ARGS:
         opts.add_argument(arg)
 
-    chromium_bin = shutil.which("chromium") or shutil.which("chromium-browser")
-    chromedriver_bin = shutil.which("chromedriver")
-    if chromium_bin and chromedriver_bin:
-        opts.binary_location = chromium_bin
-        return Chrome(service=Service(chromedriver_bin), options=opts)
+    # Em Docker, o Chrome corre num container dedicado (selenium/standalone-chrome).
+    # O chromium do Debian (v150) rebenta com SIGTRAP em headless/WSL2 — o Chrome da
+    # imagem selenium é testado para container e funciona. Ligamos por WebDriver remoto.
+    remote_url = os.environ.get("SELENIUM_REMOTE_URL")
+    if remote_url:
+        return webdriver.Remote(command_executor=remote_url, options=opts)
 
-    return Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    # Fallback local (dev fora do Docker): perfil temporário ÚNICO e escrevível.
+    opts.add_argument(f"--user-data-dir={tempfile.mkdtemp(prefix='chrome-')}")
+    opts.binary_location = shutil.which("chromium") or shutil.which("chromium-browser") or "/usr/bin/chromium"
+    chromedriver = shutil.which("chromedriver") or "/usr/bin/chromedriver"
+
+    # log_output=sys.stdout atira os erros do Chrome/chromedriver direto para o log do Docker.
+    service = Service(chromedriver, log_output=sys.stdout)
+    return Chrome(service=service, options=opts)
 
 
 def scrape_portugal2030_web() -> list[dict]:
@@ -91,6 +107,10 @@ def scrape_portugal2030_web() -> list[dict]:
 def _parse_main(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     main_element = soup.find("div", class_="et_pb_column_2_tb_body")
+    if main_element is None:
+        # Estrutura da página não encontrada (mudou, ou não renderizou). Não rebenta o scrape.
+        print("  [Portugal] AVISO: container 'et_pb_column_2_tb_body' não encontrado — 0 avisos.")
+        return []
     avisos = main_element.find_all("li")
 
     words_reject = {"prorrogação", "prorrogacao", "guia", "anexo", "orientação", "orientacao", "verificação", "verificacao"}
@@ -204,8 +224,10 @@ def _pdf_info(url: str) -> dict:
         if not r.content.startswith(b"%PDF"):
             return {"paginas": 0, "natureza": None}
         reader = PdfReader(io.BytesIO(r.content)) #Leitura em memória do PDF
-        text = " ".join(p.extract_text() or "" for p in reader.pages[:5]).lower()
-        natureza = "convite" if "convite" in text else None
+        text = " ".join(p.extract_text() or "" for p in reader.pages[:5])
+        # Deteção PRECISA (lê o campo "Natureza do aviso") — não exclui concursos que apenas
+        # mencionem a palavra "convite". Mesma função usada no download/service.
+        natureza = "convite" if text_is_invitation(text) else None
         return {"paginas": len(reader.pages), "natureza": natureza}
     except Exception:
         return {"paginas": 0, "natureza": None}

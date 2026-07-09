@@ -70,18 +70,28 @@ REGRAS (CRÍTICO):
    Para cada campo, copia o valor literalmente do documento. Se um campo não aparecer no texto,
    devolve null (strings), [] (listas) ou omite-o. NUNCA inventes códigos de aviso, nomes de
    entidades, datas, regiões, CAEs ou legislação que não estejam expressamente escritos.
-   LEGISLAÇÃO — LEITURA EXAUSTIVA: `legislacao_aplicavel` deve conter TODOS os diplomas
-   mencionados no aviso, incluindo os que estão em Anexos de Legislação (ex: "Anexo C —
-   Legislação aplicável", "Anexo E — Legislação e Regulamentação"). Se um Anexo de Legislação
-   existir nos chunks recebidos, lê-o integralmente. Não te limites à secção principal do aviso.
-   Extrai: regulamentos UE, decretos-lei, portarias, leis, resoluções do conselho de ministros.
-   Cada diploma é um item separado na lista. Mínimo esperado: 4-8 diplomas por aviso.
-   NOTA SOBRE O ANEXO B: Se receberes chunks do "Anexo B – Legislação aplicável" ou equivalente,
-   lê-o integralmente e extrai TODOS os diplomas listados (europeus e nacionais) como itens
-   separados. Cada item deve ser o nome completo do diploma, não a abreviatura
-   (ex: "Regulamento (EU) 2021/1058, de 24 de junho - relativo ao FEDER e Fundo de Coesão"
-   e não "FEDER/FC"). Não incluas "REITD" como diploma — é uma abreviatura de um regulamento
-   específico; extrai o nome completo da portaria que o aprova.
+   LEGISLAÇÃO — LISTA ESTRUTURADA (OBRIGATÓRIO): `legislacao_aplicavel` é uma LISTA DE OBJETOS,
+   um por diploma, cada um com:
+     • `nome_regulamento`: nome completo do diploma (ex: "Regulamento (UE) n.º 651/2014",
+       "Decreto-Lei n.º 20-A/2023, de 22 de março"). NÃO a abreviatura (não "FEDER/FC",
+       não "REITD" — usa o nome completo da portaria que o aprova).
+     • `artigos`: LISTA DE OBJETOS, um por artigo/número citado, cada um com:
+         - `artigo`: o número/identificador (ex: "Artigo 2.º, n.º 49", "Artigo 14.º",
+           "n.º 3 do Artigo 53.º").
+         - `refere_se_a`: a que assunto/secção do aviso ESSE artigo em concreto se aplica
+           (ex: "definição de investimento inicial", "elegibilidade de beneficiários",
+           "auxílios ao investimento regional (RGIC)"). null se o aviso não o disser.
+       SEPARA os artigos por assunto: se o aviso citar vários artigos para fins DIFERENTES,
+       cria um objeto por artigo (ou por grupo de artigos com o MESMO fim) com o respetivo
+       `refere_se_a` — não juntes artigos de assuntos distintos num só objeto. Se um conjunto
+       de artigos partilha o mesmo fim, podes agrupá-los num objeto (ex: {"artigo":"Artigos
+       13.º, 14.º, 17.º e 18.º","refere_se_a":"auxílios de Estado"}). [] se não citar artigos.
+     • `refere_se_a` (do diploma): descrição GERAL do diploma — preenche só quando NÃO citas
+       artigos, ou quando o fim é transversal e não atribuível a artigos específicos. Quando
+       cada artigo já tem o seu `refere_se_a`, deixa este null para não duplicar.
+   Extrai TODOS os diplomas mencionados no aviso E nos Anexos de Legislação (ex: "Anexo C —
+   Legislação aplicável", "Anexo B – Legislação aplicável") — lê-os integralmente. Mínimo
+   esperado: 4-8 diplomas. Cada diploma é UM objeto na lista.
 
 1. HISTÓRICO DE VERSÕES: Pesquisa por ordem: (1) tabela de versões na capa, (2) preâmbulo, (3) histórico de alterações.
    data_republicacao = data da versão MAIS RECENTE — compara TODAS as datas da tabela e escolhe a mais alta cronologicamente (as linhas podem não estar ordenadas).
@@ -210,9 +220,19 @@ REGRAS (CRÍTICO):
     Cada padrão tem SEMPRE 5 caracteres ao todo (dígitos + '*').
 
     DOIS CAMPOS DE SAÍDA (preenche o(s) que se aplicar(em), o outro fica []):
-      • `included_caes`: lista positiva — quando o aviso diz que SÓ certos CAE são elegíveis
-        ("apenas os CAE...", "são elegíveis as atividades CAE..."). Se preenchido, qualquer
-        CAE fora desta lista NÃO é elegível.
+      • `included_caes`: lista positiva. Preenche quando o aviso RESTRINGE a elegibilidade a
+        um conjunto de atividades, por qualquer uma destas vias:
+          (a) frase explícita ("apenas os CAE...", "são elegíveis as atividades CAE...",
+              "só são elegíveis...");
+          (b) uma LISTA, ANEXO ou SECÇÃO que ENUMERA as atividades/setores elegíveis — MESMO
+              sem a palavra "apenas", MESMO que o título NÃO diga "Anexo", e MESMO que o corpo
+              diga "todas as atividades exceto...". Ex.: "Lista de Atividades", "Atividades
+              elegíveis", "Setores elegíveis", "Abrangência setorial por CAE", ou secções do
+              tipo "Atividades incluídas no setor da Indústria:" / "Atividades incluídas no
+              setor do Turismo:" que enumerem divisões, grupos ou subclasses como o âmbito do
+              aviso. TODAS as atividades enumeradas → included_caes; os itens qualificados por
+              "com exceção de" dentro delas → excluded_caes.
+        Se `included_caes` ficar preenchido, qualquer CAE fora desta lista NÃO é elegível.
       • `excluded_caes`: lista de exclusão — quando o aviso diz "Todos EXCETO..." / "com
         exceção de..." / "não são elegíveis os CAE...".
     Se o aviso não tiver qualquer restrição de CAE: ambos [] (ambos vazios = qualquer CAE
@@ -236,6 +256,29 @@ REGRAS (CRÍTICO):
       Texto: "Todos exceto: Divisões 64 a 66; Subclasses 25301; 25302; 30130; Divisão 92"
       → excluded_caes = ["64***","65***","66***","25301","25302","30130","92***"]
       → included_caes = []
+
+    LER OS CAE EM TODO O DOCUMENTO — INCLUINDO ANEXOS (OBRIGATÓRIO):
+      As listas de CAE elegíveis/excluídos aparecem MUITAS VEZES em Anexos (ex: "Anexo — CAE",
+      "Lista de Atividades", "Atividades económicas elegíveis", "Abrangência setorial por CAE",
+      "Lista de CAE"). A informação de CAE pode estar em MAIS DO QUE UM sítio do documento
+      (corpo + um ou mais anexos) — lê TODOS e junta tudo.
+      Um anexo/lista que ENUMERA as atividades/setores do aviso é uma LISTA POSITIVA → todas
+      essas atividades vão para included_caes (e as suas exceções "com exceção de" para
+      excluded_caes), MESMO que o corpo diga "todas as atividades exceto...". Nesse caso
+      coexistem: included_caes (do anexo enumerado) + excluded_caes (exclusões do corpo E as
+      exceções do anexo). Extrai TODOS os CAE mencionados, incluídos E excluídos.
+
+    "X, COM EXCEÇÃO DE Y" — EXCEÇÃO HIERÁRQUICA (padrão genérico, aplica-se a qualquer nível):
+      Quando um nível X (divisão/grupo/classe) é qualificado por "com exceção de / salvo /
+      exceto" um sub-nível Y CONTIDO em X, coloca AMBOS os padrões, cada um na sua lista
+      conforme o sentido — o padrão MAIS ESPECÍFICO (Y) é a exceção e prevalece no match:
+        • "Divisão 91 ELEGÍVEL, com exceção do Grupo 911":
+            included_caes += "91***"   e   excluded_caes += "911**"
+        • "Divisão 91 EXCLUÍDA, com exceção do Grupo 911" (911 continua elegível):
+            excluded_caes += "91***"   e   included_caes += "911**"
+      Regra: o item principal (X) vai para a lista do seu contexto (elegível→included,
+      excluído→excluded); a exceção (Y) vai para a lista OPOSTA. Não precisas de enumerar os
+      outros sub-níveis — o Y mais específico chega para o match resolver a exceção.
 
     REGRAS FINAIS:
       • Compara/escreve sempre os CAE como STRING (preserva zeros à esquerda, ex: "01111").
@@ -321,7 +364,7 @@ ESQUEMA DE DADOS ESPERADO:
     "operation_typology": "String",
     "covered_actions": "String",
     "intermediate_bodies": [{ "name": "String", "tax_id": "String ou null", "competencies": "String ou null" }],
-    "applicable_legislation": ["List de Strings"],
+    "applicable_legislation": [ { "nome_regulamento": "String", "artigos": [{ "artigo": "String", "refere_se_a": "String ou null" }], "refere_se_a": "String ou null (geral do diploma; null quando cada artigo já tem o seu)" } ],
     "regulatory_documents": [{ "name": "String", "url": "String ou null" }],
     "target_technology_sectors": ["List de Strings ou []"],
     "application_submission": "String",
@@ -444,13 +487,27 @@ REGRAS CRÍTICAS:
     territoriais, cria APENAS 1 entrada em Fase_Area por área geográfica, com
     `codigo_fase: "GLOBAL"`. NUNCA replicas as mesmas dotações para F1, F2, F3...
     Só crias múltiplas entradas por área se o aviso tiver dotações diferentes por fase
-    (ex: "Fase 1: 500.000€", "Fase 2: 300.000€" para a mesma CIM).
+    (ex: "Fase 1: 500.000€", "Fase 2: 350.000€" para a mesma CIM).
 
 7. DOTAÇÃO POR FUNDO vs DOTAÇÃO GLOBAL — DUAS ENTRADAS DISTINTAS (CRÍTICO):
    As tabelas de dotação distinguem frequentemente a comparticipação do FUNDO (ex: FSE+ a
    85%) da DOTAÇÃO GLOBAL da operação (100%, = fundo + contrapartida nacional). Estas são
    DUAS dotações diferentes e o JSON tem de as tornar EXPLÍCITAS: cria uma entrada de
    PhaseArea por cada uma, usando o campo `nome_fundo` e um `codigo_fase` distinto.
+
+   `nome_fundo` — LABEL EXATO DA LINHA (NÃO só a sigla do fundo): copia a designação COMPLETA
+   da coluna "Fundo"/"Programa" da tabela de dotação, tal como está no aviso. Se a tabela
+   distinguir por PROGRAMA/REGIÃO, cada linha tem o seu label próprio — NÃO colapses tudo em
+   "FEDER". Exemplos de valores corretos: "PR Norte / FEDER", "PR Centro / FEDER",
+   "PR Lisboa / FEDER", "PR Alentejo / FEDER", "PR Algarve / FEDER", "Dotação Global".
+   PROIBIDO: pôr o mesmo `nome_fundo` (ex: "FEDER") em todas as linhas quando o aviso lhes dá
+   labels distintos por programa/região.
+   PROIBIDO INVENTAR: usa APENAS o rótulo da PRIMEIRA COLUNA da LINHA DE DADOS ("PR / Fundo"),
+   NÃO o cabeçalho da tabela. Se a linha diz "PO Alfa / FEDER", o `nome_fundo` é "PO Alfa / FEDER"
+   — NÃO acrescentes nomes de programa entre parênteses vindos do cabeçalho ou do texto (ex:
+   "(Alfa 2030)", "(Beta 2030)"). Se a linha só disser "FEDER", o `nome_fundo` é "FEDER". O
+   `codigo_fase` deve distinguir as linhas (ex: fundo vs "GLOBAL"); não uses o mesmo `codigo_fase`
+   para linhas que representam dotações diferentes.
 
    Para cada área:
    - Entrada do FUNDO: `nome_fundo` = sigla do fundo (ex: "FSE+", "FEDER"),
@@ -459,10 +516,14 @@ REGRAS CRÍTICAS:
      `codigo_fase` = a sigla do fundo (ex: "FSE+").
    - Entrada da DOTAÇÃO GLOBAL: `nome_fundo` = "Dotação Global",
      `dotacao_orcamental` = valor total da operação,
-     `taxa_financiamento_maxima` = 100.0,
+     `taxa_financiamento_maxima` = a taxa da célula "Taxa Máxima" DESSA linha, SE existir. Se a
+       célula estiver VAZIA (ex: a "Dotação Global" é apenas a linha de TOTAL/soma, sem taxa
+       própria) → null. Só usa 100.0 quando o aviso DISSER explicitamente que a dotação global
+       é a 100% (ex: fundo a 85% + contrapartida nacional = 100%). PROIBIDO inventar 100.0
+       numa célula vazia.
      `codigo_fase` = "GLOBAL".
 
-   EXEMPLO (FSE+ 4.000.000,00€ a 85% e Dotação Global 4.705.882,34€ a 100%):
+   EXEMPLO 1 (o aviso DIZ que a global é 100% = fundo 85% + contrapartida):
      PhaseArea = [
        { "codigo_fase": "FSE+",   "codigo_area": "A1", "nome_fundo": "FSE+",
          "dotacao_orcamental": 4000000.00, "taxa_financiamento_maxima": 85.0 },
@@ -470,10 +531,55 @@ REGRAS CRÍTICAS:
          "dotacao_orcamental": 4705882.34, "taxa_financiamento_maxima": 100.0 }
      ]
 
+   EXEMPLO 2 (tabela por PROGRAMA em que cada linha, além do total, se REPARTE em colunas —
+   rótulos e valores ILUSTRATIVOS/PLACEHOLDER, NÃO os copies; os rótulos reais vêm do aviso):
+     | PR / Fundo      | Valor Dotação Fundo | Taxa Máxima | «Repartição A» | «Repartição B» |
+     | PO Alfa / FEDER | 12.000.000€         | 55%         | 5.000.000€     | 7.000.000€     |
+     | Dotação Global  | 18.000.000€         | (vazio)     | 8.000.000€     | 10.000.000€    |
+   → UMA entrada por FUNDO; `dotacao_orcamental` = coluna do TOTAL da linha ("Valor Dotação
+     Fundo"); as colunas de repartição (SEJAM QUAIS FOREM os seus rótulos) vão para
+     `distribuicao` — NUNCA criar entradas separadas por coluna de repartição:
+     PhaseArea = [
+       { "codigo_fase": "ALFA",   "codigo_area": "A1", "nome_fundo": "PO Alfa / FEDER",
+         "dotacao_orcamental": 12000000.0, "taxa_financiamento_maxima": 55.0,
+         "distribuicao": [ {"nome": "«Repartição A»", "dotacao": "5.000.000"},
+                           {"nome": "«Repartição B»", "dotacao": "7.000.000"} ] },
+       { "codigo_fase": "GLOBAL", "codigo_area": "A1", "nome_fundo": "Dotação Global",
+         "dotacao_orcamental": 18000000.0, "taxa_financiamento_maxima": null,
+         "distribuicao": [ {"nome": "«Repartição A»", "dotacao": "8.000.000"},
+                           {"nome": "«Repartição B»", "dotacao": "10.000.000"} ] }
+     ]
+     REPARA: (a) `nome_fundo` é o rótulo EXATO da linha, sem programa entre parênteses;
+     (b) `dotacao_orcamental` é o TOTAL da linha (12M), NUNCA os valores das colunas de
+     repartição (5M/7M) — esses vão SÓ para `distribuicao`; (c) É PROIBIDO criar duas entradas
+     para o MESMO fundo (uma por coluna de repartição); (d) os `nome` da `distribuicao` são os
+     RÓTULOS REAIS do aviso — NÃO uses "«Repartição A/B»", que aqui são só placeholders;
+     (e) a taxa da "Dotação Global" é null (célula vazia).
+
    REGRA DE SUPRESSÃO: só cria a entrada "Dotação Global" SE o valor global for DIFERENTE
    da dotação do fundo. Se o aviso só indicar um valor (fundo = global, ou não há
    contrapartida distinta), cria UMA única entrada com `nome_fundo` = fundo desse valor.
    Multi-fundo: uma entrada por fundo + uma entrada "Dotação Global" (se diferir da soma).
+
+   REPARTIÇÃO INTERNA — CAMPO `distribuicao` (SÓ QUANDO EXISTE, GENÉRICO):
+   Preenche-la quando o aviso reparte a dotação de UMA linha em sub-montantes próprios — por
+   exemplo, quando a tabela de dotação tem COLUNAS de repartição por linha (além do total), ou
+   quando dentro de uma linha há uma sub-repartição em vários montantes. Nesses casos o
+   `dotacao_orcamental` da linha continua a ser o TOTAL, e os sub-montantes vão para `distribuicao`
+   — NUNCA cries entradas de PhaseArea separadas por cada sub-montante/coluna. Se a linha não
+   tiver repartição, `distribuicao`: [].
+   O rótulo de cada sub-registo NÃO é fixo — usa EXATAMENTE o que o aviso escrever (pode ser um
+   território, um tipo de operação, ou qualquer outra coisa). Cada sub-registo é
+   {"nome": <rótulo tal como no aviso>, "dotacao": <valor no FORMATO LEGÍVEL do aviso (string),
+   não o número puro>}. Exemplo de FORMA (rótulos PLACEHOLDER — usa os REAIS do aviso):
+     "distribuicao": [
+       {"nome": "«Repartição A»", "dotacao": "40.000.000,00"},
+       {"nome": "«Repartição B»", "dotacao": "60.000.000,00"}
+     ]
+   CONSISTÊNCIA DOS NOMES (OBRIGATÓRIO): dentro do MESMO aviso, usa SEMPRE exatamente o MESMO
+   `nome` para a mesma repartição em TODAS as linhas/fundos (mesma grafia, maiúsculas e acentos).
+   Se numa linha escreves um rótulo, repete-o IGUAL nas outras — variações da mesma coisa (ex:
+   acrescentar/remover palavras, mudar maiúsculas/acentos) são PROIBIDAS.
 
 ESQUEMA DE DADOS ESPERADO:
 {
@@ -508,9 +614,10 @@ ESQUEMA DE DADOS ESPERADO:
       "phase_code": "String — sigla do fundo (ex: 'FSE+') ou 'GLOBAL'; nunca 'F1' por defeito",
       "area_code": "String",
       "grant_code": "String",
-      "fund_name": "String — fundo desta linha (ex: 'FSE+', 'FEDER') ou 'Dotação Global'",
+      "fund_name": "String — label EXATO da linha (ex: 'PR Norte / FEDER', 'FSE+') ou 'Dotação Global'; nunca só 'FEDER' quando há labels por programa/região",
       "budget_allocation": "Float ou null",
-      "max_financing_rate": "Float ou null (100.0 na linha da Dotação Global)"
+      "max_financing_rate": "Float ou null — copia a taxa da célula 'Taxa Máxima' dessa linha; célula VAZIA (ex: linha de total/Dotação Global sem taxa) → null; NUNCA inventes 100.0",
+      "distribuicao": [ { "nome": "String — rótulo do aviso (qualquer)", "dotacao": "String — formato do aviso, ex: '40.000.000,00'" } ]  // [] na maioria dos avisos
     }
   ]
 }
@@ -540,8 +647,8 @@ REGRAS (CRÍTICO):
      constituem auxílio de Estado E não refere nenhum artigo de enquadramento.
    REGRA DE CONSISTÊNCIA OBRIGATÓRIA: se `applicable_gber_article` ficar preenchido,
    `state_aid_regime` NÃO pode ser "Não Aplicável". Os dois campos são logicamente acoplados.
-   Como a fonte é OCR de imagem, NÃO confies no glifo de checkbox isolado — decide pelo texto.
-
+   C
+   
 3. AUTOFINANCIAMENTO: Verifica se é exigida percentagem mínima de capitais próprios.
 
 4. FORMAS DE PAGAMENTO vs FORMAS DE APOIO — DISTINÇÃO OBRIGATÓRIA (CRÍTICO):
@@ -567,13 +674,25 @@ REGRAS (CRÍTICO):
    PROIBIDO: nunca coloques "Subvenção", "Custos reais", "Montantes Fixos" ou "Taxa Fixa"
    em `formas_pagamento` — esses são formas de apoio, não de pagamento.
 
-5. TAXAS DIFERENCIADAS POR DIMENSÃO DE EMPRESA: Se o aviso definir taxas distintas por dimensão,
-   cria um objeto `Taxa_Financiamento` SEPARADO para cada dimensão.
-   Se a taxa for igual para todas, usa `dimensao_empresa: "Todos"`.
+5. TAXAS DIFERENCIADAS — UMA LINHA POR CASO QUE O AVISO DISTINGA (GENÉRICO):
+   Só cria linhas separadas QUANDO o aviso distinguir mesmo a taxa. O critério de distinção é
+   o que o aviso usar — dimensão de empresa e/ou território e/ou outra condição. Codifica-o em
+   `dimensao_empresa` de forma legível, usando os rótulos DO AVISO (não inventes categorias).
+     - Só por dimensão → "Médias Empresas", "Micro e Pequenas Empresas".
+     - Por dimensão E território → "Médias Empresas - <rótulo do território>" (ex: "- Baixa
+       Densidade"), mas o rótulo do território é o que o aviso escrever, não fixo.
+     - Só por território → "<rótulo do território>" (ex: "Baixa Densidade").
+     - Taxa igual para todos → uma única linha com `dimensao_empresa: "Todos"`.
+   NUNCA dividas por território/dimensão quando o aviso NÃO o faz — a maioria dos avisos tem
+   uma taxa só. Uma linha por caso REAL que o aviso distingue, nem mais nem menos.
 
 6. CONTACTOS: Extrai todos os meios de contacto mencionados. Cada meio é um item separado.
 
 7. INVESTIMENTO MÍNIMO E MÁXIMO — REGRA ANTI-CONFUSÃO (CRÍTICO):
+   PROCURA SEMPRE OS DOIS — `investimento_minimo` E `investimento_maximo` — mesmo que apareçam
+   em frases ou secções diferentes (o piso e o teto costumam vir juntos, ex: "mínimo de despesa
+   elegível total de 150.000 euros e ... total inferior a 10 milhões euros"), e mesmo que
+   estejam por EXTENSO ("10 milhões", "150 mil"). Não deixes um null só porque encontraste o outro.
    `investimento_minimo` e `investimento_maximo` são EXCLUSIVAMENTE limites por operação
    individual, com linguagem explícita como "investimento mínimo de X€ por projeto" ou
    "apoio máximo por candidatura de X€".
@@ -585,6 +704,39 @@ REGRAS (CRÍTICO):
    NOTA SOBRE CUSTO MÍNIMO POR OPERAÇÃO: Se o aviso definir um custo mínimo por operação
    (ex: "cada operação deve ter um custo total superior a 200 mil euros"), esse valor vai
    para `investimento_minimo`. Não confundas com dotação global.
+   O `investimento_minimo` é o PISO DE ELEGIBILIDADE da operação — procura frases como "mínimo
+   de despesa elegível total de X euros" ou "não serão elegíveis as candidaturas com despesa
+   elegível total inferior a X".
+
+   ANTI-CONFUSÃO — LIMIAR DE ENCAMINHAMENTO ENTRE FUNDOS ≠ MÍNIMO NEM MÁXIMO (CRÍTICO): um
+   valor que serve para DECIDIR QUAL o fundo/programa que financia a operação NÃO é o
+   investimento mínimo NEM o máximo. Ex (valores ILUSTRATIVOS): "o Fundo A financia as operações
+   com investimento total SUPERIOR a 5.000.000€; o Fundo B financia as de valor IGUAL OU INFERIOR
+   a 5.000.000€" — este 5.000.000€ é um limiar de REPARTIÇÃO entre fundos. É PROIBIDO pô-lo em
+   `investimento_minimo` OU em `investimento_maximo`. O piso/teto reais estão na regra de
+   elegibilidade da despesa (ex: "mínimo de despesa elegível total de 150.000 euros e ... total
+   inferior a 10 milhões euros" → mínimo=150000, máximo=10000000). Se SÓ vires o limiar de
+   repartição e NÃO vires o piso/teto de elegibilidade, deixa AMBOS os campos null (o passo de
+   enriquecimento preenche-os a partir da secção de despesas) — nunca uses o limiar de
+   repartição como substituto.
+
+   FORMATO DE NÚMEROS (PT) — NÃO ALTERAR A ESCALA: o ponto é separador de MILHARES e a
+   vírgula é decimal. "150.000" = 150000 (NÃO 150, NÃO 1.500.000); "1.200.000" = 1200000;
+   "8.000.000,00" = 8000000. Copia o valor EXATAMENTE — nunca multipliques nem dividas.
+
+   MONTANTES POR EXTENSO — CONVERTE PARA NÚMERO: o valor pode NÃO estar em formato numérico e
+   aparecer escrito por palavras. Converte-o para o número inteiro correspondente (exemplos):
+     • "10 milhões" / "10 milhões euros" = 10000000
+     • "150 mil" = 150000        • "1,5 milhões" = 1500000
+     • "meio milhão" = 500000    • "2 mil milhões" = 2000000000
+   Ex.: "despesa elegível total inferior a 10 milhões euros" → `investimento_maximo` = 10000000.
+
+   VALOR MÁXIMO — LEITURA OBRIGATÓRIA: procura o TETO DE ELEGIBILIDADE por operação — ex:
+   "despesa elegível total ... inferior a X milhões euros", "o incentivo não pode exceder X€",
+   "apoio máximo por candidatura", "investimento elegível máximo de X€" — e coloca-o em
+   `investimento_maximo`. NÃO uses o limiar de repartição entre fundos como teto. Se o teto real
+   existir no texto, não deixes null; se só existir o limiar de repartição, deixa null (é
+   preenchido no enriquecimento).
 
 8. AUTOFINANCIAMENTO: Extrai para `limite_autofinanciamento_exigido` a percentagem mínima
    obrigatória de capitais próprios exigida ao promotor (ex: "mínimo de 5% de capitais
@@ -656,31 +808,32 @@ PASSO 0 — OBRIGATÓRIO ANTES DE ESCREVER O JSON:
 Antes de produzires qualquer JSON, escreve em texto simples o seguinte raciocínio:
 
 PASSO 0.1 — Fórmula geral:
-  Escreve a fórmula MP que encontraste (ex: MP = 0,3A + 0,3B + 0,1C + 0,3D)
-  Pesos nível 1: A=?, B=?, C=?, D=?  (coeficiente × 100)
+  Escreve a fórmula MP que encontraste (ex: MP = 0,2A + 0,3B + 0,1C + 0,4D)
+  Pesos de nível 1 = coeficiente × 100: A=20, B=30, C=10, D=40 (somam 100).
 
-PASSO 0.2 — Sub-fórmulas:
-  Para cada sub-fórmula encontrada (ex: A = 0,5A1 + 0,5A2), escreve:
-  "A = 0,5A1 + 0,5A2  →  A1 = 0,5 × 30 = 15.0 | A2 = 0,5 × 30 = 15.0"
-  Faz o mesmo para D, B, C se tiverem sub-fórmulas.
+PASSO 0.2 — Sub-fórmulas (PESO RELATIVO AO PAI DIRETO):
+  O peso de cada filho é o SEU coeficiente × 100 — RELATIVO ao pai direto. NÃO multipliques
+  pelo peso do pai. Cada grupo de irmãos soma 100. Exemplos:
+  "A = 0,6A1 + 0,4A2  →  A1 = 0,6×100 = 60.0 | A2 = 0,4×100 = 40.0  (somam 100)"
+  "D1 = 0,40 D1.1 + 0,30 D1.2 + 0,30 D1.3  →  D1.1 = 40.0 | D1.2 = 30.0 | D1.3 = 30.0"
+  Faz o mesmo para B, C, D e todos os níveis.
 
 PASSO 0.3 — Inventário de todos os subcritérios:
-  Lista TODOS os subcritérios que encontraste descritos no texto
-  (mesmo os que não têm tabela própria, ex: A.1, A.2, B.1, C1, D.1, D.2).
-  Para cada um escreve: código, descrição resumida, peso calculado.
+  Lista TODOS os subcritérios descritos no texto (mesmo sem tabela própria, ex: A.1, A.2,
+  B.1, C1, D.1, D.2, D1.1…). Para cada um escreve: rótulo (criterion_name), DESCRIÇÃO (o
+  que o critério avalia / como se pontua) e peso relativo calculado.
 
 PASSO 0.4 — Verificação:
-  Para cada pai, verifica: soma dos filhos == peso do pai?
-  Ex: "A: A1(15.0) + A2(15.0) = 30.0 == A(30.0) ✓"
-  Se alguma verificação der ✗, corrige antes de continuar.
+  Para cada filho confirma: weight == coeficiente × 100?
+  Ex: "D1.1 = 0,40 × 100 = 40 ✓ | D1.2 = 0,30 × 100 = 30 ✓"
+  NÃO forces os pesos a somar 100 — se os coeficientes do aviso não somarem 1, os pesos NÃO
+  somam 100, e está correto. A regra é multiplicar por 100, não normalizar.
 
-REGRA DE CÁLCULO DE PESOS — CRÍTICO:
-  Quando a fórmula define subcritérios (ex: A = 0,5×A1 + 0,5×A2), a ponderação absoluta
-  de cada filho é: peso_pai × coeficiente_filho.
-  Exemplo: A=30%, A1=0,5 → ponderação de A1 = 30 × 0,5 = 15.0 (NÃO 30.0, NÃO 50.0).
-  Extrai TODOS os subcritérios mencionados no texto, incluindo D.2 e outros que apareçam
-  apenas nos Anexos de critérios — um subcritério descrito em texto sem tabela própria
-  TEM de ser extraído.
+REGRA DE CÁLCULO DE PESOS — CRÍTICO (MULTIPLICAR POR 100):
+  O `weight` de um critério é o SEU coeficiente na sub-fórmula do PAI DIRETO, MULTIPLICADO por 100.
+  NÃO é o peso absoluto no MP. Ex: em "D1 = 0,40 D1.1 + …", D1.1 = 40.0 (NÃO 0,40 × peso de D1).
+  NÃO normalizes nem forces soma 100: copia o coeficiente do aviso e multiplica por 100, tal como está.
+  Extrai TODOS os subcritérios mencionados no texto, incluindo os que só aparecem em Anexos.
 
 SÓ depois deste raciocínio escrito produzires o JSON.
 
@@ -698,18 +851,29 @@ ESQUEMA JSON OBRIGATÓRIO:
       "scoring_scale": "String ou null — escala/rubrica dos pontos (ex: 1-5 e significado de cada nível)",
       "min_global_score": "Float ou null",
       "_verificacao": {
-        "nivel1": "String — ex: 'A(60.0) + B(40.0) = 100.0 ✓'",
-        "nivel2_por_pai": ["String por pai — ex: 'A1(x) + A2(y) = A(60.0) ✓'"],
-        "nivel3_por_pai": ["String por pai de nível 3 se existir"],
-        "formula_coef": "String — ex: 'coef_A=60.0 ✓  coef_B=40.0 ✓'"
+        "nivel1": "String — pesos de nível 1 = coef×100, ex: 'A=0,2×100=20 ✓ B=0,3×100=30 ✓'",
+        "grupos": ["String por filho — weight = coeficiente×100, ex: 'D1.1=0,40×100=40 ✓'"],
+        "formula_coef": "String — coeficientes×100 == pesos de nível 1"
       },
       "evaluation_criteria": [
         {
-          "criterion_code": "String",
-          "description": "String",
-          "weight": "Float — valor ABSOLUTO em percentagem",
+          "criterion_name": "String — rótulo do critério de NÍVEL 1 (ex: 'A', 'B', 'C', 'D')",
+          "description": "String — o que o critério avalia / como se pontua",
+          "formula": "String ou null — sub-fórmula que combina os filhos DIRETOS deste critério (ex: 'A = 0,6 A1 + 0,4 A2'); null se o critério não tiver filhos ou não houver fórmula explícita",
+          "weight": "Float — peso RELATIVO ao pai direto (coeficiente × 100); os filhos de cada pai somam 100",
           "min_score": "Float ou null — preenche quando existe nota de exclusão",
-          "is_exclusion_criterion": "Boolean — true se critério de exclusão, false caso contrário"
+          "is_exclusion_criterion": "Boolean — true se critério de exclusão, false caso contrário",
+          "subcriteria": [
+            {
+              "criterion_name": "String — filho (ex: 'A1', 'A2'); pode ter os seus próprios subcriteria (ex: 'A2' → 'A2.1','A2.2')",
+              "description": "String",
+              "formula": "String ou null — sub-fórmula dos filhos deste nó (ex: 'A2 = 0,5 A2.1 + 0,5 A2.2'); null se for folha",
+              "weight": "Float — coeficiente × 100 relativo ao pai direto",
+              "min_score": "Float ou null",
+              "is_exclusion_criterion": "Boolean",
+              "subcriteria": "… mesma estrutura, recursivo; NULL nas folhas (critério sem filhos)"
+            }
+          ]
         }
       ],
       "tiebreaker_criteria": ["List de Strings"]
@@ -727,91 +891,57 @@ REGRAS CRÍTICAS:
    c) Para cada pai de nível 2 com filhos, os critérios de nível 3.
    Só depois de teres o inventário completo começas a escrever o JSON.
 
-0b. VINCULAÇÃO DA FÓRMULA ALGÉBRICA E CONVERSÃO DE PESOS (CRÍTICO):
-   Quando encontrares uma fórmula como MP = 0,3A + 0,3B + 0,1C + 0,3D:
-   → A ponderação ABSOLUTA de cada critério de nível 1 = coeficiente × 100
-     (ex: A=30.0, B=30.0, C=10.0, D=30.0)
+0b. FÓRMULA ALGÉBRICA → PESOS RELATIVOS AO PAI DIRETO (CRÍTICO):
+   Cada critério tem `weight` = o SEU coeficiente na sub-fórmula do PAI DIRETO × 100.
+   - Nível 1 (MP = 0,2A + 0,3B + 0,1C + 0,4D): A=20, B=30, C=10, D=40 (o pai é o MP; somam 100).
+   - Sub-fórmula A = 0,6A1 + 0,4A2 → A1=60, A2=40 (relativos a A; somam 100).
+   - Sub-fórmula D1 = 0,40 D1.1 + 0,30 D1.2 + 0,30 D1.3 → D1.1=40, D1.2=30, D1.3=30 (somam 100).
+   NÃO multipliques pelo peso do pai. O peso é SEMPRE a % dentro do pai direto.
+   OBRIGATÓRIO: extrai TODOS os filhos mencionados (mesmo D.2 ou os que só têm secção de
+   texto, sem tabela própria). Se o documento descreve D.1 e D.2, ambos aparecem.
 
-   Quando encontrares uma sub-fórmula como A = 0,5A1 + 0,5A2:
-   → Os coeficientes são RELATIVOS ao pai. Converte para absoluto:
-     ponderacao_absoluta_filho = coeficiente_filho × ponderacao_absoluta_pai
-     (ex: A1 = 0,5 × 30.0 = 15.0; A2 = 0,5 × 30.0 = 15.0)
+0c. DETEÇÃO IMPLÍCITA DE SUB-FÓRMULAS:
+   Se um pai tem vários subcritérios descritos mas SEM fórmula explícita, assume
+   distribuição IGUAL entre eles (somam 100). Ex: D com D.1 e D.2 → D1=50, D2=50. Regista
+   "distribuição igual assumida" no _verificacao. Nunca omitas um subcritério descrito.
 
-   Quando encontrares D = 0,5D1 + 0,5D2:
-     D1 = 0,5 × 30.0 = 15.0; D2 = 0,5 × 30.0 = 15.0
+1. ESTRUTURA EM ÁRVORE (ANINHADA) — OBRIGATÓRIO:
+   `criterios_avaliacao` contém APENAS os critérios de NÍVEL 1 (A, B, C, D). Cada critério
+   guarda os seus filhos DENTRO do seu próprio campo `subcriteria` — NÃO numa lista plana.
+   Aninha recursivamente: A → subcriteria [A1, A2]; A2 → subcriteria [A2.1, A2.2]; e assim
+   por diante. Um critério SEM filhos (folha) tem `subcriteria`: null (NÃO []).
+   Os critérios de nível 1 aparecem SEMPRE, mesmo que no texto sejam apenas cabeçalhos de
+   secção. O peso do pai de nível 1 é o SEU coeficiente no MP × 100 (ex: A=20). Se encontrares
+   A1, A2 mas não vires "A", procura o cabeçalho/célula que os agrupa — esse é o pai "A".
+   NUNCA saltes do nível 0 para o nível 2 omitindo o pai.
 
-   OBRIGATÓRIO: extrai TODOS os filhos mencionados nas sub-fórmulas ou descritos como
-   subcritérios. Se o documento descreve D.1 E D.2, AMBOS devem aparecer em
-   `criterios_avaliacao`. Nunca omites um filho por não aparecer numa tabela.
+1b. CAMPO `formula` POR CRITÉRIO — CAPTURA TODAS AS SUB-FÓRMULAS:
+   Além da fórmula global `project_merit_formula` (MP = 0,2A + 0,3B + 0,1C + 0,4D), cada
+   critério que tenha filhos leva em `formula` a sua PRÓPRIA sub-fórmula, copiada LITERALMENTE
+   do documento — ex: A leva "A = 0,6 A1 + 0,4 A2"; A2 leva "A2 = 0,5 A2.1 + 0,5 A2.2";
+   D1 leva "D1 = 0,40 D1.1 + 0,30 D1.2 + 0,30 D1.3". Procura estas fórmulas em TODO o texto e
+   Anexos (muitas vezes centradas/isoladas). Uma folha (sem filhos) tem `formula`: null.
+   Se um pai tem filhos mas o documento NÃO dá fórmula explícita, deixa `formula`: null (não
+   a inventes) — os pesos dos filhos continuam a ser extraídos na mesma. Genérico: aplica-se
+   a QUALQUER aviso e a QUALQUER rótulo (A/B/C/D e seus subníveis), não só a este exemplo.
 
-   ANTI-ERRO: o peso do filho NUNCA é igual ao peso do pai (exceto se tiver apenas 1 filho).
-   Se A=30.0 e tens A1 e A2 → cada um tem 15.0, não 30.0.
+2. CÉLULAS FUNDIDAS: o peso na célula do pai é do PAI; os filhos têm os seus próprios pesos
+   (relativos ao pai) nas suas linhas.
 
-0c. DETEÇÃO IMPLÍCITA DE SUB-FÓRMULAS (CRÍTICO):
-   Se um critério pai tem múltiplos subcritérios descritos no texto mas sem fórmula
-   explícita (ex: o documento descreve D.1 e D.2 com secções próprias mas não escreve
-   "D = 0,5D1 + 0,5D2"), assume distribuição IGUAL entre eles e regista isso em
-   _verificacao com nota "sub-fórmula implícita — distribuição igual assumida".
-   Exemplo: D tem D.1 e D.2 descritos → assume D = 0,5D1 + 0,5D2
-             → D1 = 0,5 × 30.0 = 15.0; D2 = 0,5 × 30.0 = 15.0
-   NUNCA omites um subcritério descrito no texto por não ter sub-fórmula explícita.
+2b. PESOS A PARTIR DA FÓRMULA (fonte preferencial): usa o coeficiente da sub-fórmula × 100.
+    Se o aviso SÓ der pesos numa tabela (sem fórmula) e esses pesos forem ABSOLUTOS (relativos
+    ao MP, não ao pai), converte para relativos ao pai direto: relativo = (absoluto /
+    peso_do_pai) × 100. Caso a tabela já dê o peso relativo ao pai, usa-o diretamente.
+    NÃO normalizes à força para somar 100 — reflete o que o aviso diz.
 
-1. CRITÉRIOS PAI DE NÍVEL 1 — EXTRACÇÃO OBRIGATÓRIA:
-   Os critérios de nível 1 (ex: A, B, C) DEVEM sempre aparecer em `criterios_avaliacao`,
-   mesmo que no texto sejam apenas cabeçalhos de secção sem linha própria na tabela.
-   ANTI-ERRO CRÍTICO: Se encontrares critérios A1, A2, A3 mas não vires "A" como critério
-   próprio, procura o cabeçalho ou célula fundida que os agrupa — esse é o pai "A" e tem
-   a sua própria ponderação (soma de todos os filhos directos).
-   NUNCA saltes do nível 0 directamente para o nível 2 omitindo o nível 1.
-   Estrutura obrigatória:
-   - A (nível 1, ponderacao = soma absoluta dos seus filhos directos)
-     - A1 (nível 2)
-     - A2 (nível 2)
-     - A3 (nível 2)
-       - A3.1 (nível 3)
-       - A3.2 (nível 3)
-   - B (nível 1, ponderacao = soma absoluta dos seus filhos directos)
-     - B1 (nível 2)
-     - B2 (nível 2)
+2c. VERIFICAÇÃO — CAMPO _verificacao (antes de escrever criterios_avaliacao):
+    - grupos: para cada filho, confirma weight == coeficiente × 100 (ex: "D1.1 = 0,40×100 = 40 ✓").
+    - formula_coef: coeficientes×100 coincidem com os pesos de nível 1.
+    Marca cada equação com ✓/✗. PROIBIDO escrever criterios_avaliacao com qualquer ✗.
 
-2. CÉLULAS FUNDIDAS — LEITURA CORRECTA:
-   Quando uma célula contém o nome e peso de um critério pai e abrange várias linhas,
-   esse peso pertence APENAS ao pai. Os filhos têm os SEUS PRÓPRIOS pesos nas suas linhas.
-
-2b. PONDERAÇÕES: RELATIVAS VS ABSOLUTAS — PASSO OBRIGATÓRIO ANTES DE ESCREVER:
-    Para cada grupo de filhos de um mesmo pai, soma as ponderações como aparecem na tabela:
-
-    CASO 1 — A soma dos filhos é aproximadamente 100%:
-    → São RELATIVAS ao pai. Converte para ABSOLUTAS.
-    → Fórmula: ponderacao_absoluta = (ponderacao_relativa / 100) × peso_absoluto_do_pai
-    → Após conversão, a soma dos filhos deve igualar o peso do pai.
-
-    CASO 2 — A soma dos filhos é aproximadamente igual ao peso do pai:
-    → Já são ABSOLUTAS. Usa directamente.
-
-    REGRA DE OURO: a soma dos filhos DEVE sempre igualar o peso do pai.
-    Se não igualar: para, relê a tabela e corrige antes de continuar.
-
-    EXEMPLO OBRIGATÓRIO DE APLICAÇÃO:
-    Fórmula geral: MP = 0,3A + 0,3B + 0,1C + 0,3D  → A=30, B=30, C=10, D=30
-    Sub-fórmula A: A = 0,5A1 + 0,5A2 → A1=15, A2=15 (soma=30 ✓)
-    Sub-fórmula D: D = 0,5D1 + 0,5D2 → D1=15, D2=15 (soma=30 ✓)
-    B tem apenas B1 → B1=30 (soma=30 ✓)
-    C tem apenas C1 → C1=10 (soma=10 ✓)
-    _verificacao nivel1: A(30)+B(30)+C(10)+D(30)=100 ✓
-
-2c. VERIFICAÇÃO MATEMÁTICA — CAMPO _verificacao OBRIGATÓRIO:
-    Preenche `_verificacao` ANTES de escrever `criterios_avaliacao`.
-    - nivel1: todos os critérios de nível 1 devem somar 100.0
-    - nivel2_por_pai: para cada pai, os seus filhos directos devem somar o peso do pai
-    - nivel3_por_pai: idem para nível 3 se existir
-    - formula_coef: coeficientes da fórmula devem coincidir com pesos de nível 1
-    Marca cada equação com ✓ se correcta ou ✗ se errada.
-    PROIBIDO escrever `criterios_avaliacao` com qualquer ✗ no _verificacao.
-
-3. PONDERAÇÕES COMO FLOAT ABSOLUTO:
-   O campo `ponderacao` contém sempre o valor ABSOLUTO como número sem aspas.
-   Exemplos correctos: 65.0, 35.0, 25.0, 10.0, 30.0.
+3. `weight` COMO FLOAT RELATIVO:
+   O campo `weight` é o peso RELATIVO ao pai direto (coeficiente × 100), sem aspas.
+   Exemplos correctos: 60.0, 40.0, 30.0, 20.0, 10.0. Os filhos de cada pai somam 100.
 
 4. CRITÉRIOS DE EXCLUSÃO — DETEÇÃO DO MARCADOR `(*)` (CRÍTICO):
    Alguns avisos marcam critérios com `(*)` ou `*` na grelha de avaliação e explicam
@@ -882,8 +1012,8 @@ ESQUEMA JSON OBRIGATÓRIO:
 {
   "Grant": {
     "grant_code": "String",
-    "eligible_expenses": ["List de Strings"],
-    "ineligible_expenses": ["List de Strings"],
+    "eligible_expenses": [ { "categoria": "String ou null", "itens": ["List de Strings"] } ],
+    "ineligible_expenses": [ { "categoria": "String ou null", "itens": ["List de Strings"] } ],
     "output_indicators": [
       {
         "indicator_code": "String",
@@ -936,7 +1066,10 @@ ESQUEMA JSON OBRIGATÓRIO:
       "compliance_grade_formula": "String ou null — fórmula de cálculo do GC, ex: 'GC = (valor realizado / meta) × 100'",
       "general_tolerance_threshold": "Float ou null",
       "low_density_tolerance_threshold": "Float ou null",
-      "reduction_per_percentage_point": "Float ou null",
+      "reduction_per_percentage_point": "Float ou null — só se a redução for contínua; senão []/escaloes",
+      "escaloes_penalizacao": [
+        { "faixa_grau_cumprimento": "String — faixa exata, ex: '] 70% - 65% ]'", "reducao_pp": "Float" }
+      ],
       "max_penalty_percentage": "Float ou null",
       "financing_revocation_threshold": "Float ou null",
       "rule_description": "String"
@@ -945,6 +1078,34 @@ ESQUEMA JSON OBRIGATÓRIO:
 }
 
 REGRAS CRÍTICAS:
+0. DESPESAS ELEGÍVEIS / NÃO ELEGÍVEIS — GRUPOS OPCIONAIS POR CATEGORIA (GENÉRICO):
+   `eligible_expenses` e `ineligible_expenses` são LISTAS DE GRUPOS, cada um { "categoria": ...,
+   "itens": [...] }.
+   - POR DEFEITO (a maioria dos avisos NÃO divide): devolve UM único grupo com "categoria": null
+     e TODAS as despesas em "itens".
+   - SÓ divides em vários grupos quando o aviso SEPARA EXPLICITAMENTE as despesas por
+     categoria/setor (ex: uma lista de despesas para "Indústria" e outra para "Turismo"). Aí
+     cria um grupo por categoria, com `categoria` = o RÓTULO EXATO que o aviso usa (GENÉRICO —
+     pode ser "Indústria", "Turismo", "I&D", ou o que o aviso escrever) e os respetivos `itens`.
+   NUNCA inventes categorias que o aviso não tem. Se uma despesa vale para todos os setores mas
+   o aviso divide as outras, mantém-na no grupo/categoria onde o aviso a coloca (não a dupliques
+   a menos que o aviso a repita).
+   ITEM AVULSO CONDICIONADO A UM SETOR ≠ DIVISÃO: se o aviso apenas ACRESCENTA uma despesa
+   condicionada a um setor (ex: "no caso do setor do turismo, também são elegíveis os
+   veículos..."), NÃO cries grupos por setor — isso NÃO é uma divisão. Mantém TUDO num único
+   grupo `categoria`: null (a condição do setor já fica no texto do próprio item). Só usas
+   categorias quando o aviso apresenta as despesas mesmo ORGANIZADAS por setor — listas próprias
+   e distintas por setor, cada uma com os seus vários itens.
+
+   DESPESAS NÃO ELEGÍVEIS — PROCURA OBRIGATÓRIA (`ineligible_expenses`): procura ATIVAMENTE as
+   despesas/investimentos que o aviso EXCLUI, com formulações como "não são elegíveis as
+   despesas...", "o Aviso NÃO contempla a elegibilidade de...", "não podem ser consideradas
+   elegíveis...", "com exceção de...", "não é elegível". Estas frases aparecem muitas vezes na
+   secção "Regras ou limites específicos à elegibilidade de despesa", MISTURADAS com os limites
+   (%). Ex.: "O presente Aviso não contempla a elegibilidade de investimentos incorridos em data
+   anterior à data da candidatura, com exceção dos trabalhos preparatórios preliminares" →
+   ineligible_expenses. Só devolve `ineligible_expenses`: [] se REALMENTE não houver nenhuma.
+
 1. INDICADORES OFICIAIS — DISTINÇÃO OBRIGATÓRIA:
    Extrai APENAS indicadores com códigos oficiais (ex: EESO18, EESR32, RCO19, EEPR010, RPO047).
    - `indicadores_realizacao`: outputs directos (o que é produzido). Códigos: EESO, RCO, ECO, EECO.
@@ -987,6 +1148,26 @@ REGRAS CRÍTICAS:
    - `reducao_por_ponto_percentual`: redução por cada ponto percentual abaixo do limiar.
      Procura "redução de X p.p.", "meio p.p.", "0,5 pontos percentuais".
      Converte para Float (ex: "meio p.p." → 0.5).
+     Só preenche este campo quando a redução é uma taxa ÚNICA e contínua (ex: "0,5 p.p. por
+     cada ponto percentual abaixo de 70%"). Se a penalização vier em ESCALÕES/faixas
+     discretas (uma tabela), NÃO uses este campo — usa `escaloes_penalizacao` (a seguir).
+
+   - `escaloes_penalizacao`: LISTA de escalões, quando a penalização é definida por FAIXAS
+     de grau de cumprimento (tabela ou texto tipo "] 70% - 65% ] | 0,5 p.p.; ] 65% - 60% ] |
+     1,0 p.p.; ...; < 50% | 2,0 p.p."). Cria UMA entrada por faixa, cada uma com:
+       • `faixa_grau_cumprimento`: a faixa EXATA como está no documento (ex: "] 70% - 65% ]",
+         "] 65% - 60% ]", "< 50%") — preserva os sinais de intervalo `]`, `[`, `<`, `-`.
+       • `reducao_pp`: a redução em pontos percentuais dessa faixa, como Float (ex: 0.5, 1.0,
+         1.5, 2.0).
+     NUNCA colapses os escalões num único valor — cada faixa é uma entrada separada.
+     Exemplo COMPLETO (tabela "Grau de Cumprimento | Penalização"):
+       escaloes_penalizacao = [
+         {"faixa_grau_cumprimento": "] 70% - 65% ]", "reducao_pp": 0.5},
+         {"faixa_grau_cumprimento": "] 65% - 60% ]", "reducao_pp": 1.0},
+         {"faixa_grau_cumprimento": "] 60% - 50% ]", "reducao_pp": 1.5},
+         {"faixa_grau_cumprimento": "< 50%",         "reducao_pp": 2.0}
+       ]
+     Se a penalização não vier em faixas (é contínua), devolve [].
 
    - `penalizacao_maxima_percentual`: tecto máximo da penalização.
      Procura "até ao máximo de X%". Extrai o número (ex: 5.0).
@@ -1189,7 +1370,12 @@ CAMPOS A ENRIQUECER COM OS ANEXOS:
    decretos-lei, portarias, leis, resoluções, orientações de gestão e orientações técnicas.
    NÃO omitas nenhum item por já estarem "suficientes" — o objectivo é a lista EXAUSTIVA.
    Se encontrares diplomas em falta, inclui a lista COMPLETA (existentes + novos).
-   Se já estiver completa e correcta, NÃO a incluas no output.
+   ESTRUTURA de cada diploma: `nome_regulamento`, `artigos` (LISTA DE OBJETOS
+   {"artigo": "...", "refere_se_a": "a que assunto ESSE artigo se aplica ou null"}), e
+   `refere_se_a` geral (só quando não há artigos ou o fim é transversal). SEPARA os artigos
+   por assunto — não juntes artigos de fins diferentes no mesmo objeto. Se o JSON actual tiver
+   `artigos` como lista de strings, reescreve-o para o formato de objetos com `refere_se_a`.
+   Se já estiver completa e correcta (já no formato de objetos), NÃO a incluas no output.
 
 2. `CoveredArea` + `PhaseArea` — Se receberes um Anexo com delimitação territorial
    (ex: "Anexo A-4 — Delimitação geográfica ITI" ou similar):
@@ -1218,12 +1404,19 @@ CAMPOS A ENRIQUECER COM OS ANEXOS:
 
 3. `EvaluationMethodology` — Se receberes o Anexo com a grelha de avaliação
    (ex: "Referencial de Mérito", "Grelha de Avaliação", "Critérios de Seleção"),
-   substitui SEMPRE a lista existente — pode ter sub-critérios em falta ou pesos errados.
-   Extrai TODOS os subcritérios (A1, A2, B1, B2, C1, D1, D2...) com pesos correctos:
-   peso_filho = coeficiente_filho × peso_pai.
+   substitui SEMPRE a lista existente — pode ter subcritérios em falta, pesos errados ou
+   estrutura plana. Devolve `evaluation_criteria` como ÁRVORE ANINHADA: só critérios de
+   nível 1 (A, B, C, D) no topo, cada um com os filhos DENTRO do seu `subcriteria`, recursivo
+   até às folhas (folha → subcriteria: null, NÃO []).
+   FÓRMULAS: cada nó COM filhos leva a sua `formula` própria, copiada do documento
+   (ex: A → "A = 0,6 A1 + 0,4 A2"; A2 → "A2 = 0,5 A2.1 + 0,5 A2.2"; D1 → "D1 = 0,40 D1.1 +
+   0,30 D1.2 + 0,30 D1.3"). Folha → `formula`: null. Não inventes fórmulas.
+   PESOS (RELATIVO, coef×100): `weight` = coeficiente do nó na fórmula do PAI DIRETO × 100;
+   os filhos de cada pai somam 100 (ex: A = 0,6 A1 + 0,4 A2 → A1=60, A2=40). NÃO uses o peso
+   absoluto no MP.
    ANTI-ERRO: o peso de um filho NUNCA iguala o pai se existirem múltiplos filhos.
-   Se A=30 e tem A1 e A2 → A1=15, A2=15 (não 30).
-   Se encontrares a grelha, inclui sempre este campo no output.
+   Extrai TODOS os subcritérios e TODAS as sub-fórmulas, incluindo os que só aparecem em
+   Anexos. Se encontrares a grelha, inclui sempre este campo no output.
 
 4. `documentos_candidatura` (Aviso) — Lê o Anexo A-1 (documentos de candidatura)
    integralmente. Se encontrares documentos em falta, inclui a lista COMPLETA (existentes + novos).
@@ -1257,6 +1450,28 @@ CAMPOS A ENRIQUECER COM OS ANEXOS:
    Cada entrada: { "expense_category": "...", "max_absolute_value": 0.0, "max_percentage_value": 0.0,
    "calculation_base": "..." }.
    Se já estiver correcta, NÃO a incluas no output.
+
+9b. `included_caes` / `excluded_caes` — Se um Anexo OU uma SECÇÃO do corpo ENUMERAR as
+    atividades/setores elegíveis do aviso — o título pode NÃO conter a palavra "Anexo" (ex:
+    "Lista de Atividades", "Atividades elegíveis", "Atividades incluídas no setor da Indústria",
+    "Atividades incluídas no setor do Turismo", "Abrangência setorial por CAE") — essa
+    enumeração é uma LISTA POSITIVA → converte TODAS essas atividades para
+    padrões wildcard de 5 caracteres em `included_caes` (Divisão "64"→"64***", Grupo "651"→
+    "651**", Classe "6512"→"6512*", Subclasse "65124"→"65124"). Faz isto MESMO que o corpo diga
+    "todas as atividades exceto..." e MESMO sem a palavra "apenas". Intervalos "Divisões 05 a 33"
+    expandem-se divisão a divisão ("05***","06***",...,"33***"); enumerações "X e Y" só os
+    enumerados. Itens qualificados por "com exceção de Y" → o item principal na sua lista e o Y
+    (mais específico) na lista OPOSTA (ex: "Divisão 91 elegível com exceção do Grupo 911" →
+    included_caes+="91***", excluded_caes+="911**"). Devolve as listas COMPLETAS (corpo + anexo).
+    Não inventes CAE que não estejam no texto.
+
+9d. `eligible_expenses` / `ineligible_expenses` — ESTRUTURA DE GRUPOS: são LISTAS DE GRUPOS
+    { "category": <rótulo ou null>, "items": [...] }. Se um destes campos estiver vazio e
+    encontrares as despesas no texto, devolve-o NESTE formato: por defeito um único grupo
+    { "category": null, "items": [...] }; só divides por categoria quando o aviso o fizer
+    explicitamente. Procura ATIVAMENTE as NÃO elegíveis ("não contempla a elegibilidade de...",
+    "não são elegíveis...", "com exceção de..."), muitas vezes na secção de regras de
+    elegibilidade da despesa. NÃO devolvas lista de strings simples — usa sempre os grupos.
 
 10. CAMPOS VAZIOS DO CORPO DO DOCUMENTO — recebeste a lista "CAMPOS VAZIOS A TENTAR PREENCHER".
     Para cada campo dessa lista, procura nos chunks recebidos (tanto de Anexos como do corpo)

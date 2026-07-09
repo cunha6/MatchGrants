@@ -1,8 +1,10 @@
-version: "3.9"
+
 
 services:
   db:
-    image: postgres:15
+    # pgvector/pgvector é o postgres:15 + extensão `vector` (pesquisa semântica).
+    # Mesma versão major (15) → o volume de dados existente é compatível.
+    image: pgvector/pgvector:pg15
     container_name: matchgrants_db
     restart: always
     environment:
@@ -18,9 +20,21 @@ services:
       interval: 5s
       retries: 10
 
+  # Chrome dedicado para o scraping (Selenium). O chromium do Debian (v150) rebenta
+  # com SIGTRAP em headless/WSL2; esta imagem traz um Chrome testado para container.
+  chrome:
+    image: selenium/standalone-chrome:latest
+    container_name: matchgrants_chrome
+    shm_size: '2gb'
+    restart: unless-stopped
+    ports:
+      - "4444:4444"   # Selenium WebDriver
+      - "7900:7900"   # noVNC (debug visual, opcional)
+
   app:
     build: .
     container_name: matchgrants
+    shm_size: '1gb'
     command: >
       sh -c "python manage.py migrate &&
              python manage.py migrate --database=nif &&
@@ -35,9 +49,13 @@ services:
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_HOST=db
       - DB_PORT=5432
+      # Faz o scraping usar o Chrome do container `chrome` (WebDriver remoto).
+      - SELENIUM_REMOTE_URL=http://chrome:4444/wd/hub
     depends_on:
       db:
         condition: service_healthy
+      chrome:
+        condition: service_started
     restart: unless-stopped
 
 volumes:

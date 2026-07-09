@@ -9,19 +9,21 @@ import json
 import time
 from pathlib import Path
 
-from .chunker import chunk_by_markdown, CATS_P1, CATS_P2, CATS_P3, CATS_P4, CATS_P5, CATS_P6
+from .chunker import chunk_by_markdown, FIELD_PT_TERMS, CATS_P1, CATS_P2, CATS_P3, CATS_P4, CATS_P5, CATS_P6
 from .merge import merge
-from .normalizers import extract_grant_code, inject_anchor, normalize_grant_code, normalize_grant_codes_json
+from .normalizers import extract_grant_code, inject_anchor, normalize_grant_code, normalize_grant_codes_json, normalize_pp_to_percent
 from .openai_client import classify_ambiguous_chunks, call_openai, call_openai_text, create_client
 from .prompts import SYSTEM_PROMPT_1, SYSTEM_PROMPT_2, SYSTEM_PROMPT_3, SYSTEM_PROMPT_4, SYSTEM_PROMPT_5, SYSTEM_PROMPT_6, SYSTEM_PROMPT_7, SYSTEM_PROMPT_CONSOLIDATE
 
 # Modelo usado em cada prompt
 P1_MODEL = "gpt-5-mini-2025-08-07"
-P2_MODEL = "gpt-4o-mini"
+# P2 faz a tabela de Dotação (fundo/programa/taxas) — estrutura difícil; o gpt-4o-mini
+# inventava labels de fundo e taxas (ex: 100% numa Dotação Global sem taxa). gpt-5-mini é fiável.
+P2_MODEL = "gpt-5-mini-2025-08-07"
 P3_MODEL = "gpt-5.4-mini-2026-03-17"
 P4_MODEL = "gpt-5.4"
-P5_MODEL = "gpt-4o-mini"
-P6_MODEL = "gpt-4o-mini"
+P5_MODEL = "gpt-5-mini-2025-08-07"
+P6_MODEL = "gpt-5-mini-2025-08-07"
 P7_MODEL = "gpt-5-mini-2025-08-07"
 
 _STOPWORDS = {"de", "da", "do", "dos", "das", "e", "em", "a", "o", "por", "para", "ao", "com"}
@@ -79,6 +81,8 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
         (("grelha", "referencial de mérito", "critérios de seleção", "critérios de avaliação",
           "metodologia de avaliação", "ponderaç", "subcritério"), p4_chunks),
         (("legislação", "regulamento", "decreto-lei", "portaria", "diploma"), p1_chunks),
+        (("cae", "atividades económicas", "atividade económica", "classificação portuguesa das ativ",
+          "lista de cae", "setores elegíveis", "setores excluídos"), p1_chunks),
         (("documentos necessários", "memória descritiva", "documentos a apresentar"), p6_chunks),
         (("despesa", "custos elegíveis", "ocs", "indicador"), p5_chunks),
         (("metas de execução", "execução financeira", "taxa de execução", "anexo 6"), p2_chunks),
@@ -90,6 +94,19 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
         for keywords, target in _ANNEX_GUARANTEE:
             if id(c) not in {id(x) for x in target} and any(kw in txt for kw in keywords):
                 target.append(c)
+
+    # Garantia de conteúdo (não-anexo): o piso/teto de elegibilidade ("mínimo de despesa
+    # elegível total de X ... inferior a Y") costuma estar numa secção de DESPESAS (P5), mas
+    # os campos minimum_investment/maximum_investment são extraídos pelo P3. Sem isto o P3 nunca
+    # vê o valor e ou fica null ou apanha o limiar de repartição entre fundos.
+    _MINMAX_MARKERS = ("despesa elegível total", "investimento mínimo", "investimento máximo",
+                       "custo mínimo", "custo total superior", "não pode exceder")
+    p3_ids = {id(x) for x in p3_chunks}
+    for c in chunks:
+        txt = (c.get("text") or "").lower()
+        if id(c) not in p3_ids and any(m in txt for m in _MINMAX_MARKERS):
+            p3_chunks.append(c)
+            p3_ids.add(id(c))
 
     # 2. OpenAI — P1 primeiro para obter o notice_code, depois P2–P6 em paralelo
     print("\n[2/2] OpenAI")
@@ -178,23 +195,17 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
     if extra:
         result.update(extra)
 
+    # "p.p"/"pontos percentuais" → "%" em todo o resultado (o utilizador quer sempre "%").
+    result = normalize_pp_to_percent(result)
+
     json_file = json_dir / f"{source}.json"
     json_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n  JSON guardado: {json_file}")
 
     return result
 
-# Termos PT por campo: os nomes de campo são EN mas o texto dos chunks é PT. Sem este mapa,
-# "financial_execution_targets".split("_") → {financial,execution,targets} nunca casa no
-# texto PT e o rescue do P7 fica morto.
-FIELD_PT_TERMS = {
-    "financial_execution_targets": ["metas de execução", "taxa de execução", "execução financeira"],
-    "state_aid_regime": ["auxílios de estado", "de minimis", "rgic", "651/2014"],
-    "low_density_territories": ["baixa densidade", "territórios de baixa densidade"],
-    "required_self_financing_limit": ["capitais próprios", "autofinanciamento"],
-    "maximum_investment": ["apoio máximo", "investimento máximo", "máximo por candidatura"],
-    "monitoring_indicators": ["indicadores de acompanhamento"],
-}
+# FIELD_PT_TERMS (termos PT por campo, para o rescue do P7) vem do mapping_config.json,
+# carregado em chunker.py e importado no topo deste módulo.
 
 
 def _field_search_terms(field: str) -> list[str]:

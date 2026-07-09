@@ -1,8 +1,10 @@
+import os
 import re
 import shutil
 import time
 import urllib.parse
 from bs4 import BeautifulSoup
+from selenium import webdriver
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -65,6 +67,12 @@ def _get_driver() -> WebDriver:
     options.add_argument(f"user-agent={HEADERS['User-Agent']}")
     options.add_argument("--lang=pt-PT")
     options.add_experimental_option("prefs", {"intl.accept_languages": "pt-PT,pt"})
+
+    # Em Docker: Chrome no container dedicado (selenium/standalone-chrome). O chromium
+    # do Debian rebenta com SIGTRAP em headless/WSL2 — ligamos por WebDriver remoto.
+    remote_url = os.environ.get("SELENIUM_REMOTE_URL")
+    if remote_url:
+        return webdriver.Remote(command_executor=remote_url, options=options)
 
     chromium_bin = shutil.which("chromium") or shutil.which("chromium-browser")
     chromedriver_bin = shutil.which("chromedriver")

@@ -14,9 +14,16 @@ from match.scoring_rules import (
     eligible_dimension,
     is_eligible,
     missing_required_fields,
+    match_cae,
 )
+from datetime import datetime
+
 from match.services import NifMatchingService
 from match.models import NifCompany
+from match.ranking import (
+    active_phase_id, company_area_id, effective_budget_rate,
+    max_financing_rate_from_rates,
+)
 from users.models import UserProfile
 
 
@@ -135,6 +142,32 @@ class IsEligibleTests(SimpleTestCase):
         self.assertTrue(is_eligible(client, grant)[0])
 
 
+class CaeExceptionTests(SimpleTestCase):
+    """'Divisão 91 com exceção do Grupo 911' — o padrão MAIS ESPECÍFICO ganha."""
+
+    def _m(self, cae, inc, exc):
+        return match_cae({"cae_codes": [cae]}, {"included_caes": inc, "excluded_caes": exc})
+
+    def test_included_division_with_excluded_subgroup(self):
+        # 91 elegível EXCETO 911: '91100' (em 911) fora; '91200' dentro.
+        self.assertFalse(self._m("91100", ["91***"], ["911**"]))
+        self.assertTrue(self._m("91200", ["91***"], ["911**"]))
+
+    def test_excluded_division_with_included_exception(self):
+        # 91 excluído EXCETO 911: '91100' (em 911) elegível; '91200' fora.
+        self.assertTrue(self._m("91100", ["911**"], ["91***"]))
+        self.assertFalse(self._m("91200", ["911**"], ["91***"]))
+
+    def test_plain_included_and_excluded_still_work(self):
+        self.assertTrue(self._m("62010", ["62***"], []))
+        self.assertFalse(self._m("10120", ["62***"], []))
+        self.assertFalse(self._m("55100", [], ["55***"]))
+        self.assertTrue(self._m("62010", [], ["55***"]))
+
+    def test_no_restriction_is_eligible(self):
+        self.assertTrue(self._m("99999", [], []))
+
+
 class MissingRequiredFieldsTests(SimpleTestCase):
     """CAE and location are required; dimension is not (it is tolerant)."""
 
@@ -242,3 +275,74 @@ class NifCompanyProfileConcordanceTests(SimpleTestCase):
         profile = UserProfile(**company.to_profile_fields())
         self.assertEqual(profile.entity_size, "micro")
         self.assertEqual(profile.county, "Aveiro")
+
+
+class ActivePhaseTests(SimpleTestCase):
+    """The relevant phase (by DB id) drives which budget/rate row applies now."""
+
+    PHASES = [
+        {"id": 1, "start_date": "2026-04-30T15:00:00", "end_date": "2026-07-30T18:00:00"},
+        {"id": 2, "start_date": "2026-07-30T18:00:00", "end_date": "2026-10-30T18:00:00"},
+        {"id": 3, "start_date": "2026-10-30T18:00:00", "end_date": "2027-01-15T18:00:00"},
+    ]
+
+    def test_current_phase(self):
+        self.assertEqual(active_phase_id(self.PHASES, datetime(2026, 8, 15)), 2)
+
+    def test_before_all_picks_next_to_open(self):
+        self.assertEqual(active_phase_id(self.PHASES, datetime(2026, 1, 1)), 1)
+
+    def test_after_all_picks_latest(self):
+        self.assertEqual(active_phase_id(self.PHASES, datetime(2027, 6, 1)), 3)
+
+    def test_no_dates_returns_none(self):
+        self.assertIsNone(active_phase_id([{"id": 1}]))
+
+
+class CompanyAreaTests(SimpleTestCase):
+
+    def test_single_area_always_matches(self):
+        self.assertEqual(
+            company_area_id([], [{"id": 1, "geographic_area": "Qualquer"}]), 1)
+
+    def test_matches_by_location_token(self):
+        areas = [{"id": 1, "geographic_area": "Área Metropolitana do Porto (AMP)"},
+                 {"id": 2, "geographic_area": "CIM do Ave"}]
+        self.assertEqual(company_area_id(["ave"], areas), 2)
+
+    def test_no_match_returns_none(self):
+        areas = [{"id": 1, "geographic_area": "Norte"},
+                 {"id": 2, "geographic_area": "Centro"}]
+        self.assertIsNone(company_area_id(["algarve"], areas))
+
+
+class EffectiveBudgetRateTests(SimpleTestCase):
+
+    def test_fund_and_global_uses_global_budget_and_fund_rate(self):
+        # Dotação Global (100%) dá o maior pote; a taxa é a de comparticipação do fundo (85%).
+        # Linhas de fundo/global têm phase_id None (não são por fase).
+        pa = [
+            {"phase_id": None, "area_id": 1, "fund_name": "FSE+",
+             "budget_allocation": 4000000.0, "max_financing_rate": 85.0},
+            {"phase_id": None, "area_id": 1, "fund_name": "Dotação Global",
+             "budget_allocation": 4705882.34, "max_financing_rate": 100.0},
+        ]
+        self.assertEqual(effective_budget_rate(pa, None, 1), (4705882.34, 85.0))
+
+    def test_phase_specific_row_is_used_when_phase_matches(self):
+        pa = [{"phase_id": 1, "area_id": 1, "budget_allocation": 3000000.0, "max_financing_rate": 60.0},
+              {"phase_id": 2, "area_id": 1, "budget_allocation": 5000000.0, "max_financing_rate": 60.0}]
+        self.assertEqual(effective_budget_rate(pa, 2, 1), (5000000.0, 60.0))
+
+    def test_area_filter(self):
+        pa = [{"phase_id": None, "area_id": 1, "budget_allocation": 1000000.0, "max_financing_rate": 50.0},
+              {"phase_id": None, "area_id": 2, "budget_allocation": 9000000.0, "max_financing_rate": 70.0}]
+        self.assertEqual(effective_budget_rate(pa, None, 1), (1000000.0, 50.0))
+
+    def test_empty_returns_none(self):
+        self.assertEqual(effective_budget_rate([], None, None), (None, None))
+
+    def test_rate_fallback_from_financing_rates(self):
+        self.assertEqual(
+            max_financing_rate_from_rates([{"max_global_rate": "60,0"}, {"base_rate": "40%"}]), 60.0)
+        self.assertIsNone(max_financing_rate_from_rates([]))

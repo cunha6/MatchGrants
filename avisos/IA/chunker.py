@@ -17,12 +17,16 @@ _MD_HEADER_RE = re.compile(r'^(#{1,6})\s+(.*?)\s*#*$')
 _CRITERION_ENUM_RE = re.compile(r'^[A-H](\.\d+)*[.)]')
 
 
-def load_mapping(config_path: Path | str | None = None) -> tuple[dict, dict]:
+def load_mapping(config_path: Path | str | None = None) -> tuple[dict, dict, dict]:
     path = Path(config_path) if config_path else _CONFIG_PATH
     try:
         with open(path, "r", encoding="utf-8") as f:
             config = json.load(f)
-        return config["mapeamento"], config["categoria_para_prompts"]
+        return (
+            config["mapeamento"],
+            config["categoria_para_prompts"],
+            config.get("field_pt_terms", {}),
+        )
     except FileNotFoundError:
         raise FileNotFoundError(
             f"Ficheiro de configuração não encontrado: {path}\n"
@@ -30,7 +34,9 @@ def load_mapping(config_path: Path | str | None = None) -> tuple[dict, dict]:
         )
 
 
-MAPEAMENTO, CATEGORIA_PARA_PROMPTS = load_mapping()
+# FIELD_PT_TERMS: termos PT por campo (nomes de campo são EN, texto dos chunks é PT). Usado
+# pelo rescue do P7 para encontrar a secção certa de um campo vazio. Vive no mapping_config.json.
+MAPEAMENTO, CATEGORIA_PARA_PROMPTS, FIELD_PT_TERMS = load_mapping()
 
 
 def _get_prompt_categories(prompt: str) -> frozenset[str]:

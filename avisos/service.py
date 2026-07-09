@@ -94,18 +94,22 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     if not canonical_url:
         return None
 
-    # Já processado na BD (este canónico exato + ai_processed): o aviso já existe.
-    # Atualiza apenas os campos autoritativos do HTML (ex: prorrogação que muda a
-    # closing_date) e salta a extração. NÃO cria registo novo — só atualiza o existente.
-    if Grant.objects.filter(scraping_url=canonical_url, ai_processed=True).exists():
-        save_scraped_grant({**grant, "url": canonical_url}, source_label)
-        return None
-
-    # PDF já está na pasta mas não está na BD → por enquanto, ignora (não cria registo).
-    # Só registamos avisos cujo PDF seja efetivamente descarregado nesta passagem.
+    # A EXTRAÇÃO é decidida pela PRESENÇA DO PDF na pasta:
+    #  • PDF já na pasta  → NÃO descarrega, NÃO extrai, NÃO cria registo. Se o aviso já
+    #    existir na BD, atualiza só os campos autoritativos do HTML (ex: prorrogação que muda
+    #    a closing_date); se NÃO existir na BD, não faz nada (não o "coloca na BD").
+    #  • PDF não na pasta → (re)descarrega, converte, verifica convite e extrai (a seguir).
     if find_existing_document(canonical_url, download_dir):
+        code = grant.get("grant_code")
+        in_db = (Grant.objects.filter(scraping_url=canonical_url).exists()
+                 or (bool(code) and Grant.objects.filter(grant_code=code).exists()))
+        if in_db:
+            save_scraped_grant({**grant, "url": canonical_url}, source_label)
         return None
 
+    # PDF NÃO está na pasta (aviso novo, PDF apagado, ou canónico novo/republicação):
+    # descarrega + converte + verifica convite + extrai. O save_ai_grant faz match por
+    # grant_code e ATUALIZA o registo existente (não duplica), reapontando o scraping_url.
     annexes = _annex_documents(grant)
     # Outros documentos primários (para consolidação de alterações e para registo)
     ordered = order_documents([d for d in _candidate_documents(grant) if d["url"] != canonical_url])

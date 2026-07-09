@@ -129,6 +129,13 @@ def save_ai_grant(
         elif force_overwrite or current_empty:
             setattr(grant, field, value)
 
+    # annex_documents é uma chave de TOPO do JSON (não vem dentro de "Grant"), por isso não
+    # entra no loop _GRANT_AI_FIELDS acima — tratamo-la aqui. Vem fresca do scrape a cada
+    # processamento, logo atualiza-se quando presente.
+    annexes = dados_ia.get("annex_documents")
+    if annexes is not None:
+        grant.annex_documents = annexes or []
+
     if pdf_path:
         grant.pdf_path = pdf_path
     if markdown_path:
@@ -153,40 +160,49 @@ def save_ai_grant(
         ) for b in dados_ia.get("BeneficiaryByAction", [])
     ])
 
-    Phase.objects.bulk_create([
-        Phase(
+    # Fases e áreas: cria os registos (a BD gera os ids) e mapeia o código de junção do
+    # JSON (codigo_fase/codigo_area) → instância, para ligar o PhaseArea por FK REAL.
+    phase_by_code: dict[str, Phase] = {}
+    for f in dados_ia.get("phases", []):
+        ph = Phase.objects.create(
             grant=grant,
-            phase_code=f.get("phase_code"),
             name=f.get("name"),
             start_date=f.get("start_date"),
             end_date=f.get("end_date"),
             access_condition=f.get("access_condition"),
-        ) for f in dados_ia.get("phases", [])
-    ])
+        )
+        code = f.get("phase_code")
+        if code:
+            phase_by_code[str(code)] = ph
 
-    CoveredArea.objects.bulk_create([
-        CoveredArea(
+    area_by_code: dict[str, CoveredArea] = {}
+    for a in dados_ia.get("CoveredArea", []):
+        ar = CoveredArea.objects.create(
             grant=grant,
-            area_code=a.get("area_code"),
             geographic_area=a.get("geographic_area"),
-        ) for a in dados_ia.get("CoveredArea", [])
-    ])
+        )
+        code = a.get("area_code")
+        if code:
+            area_by_code[str(code)] = ar
 
+    # PhaseArea liga-se a Phase/CoveredArea por FK (via os códigos de junção). phase/area
+    # ficam null quando o código não corresponde a nenhuma fase/área (ex: dotação por
+    # fundo/global, cujo codigo_fase é "FEDER"/"GLOBAL").
     PhaseArea.objects.bulk_create([
         PhaseArea(
             grant=grant,
-            phase_code=fa.get("phase_code"),
-            area_code=fa.get("area_code"),
+            phase=phase_by_code.get(str(fa.get("phase_code"))),
+            area=area_by_code.get(str(fa.get("area_code"))),
             fund_name=fa.get("fund_name"),
             budget_allocation=fa.get("budget_allocation"),
             max_financing_rate=fa.get("max_financing_rate"),
+            distribution=fa.get("distribution", []),
         ) for fa in dados_ia.get("PhaseArea", [])
     ])
 
     FinancingRate.objects.bulk_create([
         FinancingRate(
             grant=grant,
-            rate_code=t.get("rate_code"),
             company_size=t.get("company_size"),
             aid_regime=t.get("aid_regime"),
             base_rate=t.get("base_rate"),
@@ -200,7 +216,6 @@ def save_ai_grant(
     ExpenseLimit.objects.bulk_create([
         ExpenseLimit(
             grant=grant,
-            limit_code=l.get("limit_code"),
             expense_category=l.get("expense_category"),
             applicable_ocs_methodology=l.get("applicable_ocs_methodology"),
             max_absolute_value=l.get("max_absolute_value"),
@@ -213,11 +228,12 @@ def save_ai_grant(
     NonCompliancePenalty.objects.bulk_create([
         NonCompliancePenalty(
             grant=grant,
-            penalty_code=p.get("penalty_code"),
             indicator_types=p.get("indicator_types"),
+            compliance_grade_formula=p.get("compliance_grade_formula"),
             general_tolerance_threshold=p.get("general_tolerance_threshold"),
             low_density_tolerance_threshold=p.get("low_density_tolerance_threshold"),
             reduction_per_percentage_point=p.get("reduction_per_percentage_point"),
+            penalty_tiers=p.get("penalty_tiers", []),
             max_penalty_percentage=p.get("max_penalty_percentage"),
             financing_revocation_threshold=p.get("financing_revocation_threshold"),
             rule_description=p.get("rule_description"),
@@ -227,7 +243,6 @@ def save_ai_grant(
     EvaluationMethodology.objects.bulk_create([
         EvaluationMethodology(
             grant=grant,
-            evaluation_code=m.get("evaluation_code"),
             project_merit_formula=m.get("project_merit_formula"),
             scoring_scale=m.get("scoring_scale"),
             min_global_score=m.get("min_global_score"),
@@ -235,5 +250,14 @@ def save_ai_grant(
             tiebreaker_criteria=m.get("tiebreaker_criteria", []),
         ) for m in dados_ia.get("EvaluationMethodology", [])
     ])
+
+    # Pré-calcula o embedding da atividade do aviso, para o match semântico ficar SEMPRE pronto
+    # (não depende de correr `embed_grants` nem de o calcular à la carte no 1º match). Best-effort:
+    # sem OPENAI_API_KEY ou em falha, embed() devolve None e a gravação do aviso segue na mesma.
+    try:
+        from match.embeddings import ensure_grant_embedding
+        ensure_grant_embedding(grant)
+    except Exception:
+        pass
 
     return grant
