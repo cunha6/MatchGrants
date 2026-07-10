@@ -11,6 +11,7 @@ sobre dicionários normalizados (não sobre o ORM), mantendo as regras desacopla
 fonte de dados das oportunidades.
 """
 
+import re
 import unicodedata
 
 
@@ -96,28 +97,33 @@ def match_cae(client: dict, opportunity: dict) -> bool:
 
 
 def match_location(client: dict, opportunity: dict) -> bool:
-    """A localização do cliente (cidade/região/concelho) cabe nas regiões elegíveis."""
-    opp_regions = [r for r in (opportunity.get("eligible_regions") or []) if r]
-    if not opp_regions:
-        return False
-
-    normalized_regions = [_normalize(r) for r in opp_regions]
+    """A localização do cliente cabe nas regiões elegíveis, OU o aviso menciona a localização
+    (região/concelho/NUTS II/NUTS III) no seu texto de elegibilidade."""
+    normalized_regions = [_normalize(r) for r in (opportunity.get("eligible_regions") or []) if r]
     if any(("todo o pais" in r or "nacional" in r or "continente" in r) for r in normalized_regions):
         return True
 
+    # Inclui a NUTS II/III resolvida do município (nuts.json): o cliente traz o concelho
+    # ("Faro") mas os avisos usam a NUTS II ("Algarve"). É correspondência EXATA (não fuzzy).
     client_tokens = [
-        _normalize(client.get(field))
-        for field in ("region", "city", "county")
-        if client.get(field)
+        t for t in (
+            _normalize(client.get(field))
+            for field in ("region", "city", "county", "nuts_ii", "nuts_iii", "nuts_ii_old")
+        ) if t
     ]
     if not client_tokens:
         return False
 
+    # 1) casa com uma das regiões elegíveis (contains bidirecional).
     for region in normalized_regions:
         for token in client_tokens:
-            if token and (token in region or region in token):
+            if token in region or region in token:
                 return True
-    return False
+
+    # 2) ou o aviso FALA da localização no texto de elegibilidade (palavra inteira, para não
+    #    apanhar "ave" dentro de "aveiro"). Cobre avisos que dão a região só no texto.
+    text = _normalize(opportunity.get("eligibility_text"))
+    return any(re.search(r"\b" + re.escape(token) + r"\b", text) for token in client_tokens)
 
 
 def match_dimension(client: dict, opportunity: dict) -> bool:
@@ -138,20 +144,29 @@ def match_dimension(client: dict, opportunity: dict) -> bool:
     return any(syn in text for syn in synonyms)
 
 
+# Sinónimos por tipo de beneficiário (texto normalizado, sem acentos). Fonte única usada
+# tanto pelo matcher (score) como pela elegibilidade (filtro).
+ENTITY_TYPE_SYNONYMS = {
+    "empresa":        ("empresa", "empresas", "sociedade", "pme", "micro", "pequena", "media", "grande"),
+    "associacao":     ("associacao", "associacoes"),
+    "cooperativa":    ("cooperativa", "cooperativas"),
+    "fundacao":       ("fundacao", "fundacoes"),
+    "municipio":      ("municipio", "municipios", "autarquia", "autarquias", "camara municipal", "administracao local"),
+    "intermunicipio": ("comunidade intermunicipal", "comunidades intermunicipais", "intermunicipal", "cim", "entidade intermunicipal"),
+    "multimunicipio": ("area metropolitana", "areas metropolitanas", "multimunicipal", "entidade metropolitana"),
+    "junta_freguesia": ("junta de freguesia", "juntas de freguesia", "uniao de freguesias", "freguesia", "freguesias"),
+    "misericordia":   ("misericordia", "misericordias", "santa casa"),
+    "ensino":         ("ensino", "escola", "universidade", "politecnico", "instituicao de ensino"),
+    "ong":            ("ong", "organizacao nao governamental", "ipss", "sem fins lucrativos"),
+}
+
+
 def match_entity_type(client: dict, opportunity: dict) -> bool:
     """O tipo/natureza da entidade do cliente é admitido nos critérios da oportunidade."""
     entity_type = _normalize(client.get("entity_type"))
     if not entity_type:
         return False
-
-    synonyms = {
-        "empresa": ("empresa", "empresas", "sociedade", "pme"),
-        "associacao": ("associacao", "associacoes"),
-        "municipio": ("municipio", "municipios", "autarquia", "camara municipal"),
-        "ensino": ("ensino", "escola", "universidade", "instituicao de ensino"),
-        "ong": ("ong", "organizacao nao governamental", "ipss", "sem fins lucrativos"),
-    }.get(entity_type, (entity_type,))
-
+    synonyms = ENTITY_TYPE_SYNONYMS.get(entity_type, (entity_type,))
     text = opportunity.get("eligibility_text", "")
     return any(syn in text for syn in synonyms)
 
@@ -236,16 +251,42 @@ def eligible_dimension(client: dict, opportunity: dict) -> bool:
     return dim in allowed
 
 
+def grant_allowed_entity_types(eligibility_text: str) -> set[str]:
+    """Tipos de beneficiário admitidos pelo aviso, lidos do texto de elegibilidade.
+
+    Conjunto vazio ⇒ o aviso não restringe o tipo (todos elegíveis). Usa os mesmos sinónimos
+    do matcher — se o texto mencionar o tipo, considera-o admitido."""
+    t = eligibility_text or ""
+    allowed: set[str] = set()
+    for etype, synonyms in ENTITY_TYPE_SYNONYMS.items():
+        if any(syn in t for syn in synonyms):
+            allowed.add(etype)
+    return allowed
+
+
+def eligible_entity_type(client: dict, opportunity: dict) -> bool:
+    """OK se o aviso não restringe o tipo de beneficiário, se o tipo do cliente é admitido,
+    ou se o tipo do cliente é desconhecido (não dá para provar inelegibilidade)."""
+    allowed = grant_allowed_entity_types(opportunity.get("eligibility_text", ""))
+    if not allowed:
+        return True
+    etype = _normalize(client.get("entity_type"))
+    if not etype:
+        return True
+    return etype in allowed
+
+
 ELIGIBILITY = {
     "cae": {"label": "CAE", "check": eligible_cae},
     "location": {"label": "Localização", "check": eligible_location},
     "dimension": {"label": "Dimensão", "check": eligible_dimension},
+    "entity_type": {"label": "Tipo de Beneficiário", "check": eligible_entity_type},
 }
 
 
 def is_eligible(client: dict, opportunity: dict) -> tuple[bool, list[dict]]:
     """(elegível, detalhe). O cliente só é elegível se passar TODOS os critérios rígidos
-    que o aviso especifica (região, CAE, dimensão)."""
+    que o aviso especifica (região, CAE, dimensão, tipo de beneficiário)."""
     breakdown = []
     ok = True
     for key, rule in ELIGIBILITY.items():

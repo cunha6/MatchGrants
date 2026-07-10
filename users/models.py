@@ -23,6 +23,10 @@ class UserProfile(models.Model):
     COOPERATIVA = "cooperativa"
     FUNDACAO = "fundacao"
     MUNICIPIO = "municipio"
+    INTERMUNICIPIO = "intermunicipio"
+    MULTIMUNICIPIO = "multimunicipio"
+    JUNTA_FREGUESIA = "junta_freguesia"
+    MISERICORDIA = "misericordia"
     ENSINO = "ensino"
     ONG = "ong"
     OUTRO = "outro"
@@ -32,6 +36,10 @@ class UserProfile(models.Model):
         (COOPERATIVA, COOPERATIVA),
         (FUNDACAO, FUNDACAO),
         (MUNICIPIO, MUNICIPIO),
+        (INTERMUNICIPIO, INTERMUNICIPIO),
+        (MULTIMUNICIPIO, MULTIMUNICIPIO),
+        (JUNTA_FREGUESIA, JUNTA_FREGUESIA),
+        (MISERICORDIA, MISERICORDIA),
         (ENSINO, ENSINO),
         (ONG, ONG),
         (OUTRO, OUTRO),

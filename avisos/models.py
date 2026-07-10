@@ -96,6 +96,9 @@ class Grant(models.Model):
     dnsh_criteria = models.TextField(blank=True, null=True)
     # Marcado quando há alterações não consolidadas que precisam de revisão manual
     needs_review = models.BooleanField(default=False)
+    # Ativo = ainda a decorrer. Fica False quando a closing_date já passou (avisos terminados
+    # são escondidos do match, mas os ficheiros PDF/markdown/JSON são MANTIDOS).
+    active = models.BooleanField(default=True, db_index=True)
     # Embedding (pgvector) para pesquisa semântica — gerado pela OpenAI, guardado/pesquisado
     # no Postgres. activity_embedding_hash deteta quando o texto do aviso mudou e força recálculo.
     activity_embedding = VectorField(dimensions=EMBEDDING_DIM, null=True, blank=True)

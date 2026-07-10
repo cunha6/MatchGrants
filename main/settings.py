@@ -31,6 +31,9 @@ NIF_KEY = os.getenv('NIF_KEY')
 # Token da API base.gov.pt (header _AcessToken) — lido do .env.
 BASE_KEY = os.getenv('BASE_KEY')
 
+# Chave da API cttcodigopostal.pt (resolve código postal → localidade/concelho/distrito) — .env.
+CTT_KEY = os.getenv('CTT_KEY')
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',

@@ -8,6 +8,7 @@ contribuinte -> extração de metadados -> cruzamento com as oportunidades ativa
 A view limita-se a invocar `NifMatchingService().evaluate(nif)`.
 """
 
+import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -19,6 +20,8 @@ from django.db import transaction
 from avisos.models import Grant
 from users.models import UserProfile
 from .models import NifCompany
+from .nuts import nuts_for
+from .ctt import ctt_lookup
 from .scoring_rules import (
     SCORING_CONFIG, MAX_SCORE, _normalize, classify_dimension, is_eligible,
     missing_required_fields,
@@ -127,6 +130,33 @@ NATURE_TO_ENTITY_TYPE = {
     "FUN": "fundacao",
 }
 
+# Padrões no NOME → tipo de beneficiário. Servem para as entidades públicas/sociais que a
+# natureza jurídica do nif.pt NÃO distingue (município, junta, misericórdia...). Ordem: do
+# mais específico para o mais genérico (o primeiro que casar ganha).
+_NAME_TYPE_PATTERNS = [
+    (re.compile(r"comunidade intermunicipal|\bcim\b|entidade intermunicipal", re.I), "intermunicipio"),
+    (re.compile(r"[aá]rea metropolitana|multimunicipal", re.I), "multimunicipio"),
+    (re.compile(r"\b(junta|uni[aã]o)\s+de\s+freguesias?\b", re.I), "junta_freguesia"),
+    (re.compile(r"miseric[oó]rdia|santa casa", re.I), "misericordia"),
+    (re.compile(r"munic[ií]pio|c[aâ]mara municipal", re.I), "municipio"),
+    (re.compile(r"funda[cç][aã]o", re.I), "fundacao"),
+    (re.compile(r"cooperativa|\bcrl\b", re.I), "cooperativa"),
+    (re.compile(r"universidade|instituto polit[eé]cnico|agrupamento de escolas|\bescola\b", re.I), "ensino"),
+    (re.compile(r"associa[cç][aã]o", re.I), "associacao"),
+]
+
+
+def infer_entity_type(name: str | None, nature: str | None) -> str | None:
+    """Infere o tipo de beneficiário pelo NOME (entidades públicas/sociais que a natureza
+    jurídica não distingue) e, em fallback, pela natureza jurídica do nif.pt.
+
+    O nome tem prioridade porque um "Município de X" ou "Santa Casa da Misericórdia de Y" não
+    tem uma natureza jurídica societária que os identifique. None quando nada permite inferir."""
+    for pattern, etype in _NAME_TYPE_PATTERNS:
+        if pattern.search(name or ""):
+            return etype
+    return NATURE_TO_ENTITY_TYPE.get(nature)
+
 
 class NifValidationError(Exception):
     """NIF inexistente, inválido ou contribuinte inativo (→ HTTP 400)."""
@@ -228,19 +258,28 @@ class NifMatchingService:
         dimension = (enrich.dimension if enrich else None) \
             or classify_dimension(employees, operating_revenue)
 
-        # Região: SEMPRE do SQLite (fonte autoritativa); só cai para o nif.pt se o
-        # enriquecimento não a tiver. Concelho/distrito seguem a mesma preferência.
-        region = (enrich.region if enrich else "") or geo.get("region") or ""
-        county = (enrich.municipality if enrich else "") or geo.get("county") or ""
-        district = (enrich.district if enrich else "") or ""
-
         pc4, pc3 = record.get("pc4"), record.get("pc3")
+        postal_code = f"{pc4}-{pc3}" if pc4 and pc3 else (pc4 or None)
+
+        # CTT: o código postal (do nif.pt) → localidade/concelho/distrito precisos. Preferimos
+        # estes valores; se a CTT não responder, caímos para o enriquecimento (SQLite)/nif.pt.
+        ctt_local, ctt_concelho, ctt_distrito = ctt_lookup(postal_code)
+        region = (enrich.region if enrich else "") or geo.get("region") or ""
+        city = ctt_local or record.get("city") or geo.get("county") or ""
+        county = ctt_concelho or (enrich.municipality if enrich else "") or geo.get("county") or ""
+        district = ctt_distrito or (enrich.district if enrich else "") or ""
+
+        # NUTS II/III pela CIDADE vinda da CTT (procura no nuts.json; fallback pelo concelho).
+        # Assim "4800-937" → CTT dá "Guimarães" → nuts.json dá NUTS II "Norte", NUTS III "Ave".
+        # `nuts_ii_old` = NUTS II standard (5 continentais) para casar com os avisos.
+        nuts_ii, nuts_iii, nuts_ii_old = nuts_for(city, county)
         return {
             "nif": nif,
             "name": record.get("title") or "",
             "nature": nature,
             "nature_label": NATURE_LABELS.get(nature, nature),
-            "entity_type": NATURE_TO_ENTITY_TYPE.get(nature),
+            # Tipo de beneficiário: nome (entidades públicas/sociais) + natureza jurídica.
+            "entity_type": infer_entity_type(record.get("title"), nature),
             "dimension": dimension,
             "employees": employees,
             "operating_revenue": float(operating_revenue) if operating_revenue is not None else None,
@@ -248,11 +287,14 @@ class NifMatchingService:
             "main_cae": cae_codes[0] if cae_codes else None,
             "secondary_cae": cae_codes[1:],
             "address": record.get("address") or "",
-            "postal_code": f"{pc4}-{pc3}" if pc4 and pc3 else (pc4 or None),
-            "city": record.get("city") or geo.get("county") or "",
+            "postal_code": postal_code,
+            "city": city,
             "region": region,
             "county": county,
             "district": district,
+            "nuts_ii": nuts_ii,
+            "nuts_iii": nuts_iii,
+            "nuts_ii_old": nuts_ii_old,
             "parish": geo.get("parish") or "",
             "capital": structure.get("capital"),
             "capital_currency": structure.get("capital_currency"),
@@ -300,7 +342,7 @@ class NifMatchingService:
         """
         client_tokens = [
             _normalize(client_metadata.get(f))
-            for f in ("region", "county", "city") if client_metadata.get(f)
+            for f in ("region", "county", "city", "nuts_ii", "nuts_iii", "nuts_ii_old") if client_metadata.get(f)
         ]
 
         results = []
@@ -467,8 +509,8 @@ class NifMatchingService:
         # É a base da procura semântica que ordena os avisos mais enquadrados no topo.
         activity_vec = embeddings.embed(_company_query_text(metadata))
 
-        # `company` expõe os dados ricos do contribuinte; `matches` vem ordenado.
-        company = {k: v for k, v in metadata.items() if k != "activity"}
+        # `company` expõe os dados ricos do contribuinte (incluindo a `activity`); `matches` ordenado.
+        company = dict(metadata)
         return {
             "company": company,
             "nif": metadata["nif"],
@@ -500,18 +542,24 @@ class NifMatchingService:
         if not metadata.get("dimension") and overrides.get("dimension"):
             metadata["dimension"] = str(overrides["dimension"]).strip().lower()
 
+        # entity_type é INFERIDO (heurística nome/natureza); um valor explícito do utilizador
+        # PREVALECE — permite corrigir a inferência ou testar como outro tipo de beneficiário.
+        if overrides.get("entity_type"):
+            metadata["entity_type"] = str(overrides["entity_type"]).strip().lower()
+
         return metadata
 
     # --- Auxiliares -------------------------------------------------------
 
     @staticmethod
     def _active_opportunities():
-        """Oportunidades consideradas ativas: avisos já processados pela IA.
+        """Oportunidades consideradas ativas: avisos já processados pela IA e AINDA a decorrer
+        (active=True — os terminados, cuja closing_date já passou, são escondidos do match).
 
         Faz prefetch das relações usadas pelo ranking (fases, áreas, dotações por
         fase/área, taxas) para evitar N+1 queries por aviso.
         """
-        return Grant.objects.filter(ai_processed=True).prefetch_related(
+        return Grant.objects.filter(ai_processed=True, active=True).prefetch_related(
             "phases", "covered_areas", "phase_areas", "financing_rates",
         )
 

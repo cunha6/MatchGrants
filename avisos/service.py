@@ -8,6 +8,8 @@ então corre o pipeline de extração uma única vez.
 """
 
 import os
+import re
+from datetime import date, datetime
 
 from .scrape_compete import scrape_compete2030_web
 from .scrape_portugal import scrape_portugal2030_web
@@ -187,21 +189,66 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     return grant_rec
 
 
+def _parse_closing_date(text) -> date | None:
+    """Interpreta a closing_date (texto livre) numa date, ou None se não der.
+    Aceita ISO (2026-09-30[T…]), DD/MM/AAAA e AAAA/MM/DD (com '/' ou '-')."""
+    if not text:
+        return None
+    s = str(text).strip()
+    try:
+        return datetime.fromisoformat(s[:19].replace("Z", "")).date()
+    except ValueError:
+        pass
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", s)   # DD/MM/AAAA
+    if m:
+        d, mo, y = (int(x) for x in m.groups())
+    else:
+        m = re.search(r"\b(\d{4})[/-](\d{1,2})[/-](\d{1,2})\b", s)   # AAAA/MM/DD
+        if not m:
+            return None
+        y, mo, d = (int(x) for x in m.groups())
+    try:
+        return date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def deactivate_expired_grants(today: date | None = None) -> int:
+    """Sincroniza Grant.active com a closing_date: terminados (data < hoje) → active=False;
+    ainda a decorrer ou sem data legível → active=True (reativa se foi prorrogado). MANTÉM os
+    ficheiros (PDF/markdown/JSON). Devolve o nº de registos cujo estado mudou."""
+    today = today or date.today()
+    changed = 0
+    for grant in Grant.objects.only("id", "closing_date", "active"):
+        closing = _parse_closing_date(grant.closing_date)
+        want_active = not (closing is not None and closing < today)
+        if grant.active != want_active:
+            grant.active = want_active
+            grant.save(update_fields=["active"])
+            changed += 1
+    if changed:
+        print(f"  [Avisos] {changed} aviso(s) mudaram de estado ativo/inativo (por data de fim).")
+    return changed
+
+
 def scrape_compete() -> list[dict]:
     all_data = scrape_compete2030_web()
     new_grants = [g for g in all_data if _process_grant(g, "pdf_Avisos/compete", "compete")]
+    deactivate_expired_grants()
     return new_grants
 
 
 def scrape_portugal() -> list[dict]:
     all_data = scrape_portugal2030_web()
     new_grants = [g for g in all_data if _process_grant(g, "pdf_Avisos/portugal", "portugal")]
+    deactivate_expired_grants()
     return new_grants
 
 
 def scrape_prr() -> list[dict]:
     all_data = scrape_prr_web()
     new_grants = [g for g in all_data if _process_grant(g, "pdf_Avisos/prr", "prr")]
+    deactivate_expired_grants()
     return new_grants
 
 

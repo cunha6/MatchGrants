@@ -25,7 +25,7 @@ def _payload(request) -> dict:
 @csrf_exempt
 @require_http_methods(["POST"])
 def evaluate_nif(request):
-    """POST {"nif": "...", "cae"?, "region"?, "dimension"?} -> matches ordenados.
+    """POST {"nif": "...", "cae"?, "region"?, "dimension"?, "entity_type"?} -> matches ordenados.
 
     Os campos opcionais (cae/region/dimension) servem para responder a um pedido de
     mais informações: quando o nif.pt não traz CAE ou localização, a resposta 422 diz
@@ -45,6 +45,7 @@ def evaluate_nif(request):
         "cae": data.get("cae") or data.get("cae_codes"),
         "region": data.get("region"),
         "dimension": data.get("dimension"),
+        "entity_type": data.get("entity_type"),
     }
     try:
         result = NifMatchingService().evaluate(nif, overrides=overrides)

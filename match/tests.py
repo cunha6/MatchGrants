@@ -128,8 +128,17 @@ class IsEligibleTests(SimpleTestCase):
         eligible, breakdown = is_eligible(client, self.GRANT)
         self.assertTrue(eligible)
         self.assertEqual({b["criterion"] for b in breakdown},
-                         {"cae", "location", "dimension"})
+                         {"cae", "location", "dimension", "entity_type"})
         self.assertTrue(all(b["eligible"] for b in breakdown))
+
+    def test_wrong_entity_type_is_excluded(self):
+        # Aviso só para municípios (texto de elegibilidade) → uma empresa não é elegível.
+        grant = {"included_caes": [], "excluded_caes": [], "eligible_regions": [],
+                 "eligibility_text": "sao beneficiarios os municipios"}
+        client = {"cae_codes": ["62010"], "region": "Norte", "entity_type": "empresa"}
+        self.assertFalse(is_eligible(client, grant)[0])
+        municipio = {"region": "Norte", "entity_type": "municipio"}
+        self.assertTrue(is_eligible(municipio, grant)[0])
 
     def test_unknown_dimension_still_eligible(self):
         client = {"cae_codes": ["62010"], "region": "Norte", "dimension": None}
