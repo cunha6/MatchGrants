@@ -25,7 +25,10 @@ jobs:
         env:
           POSTGRES_DB: matchgrants
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          # Postgres EFÉMERO do CI (vive só durante a corrida, nunca exposto). A password vem do
+          # secret DB_PASSWORD do repositório; sem ele, cai no 'postgres' convencional — o .env NÃO
+          # é lido pelo GitHub Actions, por isso o equivalente correto a segredos no CI é este.
+          POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD || 'postgres' }}
         ports:
           - 5432:5432
         options: >-
@@ -35,7 +38,7 @@ jobs:
     env:
       DB_NAME: matchgrants
       DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD || 'postgres' }}
       DB_HOST: localhost
       DB_PORT: "5432"
     steps:

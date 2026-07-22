@@ -6,6 +6,7 @@ offline and does not touch pdf_Anuncios/ or the real lock files.
 
 import io
 import json
+import os
 import shutil
 import tempfile
 import zipfile
@@ -20,6 +21,10 @@ from django.test import SimpleTestCase, TestCase, override_settings
 from anuncios import services, specifications
 from anuncios.models import Notice
 from users.models import UserProfile
+
+# Password dos utilizadores de teste — lida do ambiente (.env), nunca hardcoded. Os testes usam
+# force_login, por isso o valor não é autenticado; só não pode ficar no código versionado.
+TEST_PASSWORD = os.environ.get("TEST_USER_PASSWORD", "test-only-password")
 
 
 class FakeResp:
@@ -489,10 +494,10 @@ class NoticeEditViewTests(TestCase):
             proposal_deadline=date.today() + timedelta(days=5),
         )
         self.commercial = User.objects.create_user(
-            "comercial_an", email="c@x.pt", password="Xk93!vTq21mZ")
+            "comercial_an", email="c@x.pt", password=TEST_PASSWORD)
         self.commercial.profile.role = UserProfile.COMMERCIAL
         self.commercial.profile.save()
-        self.client_user = User.objects.create_user("cliente_an", password="Xk93!vTq21mZ")
+        self.client_user = User.objects.create_user("cliente_an", password=TEST_PASSWORD)
         # o signal já cria o perfil com role=client
 
     def _edit(self, payload):
