@@ -8,7 +8,9 @@ contribuinte -> extração de metadados -> cruzamento com as oportunidades ativa
 A view limita-se a invocar `NifMatchingService().evaluate(nif)`.
 """
 
+import logging
 import re
+import threading
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
@@ -16,8 +18,10 @@ import requests
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import transaction
+from django.db.models import Exists, OuterRef, Q
 
-from avisos.models import Grant
+from avisos.models import Grant, GrantCae, GrantEmbedding
+from common.cae import cae_all_prefixes
 from users.models import UserProfile
 from .models import NifCompany
 from .nuts import nuts_for
@@ -27,10 +31,34 @@ from .scoring_rules import (
     missing_required_fields,
 )
 from . import embeddings
+from . import grant_embeddings
+from . import llm_validation
 from .ranking import (
     active_phase_id, company_area_id, effective_budget_rate,
     max_financing_rate_from_rates,
 )
+
+logger = logging.getLogger(__name__)
+
+# Rotação das chaves da API nif.pt (NIF_KEY, NIF_KEY1..N do .env): a cada consulta usa-se a
+# chave seguinte, uma de cada vez (round-robin), para repartir os pedidos por várias chaves.
+# O índice é global ao processo e protegido por lock (seguro entre threads do gunicorn).
+_nif_key_lock = threading.Lock()
+_nif_key_index = 0
+
+
+def _next_nif_key() -> str | None:
+    """Chave nif.pt seguinte na rotação. Lê settings.NIF_KEYS a cada chamada (respeita
+    override_settings nos testes). Se não houver lista, cai para a NIF_KEY única. None se
+    não houver nenhuma configurada."""
+    global _nif_key_index
+    keys = list(getattr(settings, "NIF_KEYS", None) or [])
+    if not keys:
+        return getattr(settings, "NIF_KEY", None)
+    with _nif_key_lock:
+        key = keys[_nif_key_index % len(keys)]
+        _nif_key_index += 1
+    return key
 
 
 def promote_viewer_to_client(nif: str) -> dict | None:
@@ -81,9 +109,9 @@ def _to_date(value):
         return None
 
 
-def _company_query_text(metadata: dict) -> str:
-    """Texto RICO do cliente para a pesquisa semântica — junta tudo o que o descreve:
-    atividade + nome + tipo de entidade + CAE + localização (região/concelho/cidade/morada).
+def _company_general_text(metadata: dict) -> str:
+    """Texto GERAL do cliente (compara com o embedding GENERAL do aviso) — junta tudo o que
+    o descreve: atividade + nome + tipo de entidade + CAE + localização.
 
     A `activity` (descrição do nif.pt) é o sinal semântico mais forte; os restantes campos
     acrescentam contexto (setor via CAE, afinidade regional via localização). Quando a atividade
@@ -102,6 +130,25 @@ def _company_query_text(metadata: dict) -> str:
     loc = [str(metadata.get(f)) for f in ("region", "county", "city", "address") if metadata.get(f)]
     if loc:
         parts.append("Localização: " + ", ".join(loc))
+    return "\n".join(parts)
+
+
+def _company_sector_text(metadata: dict) -> str:
+    """Texto SETORIAL do cliente (compara com o embedding SECTOR do aviso): a ATIVIDADE
+    PRINCIPAL — a descrição do nif.pt é o que define o domínio económico da empresa.
+
+    Sem localização nem nome: aqui só interessa "o que a empresa faz", para casar com os
+    setores-alvo do aviso. Fallback ao CAE + nome quando o nif.pt não traz atividade — senão
+    a empresa ficaria sem dimensão setorial nenhuma."""
+    activity = (metadata.get("activity") or "").strip()
+    if activity:
+        return activity
+    parts: list[str] = []
+    caes = [str(c) for c in (metadata.get("cae_codes") or []) if c]
+    if caes:
+        parts.append("CAE: " + ", ".join(caes))
+    if metadata.get("name"):
+        parts.append(str(metadata["name"]))
     return "\n".join(parts)
 
 
@@ -182,9 +229,15 @@ class NifMatchingService:
 
     API_URL = "https://www.nif.pt/?json=1&q={nif}&key={key}"
     TIMEOUT = 15  # segundos
+    # Máximo de avisos enviados à validação LLM (os N mais relevantes). Limita custo/latência
+    # da chamada externa; os restantes passam sem validação LLM (ver _apply_llm_validation).
+    LLM_VALIDATION_CAP = 10
 
     def __init__(self, api_key: str | None = None):
-        self.api_key = api_key or getattr(settings, "NIF_KEY", None)
+        # Chave explícita (ex: testes) prevalece; senão pega a próxima da rotação (uma de
+        # cada vez). Como a view cria um NifMatchingService por pedido, cada consulta ao
+        # nif.pt usa a chave seguinte do ciclo NIF_KEY, NIF_KEY1, NIF_KEY2, NIF_KEY3, NIF_KEY4.
+        self.api_key = api_key or _next_nif_key()
 
     # --- Integração HTTP + validação -------------------------------------
 
@@ -201,11 +254,16 @@ class NifMatchingService:
 
         url = self.API_URL.format(nif=nif, key=self.api_key)
         try:
-            response = requests.get(url, timeout=self.TIMEOUT)
-            response.raise_for_status()
+            response = requests.get(url, timeout=self.TIMEOUT)  
+            response.raise_for_status() 
             payload = response.json()
         except (requests.RequestException, ValueError) as exc:
-            raise NifServiceError(f"Falha ao contactar a API nif.pt: {exc}")
+            # O detalhe fica no log — a str(exc) inclui o URL com a NIF_KEY e não
+            # pode ir na resposta HTTP.
+            logger.warning("Falha ao contactar a API nif.pt (nif=%s): %s", nif, exc)
+            raise NifServiceError(
+                f"Falha ao contactar a API nif.pt ({type(exc).__name__}). Tenta novamente."
+            )
 
         # Erro reportado pela própria API (ex: "Key not valid") → erro de serviço.
         if payload.get("result") == "error":
@@ -324,7 +382,8 @@ class NifMatchingService:
 
     # --- Motor de matching -----------------------------------------------
 
-    def process_matches(self, client_metadata: dict, activity_vec: list[float] | None = None) -> list[dict]:
+    def process_matches(self, client_metadata: dict,
+                        company_vectors: dict[str, list[float]] | None = None) -> list[dict]:
         """Cruza os metadados do cliente com as oportunidades ativas.
 
         FILTRO RÍGIDO DE ELEGIBILIDADE: só entram na lista as oportunidades para as
@@ -334,19 +393,29 @@ class NifMatchingService:
         para grandes) para a oportunidade nem sequer aparecer.
 
         ORDENAÇÃO (o que o utilizador vê no topo):
-          1) RELEVÂNCIA da atividade — procura semântica (embeddings) entre a atividade
-             da empresa (`activity_vec`) e o texto do aviso; mais direcionados ao topo.
+          1) RELEVÂNCIA semântica — score combinado (0.60 setorial + 0.40 geral) entre os
+             embeddings do cliente (`company_vectors`) e os do aviso; mais direcionados ao topo.
           2) TAXA de financiamento EFETIVA (maior primeiro).
           3) DOTAÇÃO EFETIVA (maior primeiro).
         A taxa/dotação efetivas são as da FASE ativa e da ÁREA da empresa (ver ranking).
+
+        Só LÊ embeddings (pré-carregados por prefetch) — nunca os gera. Quem os gera é o save
+        do aviso (db_service) e o comando `embed_grants`; um aviso ainda sem embeddings fica
+        com relevância None e o ranking cai para taxa+dotação.
+
+        CAMADA FINAL (LLM): depois de ordenar, um LLM gratuito (OpenRouter) valida cada aviso
+        contra o perfil do cliente e os NÃO adequados são removidos (ver llm_validation). Sem
+        OPENROUTER_API_KEY ou em falha, nada é filtrado — o match mantém a lista da semântica.
         """
+        company_vectors = company_vectors or {}
         client_tokens = [
             _normalize(client_metadata.get(f))
             for f in ("region", "county", "city", "nuts_ii", "nuts_iii", "nuts_ii_old") if client_metadata.get(f)
         ]
 
         results = []
-        for grant in self._active_opportunities():
+        grant_by_id = {}
+        for grant in self._active_opportunities(client_metadata):
             opportunity = self._grant_to_opportunity(grant)
 
             eligible, eligibility = is_eligible(client_metadata, opportunity)
@@ -366,8 +435,10 @@ class NifMatchingService:
                     "points": points,
                 })
 
-            # Relevância semântica à atividade da empresa (None se sem embeddings).
-            relevance = self._grant_relevance(grant, activity_vec)
+            # Relevância semântica: 0.60 setorial + 0.40 geral (None se sem embeddings).
+            relevance, sector_sim, general_sim = grant_embeddings.relevance(
+                company_vectors, grant_embeddings.grant_vectors(grant),
+            )
 
             # Dotação/taxa efetivas p/ a fase ativa + área da empresa (ligação por FK id).
             phase_id = active_phase_id(opportunity["phases"])
@@ -384,7 +455,12 @@ class NifMatchingService:
                 "title": opportunity["title"],
                 "score": score,
                 "max_score": MAX_SCORE,
+                # Score semântico combinado. Mantém o nome `activity_relevance` (contrato da
+                # API) e continua a ser o 1º critério de ordenação; as duas componentes vão
+                # à parte para o front-end/diagnóstico poder explicar o porquê.
                 "activity_relevance": relevance,
+                "sector_similarity": sector_sim,
+                "general_similarity": general_sim,
                 "effective_financing_rate": rate,
                 "effective_budget_allocation": budget,
                 "active_phase_id": phase_id,
@@ -392,6 +468,7 @@ class NifMatchingService:
                 "eligibility": eligibility,
                 "breakdown": breakdown,
             })
+            grant_by_id[opportunity["id"]] = grant
 
         # Atividade 1º, depois taxa, depois dotação — todos decrescentes.
         results.sort(
@@ -402,25 +479,38 @@ class NifMatchingService:
             ),
             reverse=True,
         )
-        return results
+        return self._apply_llm_validation(client_metadata, results, grant_by_id)
 
-    @staticmethod
-    def _grant_relevance(grant: Grant, activity_vec: list[float] | None) -> float | None:
-        """Similaridade semântica entre a atividade do cliente e o texto do aviso (0..1),
-        ou None se não houver embeddings (sem API/atividade). Usa/atualiza a cache no Grant."""
-        if activity_vec is None:
-            return None
-        grant_vec = NifMatchingService._grant_embedding(grant)
-        if grant_vec is None:
-            return None
-        return embeddings.cosine(activity_vec, grant_vec)
+    @classmethod
+    def _apply_llm_validation(cls, client_metadata: dict, results: list[dict],
+                              grant_by_id: dict) -> list[dict]:
+        """Camada FINAL: marca cada match com `llm_adequate`/`llm_reason` e REMOVE os que o LLM
+        considerou não adequados. Sem chave/em falha (verdicts vazios) nada é filtrado — cada
+        match fica com llm_adequate=None e permanece na lista.
 
-    @staticmethod
-    def _grant_embedding(grant: Grant) -> list[float] | None:
-        """Embedding do aviso, da cache (Grant.activity_embedding) quando o texto não mudou;
-        senão calcula-o e persiste (fallback à la carte, caso o aviso ainda não tenha sido
-        embebido ao gravar). None se não houver API/erro."""
-        return embeddings.ensure_grant_embedding(grant)
+        CAP: só os `LLM_VALIDATION_CAP` avisos mais relevantes (results já vem ordenado por
+        relevância) são enviados ao LLM — controla custo/latência da chamada externa. Os
+        restantes passam sem validação (llm_adequate=None): ficam sempre na lista, no fundo,
+        onde já estavam por relevância."""
+        to_validate = results[:cls.LLM_VALIDATION_CAP]
+        grants_in_order = [grant_by_id[r["opportunity_id"]] for r in to_validate]
+        verdicts = llm_validation.validate_matches(client_metadata, grants_in_order) \
+            if grants_in_order else {}
+
+        final = []
+        for r in results:
+            # Só os avisos do top-N enviados têm veredito; os restantes ficam com None (passam).
+            verdict = verdicts.get(r["opportunity_id"])
+            r["llm_adequate"] = verdict["adequate"] if verdict else None
+            r["llm_reason"] = verdict["reason"] if verdict else None
+            # Só é removido quando o LLM diz EXPLICITAMENTE que não é adequado.
+            if verdict is None or verdict["adequate"]:
+                final.append(r)
+        removed = len(results) - len(final)
+        if removed:
+            logger.info("Validação LLM: %d de %d avisos (top-%d) removidos por não adequados.",
+                        removed, min(len(results), cls.LLM_VALIDATION_CAP), cls.LLM_VALIDATION_CAP)
+        return final
 
     @transaction.atomic
     def create_or_update_viewer(self, metadata: dict) -> User:
@@ -438,11 +528,17 @@ class NifMatchingService:
             user, is_new = profile.user, False
         else:
             # Viewer nasce inativo e sem password — é só um registo de acesso ao match.
-            user = User.objects.create(username=nif, is_active=False)
-            user.set_unusable_password()
-            user.save()
-            profile = user.profile  # criado pelo signal post_save (role=client por defeito)
-            is_new = True
+            # get_or_create tolera um User pré-existente com username=NIF (ex: perfil ainda
+            # sem nif) — sem isto a unicidade do username rebentava com IntegrityError.
+            user, is_new = User.objects.get_or_create(
+                username=nif, defaults={"is_active": False}
+            )
+            if is_new:
+                user.set_unusable_password()
+                user.save()
+            # O signal post_save cria o perfil (role=client); get_or_create cobre contas
+            # antigas que possam não o ter.
+            profile, _ = UserProfile.objects.get_or_create(user=user)
 
         email = contacts.get("email")
         if email and not user.email:
@@ -487,36 +583,60 @@ class NifMatchingService:
         profile.save()
         return user
 
-    def evaluate(self, nif: str, overrides: dict | None = None) -> dict:
+    def evaluate(self, nif: str, overrides: dict | None = None,
+                 create_viewer: bool = True) -> dict:
         """Orquestra o fluxo completo e devolve o payload pronto para a resposta.
 
         `overrides` permite preencher dados que o nif.pt/enriquecimento não trazem
         (CAE, região, dimensão) — usado quando o utilizador responde ao pedido de mais
         informações. Se, mesmo assim, faltar um campo obrigatório (CAE ou localização),
         levanta MissingClientDataError em vez de excluir avisos em silêncio.
+
+        `create_viewer`: só se regista a empresa como viewer quando o match vem de alguém
+        NÃO autenticado (é aí que o viewer serve — guardar o lead que consultou os apoios).
+        Um utilizador autenticado (admin, composer…) que faça um match está a consultar,
+        não a gerar lead: nesse caso não se cria nem se toca no perfil, e `viewer_user_id`
+        vem a None.
         """
         record = self.fetch_company(nif)
         metadata = self.extract_metadata(record)
         metadata = self._apply_overrides(metadata, overrides)
         # Regista/atualiza a empresa como viewer (já com os dados fornecidos, se houver).
-        user = self.create_or_update_viewer(metadata)
+        user = self.create_or_update_viewer(metadata) if create_viewer else None
 
         missing = missing_required_fields(metadata)
         if missing:
             raise MissingClientDataError(missing)
 
-        # Embedding do perfil do cliente (1 chamada) — atividade + CAE + localização + tipo.
-        # É a base da procura semântica que ordena os avisos mais enquadrados no topo.
-        activity_vec = embeddings.embed(_company_query_text(metadata))
+        # Embeddings do cliente, gerados DINAMICAMENTE (nunca guardados na BD), um por
+        # dimensão — a base da procura semântica que ordena os avisos mais enquadrados no topo.
+        company_vectors = self._company_vectors(metadata)
 
         # `company` expõe os dados ricos do contribuinte (incluindo a `activity`); `matches` ordenado.
         company = dict(metadata)
         return {
             "company": company,
             "nif": metadata["nif"],
-            "viewer_user_id": user.id,
-            "matches": self.process_matches(metadata, activity_vec),
+            "viewer_user_id": user.id if user else None,
+            "matches": self.process_matches(metadata, company_vectors),
         }
+
+    @staticmethod
+    def _company_vectors(metadata: dict) -> dict[str, list[float]]:
+        """{tipo: vetor} do cliente — setorial (atividade) + geral (perfil completo).
+
+        Uma ÚNICA chamada à OpenAI para as duas dimensões (embed_many). Tipos sem texto ou
+        sem API ficam de fora e a relevância renormaliza sobre os que existirem.
+        """
+        texts = {
+            GrantEmbedding.Type.SECTOR: _company_sector_text(metadata),
+            GrantEmbedding.Type.GENERAL: _company_general_text(metadata),
+        }
+        types = [t for t, text in texts.items() if text.strip()]
+        if not types:
+            return {}
+        vectors = embeddings.embed_many([texts[t] for t in types])
+        return {t: v for t, v in zip(types, vectors) if v is not None}
 
     @staticmethod
     def _apply_overrides(metadata: dict, overrides: dict | None) -> dict:
@@ -552,22 +672,52 @@ class NifMatchingService:
     # --- Auxiliares -------------------------------------------------------
 
     @staticmethod
-    def _active_opportunities():
+    def _active_opportunities(client_metadata: dict | None = None):
         """Oportunidades consideradas ativas: avisos já processados pela IA e AINDA a decorrer
         (active=True — os terminados, cuja closing_date já passou, são escondidos do match).
 
         Faz prefetch das relações usadas pelo ranking (fases, áreas, dotações por
-        fase/área, taxas) para evitar N+1 queries por aviso.
+        fase/área, taxas), dos beneficiários por ação (tipo de beneficiário) e dos
+        embeddings (relevância semântica) para evitar N+1 queries por aviso.
+
+        PREFILTRO CAE em SQL (quando o cliente tem CAE): usando a tabela normalizada GrantCae,
+        o Postgres devolve só os avisos SEM lista de inclusão OU cuja inclusão bate num prefixo
+        do cliente — é impossível ser CAE-elegível fora desse conjunto. Assim o Python nunca
+        vê os avisos com CAE incompatível; a regra fina (prefixo mais específico ↔ exclusões)
+        continua no match_cae. O resultado final é IDÊNTICO ao de filtrar tudo em Python.
         """
-        return Grant.objects.filter(ai_processed=True, active=True).prefetch_related(
+        qs = Grant.objects.filter(ai_processed=True, active=True).prefetch_related(
             "phases", "covered_areas", "phase_areas", "financing_rates",
+            "beneficiaries_by_action", "embeddings",
         )
+        caes = [str(c).strip() for c in (client_metadata or {}).get("cae_codes", []) if c]
+        if caes:
+            prefixes = set().union(*(cae_all_prefixes(c) for c in caes))
+            included = GrantCae.objects.filter(
+                grant=OuterRef("pk"), kind=GrantCae.INCLUDED)
+            matching = included.filter(prefix__in=prefixes)
+            qs = qs.annotate(
+                _has_included=Exists(included), _matches_included=Exists(matching),
+            ).filter(Q(_has_included=False) | Q(_matches_included=True))
+        return qs
 
     @staticmethod
     def _grant_to_opportunity(grant: Grant) -> dict:
         """Converte um Grant no dicionário normalizado que os matchers e o ranking consomem."""
         eligibility_parts = list(grant.beneficiary_eligibility_criteria or [])
         eligibility_parts += list(grant.final_recipients or [])
+
+        # QUEM se pode candidatar — fonte SEPARADA das CONDIÇÕES legais. Os
+        # `beneficiary_eligibility_criteria` são requisitos ("não ser uma empresa em
+        # dificuldade", "não ter processo de injunção…"), não dizem quem é o beneficiário —
+        # e o boilerplate legal da UE menciona "empresa" numa cláusula de EXCLUSÃO, o que
+        # levava o filtro a concluir que o aviso era para empresas. O tipo de beneficiário
+        # lê-se só de onde ele está mesmo declarado: destinatários finais + beneficiários
+        # por ação.
+        beneficiary_parts = list(grant.final_recipients or [])
+        for b in grant.beneficiaries_by_action.all():
+            beneficiary_parts += list(b.entities or [])
+
         return {
             "id": grant.id,
             "grant_code": grant.grant_code,
@@ -576,6 +726,7 @@ class NifMatchingService:
             "excluded_caes": grant.excluded_caes or [],
             "eligible_regions": grant.eligible_regions or [],
             "eligibility_text": _normalize(" | ".join(str(p) for p in eligibility_parts)),
+            "beneficiary_text": _normalize(" | ".join(str(p) for p in beneficiary_parts)),
             # Dados para o ranking por dotação/taxa efetivas (fase ativa × área da empresa).
             "total_allocation": grant.total_allocation,
             "phases": [

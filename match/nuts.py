@@ -7,19 +7,11 @@ sua NUTS II/III — carregada UMA vez do nuts.json para um dicionário em memór
 """
 
 import json
-import unicodedata
 from pathlib import Path
 
+from common.text import normalize as _norm
+
 _NUTS_PATH = Path(__file__).resolve().parent.parent / "nuts.json"
-
-
-def _norm(s) -> str:
-    """minúsculas + sem acentos + espaços colapsados (para casar nomes de município)."""
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKD", str(s))
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    return " ".join(s.lower().split())
 
 
 def _load() -> dict[str, dict]:

@@ -86,8 +86,11 @@ def is_consolidated_markdown(markdown: str) -> bool:
 
 
 def has_diff_language(markdown: str) -> bool:
-    """True se o texto usa linguagem de alteração pontual ('onde consta X passa a Y')."""
-    return bool(_DIFF_LANGUAGE_RE.search(markdown))
+    """True se o texto usa linguagem de alteração pontual ('onde consta X passa a Y').
+
+    Normaliza antes de comparar: os padrões estão sem acentos, mas o texto real tem
+    ("redação", "onde se lê", "é alterado") — sem isto os diffs reais não eram detetados."""
+    return bool(_DIFF_LANGUAGE_RE.search(normalize_text(markdown)))
 
 
 def needs_consolidation(markdown: str) -> bool:

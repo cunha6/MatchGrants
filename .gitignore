@@ -13,8 +13,18 @@ anuncios_import.lock
 anuncios_import.pid
 
 dictionary_by_nif.json
+MatchGrants.postman_collection.json
+
+# Bases de dados locais (SQLite) e logs — nunca versionar
+*.sqlite3
+logs/
+
+# Artefactos de cobertura de testes
+.coverage
+htmlcov/
 
 # Ambiente virtual
 venv/
 .env/
 .venv/
+

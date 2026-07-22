@@ -1,0 +1,18 @@
+# Medição de cobertura de testes (coverage.py) — corre no CI e localmente:
+#   coverage run manage.py test match users anuncios avisos --noinput && coverage report
+[run]
+source = .
+omit =
+    */migrations/*
+    */tests.py
+    manage.py
+    main/asgi.py
+    main/wsgi.py
+    # Ferramenta CLI de diagnóstico, não faz parte da aplicação
+    avisos/IA/coverage.py
+
+[report]
+# Percentagem por ficheiro + linhas em falta; ordena do pior para o melhor.
+show_missing = True
+sort = cover
+precision = 1

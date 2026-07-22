@@ -28,7 +28,10 @@ webdriver-manager==4.0.2
 websocket-client==1.9.0
 wsproto==1.3.2
 psycopg2-binary==2.9.9
-docling
-pypdf
-openai
-pgvector
+docling==2.111.0
+pypdf==6.14.2
+openai==2.44.0
+pgvector==0.5.0
+numpy==2.4.6
+pydantic==2.13.4
+gunicorn==23.0.0

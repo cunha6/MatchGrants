@@ -5,6 +5,7 @@ offline and does not touch pdf_Anuncios/ or the real lock files.
 """
 
 import io
+import json
 import shutil
 import tempfile
 import zipfile
@@ -13,10 +14,12 @@ from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
-from django.test import SimpleTestCase, TestCase
+from django.contrib.auth.models import User
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from anuncios import services, specifications
 from anuncios.models import Notice
+from users.models import UserProfile
 
 
 class FakeResp:
@@ -426,3 +429,188 @@ class ViewTests(TestCase):
         data = resp.json()
         self.assertEqual(data["total"], 1)
         self.assertEqual(data["notices"][0]["notice_number"], "1/2026")
+
+    def test_list_is_summary_only(self):
+        # A listagem é enxuta — a descrição completa só vem no detalhe.
+        Notice.objects.create(notice_number="2/2026", description="texto longo",
+                              proposal_deadline=date.today() + timedelta(days=3))
+        resp = self.client.get("/anuncios/")
+        body = resp.json()
+        self.assertEqual(set(body), {"total", "page", "page_size", "num_pages", "notices"})
+        row = body["notices"][0]
+        self.assertEqual(set(row), {"id", "notice_number", "entity_name", "act_type",
+                                    "base_price", "proposal_deadline", "active"})
+
+    def test_ordering_is_global_not_per_page(self):
+        # O anúncio de maior preço foi criado PRIMEIRO (id mais baixo) — se a paginação
+        # cortasse antes de ordenar, não apareceria em 1º ao pedir price_highest. A
+        # ordenação é feita no SQL (ORDER BY) ANTES do LIMIT/OFFSET da paginação — global.
+        Notice.objects.create(notice_number="LOW/2026", base_price=Decimal("100"),
+                              proposal_deadline=date.today() + timedelta(days=3))
+        Notice.objects.create(notice_number="HIGH/2026", base_price=Decimal("999999"),
+                              proposal_deadline=date.today() + timedelta(days=3))
+        Notice.objects.create(notice_number="MID/2026", base_price=Decimal("5000"),
+                              proposal_deadline=date.today() + timedelta(days=3))
+        resp = self.client.get("/anuncios/?order_by=price_highest&page_size=2")
+        numbers = [n["notice_number"] for n in resp.json()["notices"]]
+        self.assertEqual(numbers, ["HIGH/2026", "MID/2026"])
+
+    def test_list_pagination(self):
+        for i in range(5):
+            Notice.objects.create(notice_number=f"P{i}/2026",
+                                  proposal_deadline=date.today() + timedelta(days=3))
+        resp = self.client.get("/anuncios/?page=2&page_size=2")
+        body = resp.json()
+        self.assertEqual(body["total"], 5)
+        self.assertEqual(body["page"], 2)
+        self.assertEqual(body["page_size"], 2)
+        self.assertEqual(body["num_pages"], 3)
+        self.assertEqual(len(body["notices"]), 2)
+
+    def test_detail_route(self):
+        n = Notice.objects.create(notice_number="3/2026", description="descrição completa",
+                                  proposal_deadline=date.today() + timedelta(days=3))
+        resp = self.client.get(f"/anuncios/{n.pk}/")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["description"], "descrição completa")  # detalhe traz tudo
+
+    def test_detail_404(self):
+        self.assertEqual(self.client.get("/anuncios/999999/").status_code, 404)
+
+
+class NoticeEditViewTests(TestCase):
+    """Permissões, validação e auditoria da edição de anúncios (/anuncios/<pk>/edit/)."""
+
+    def setUp(self):
+        self.notice = Notice.objects.create(
+            notice_number="ED-1/2026", entity_name="Câmara Municipal X",
+            description="Original", base_price=Decimal("1000"),
+            proposal_deadline=date.today() + timedelta(days=5),
+        )
+        self.commercial = User.objects.create_user(
+            "comercial_an", email="c@x.pt", password="Xk93!vTq21mZ")
+        self.commercial.profile.role = UserProfile.COMMERCIAL
+        self.commercial.profile.save()
+        self.client_user = User.objects.create_user("cliente_an", password="Xk93!vTq21mZ")
+        # o signal já cria o perfil com role=client
+
+    def _edit(self, payload):
+        # Edição é por PUT (por id, inalterável) — POST não é aceite.
+        return self.client.put(
+            f"/anuncios/{self.notice.pk}/edit/",
+            data=json.dumps(payload), content_type="application/json",
+        )
+
+    def test_anonymous_gets_401(self):
+        self.assertEqual(self._edit({"description": "X"}).status_code, 401)
+
+    def test_client_role_gets_403(self):
+        self.client.force_login(self.client_user)
+        self.assertEqual(self._edit({"description": "X"}).status_code, 403)
+
+    def test_commercial_edits_and_audit_logs_who_and_what(self):
+        self.client.force_login(self.commercial)
+        with self.assertLogs("anuncios.audit", level="INFO") as logs:
+            resp = self._edit({"description": "Novo texto", "id": 999})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["updated"], ["description"])
+        self.assertEqual(body["ignored"], ["id"])   # id nunca é editável
+        self.notice.refresh_from_db()
+        self.assertEqual(self.notice.description, "Novo texto")
+        # O log de auditoria diz QUEM alterou e O QUÊ (antigo -> novo).
+        self.assertIn("comercial_an", logs.output[0])
+        self.assertIn("'Original'", logs.output[0])
+        self.assertIn("'Novo texto'", logs.output[0])
+
+    def test_edit_multiple_fields(self):
+        self.client.force_login(self.commercial)
+        resp = self._edit({"entity_name": "Câmara Y", "active": False})
+        self.assertEqual(resp.status_code, 200)
+        self.notice.refresh_from_db()
+        self.assertEqual(self.notice.entity_name, "Câmara Y")
+        self.assertFalse(self.notice.active)
+
+    def test_invalid_value_returns_400_not_500(self):
+        self.client.force_login(self.commercial)
+        resp = self._edit({"base_price": "não é um número"})
+        self.assertEqual(resp.status_code, 400)
+        self.notice.refresh_from_db()
+        self.assertEqual(self.notice.base_price, Decimal("1000"))  # nada foi gravado
+
+    def test_duplicate_notice_number_returns_400(self):
+        # notice_number é único — a colisão vira 400 (não 500).
+        Notice.objects.create(notice_number="OUTRO/2026")
+        self.client.force_login(self.commercial)
+        resp = self._edit({"notice_number": "OUTRO/2026"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_post_method_not_allowed(self):
+        self.client.force_login(self.commercial)
+        resp = self.client.post(
+            f"/anuncios/{self.notice.pk}/edit/",
+            data=json.dumps({"description": "X"}), content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 405)
+
+    def test_unknown_notice_returns_404(self):
+        self.client.force_login(self.commercial)
+        resp = self.client.put(
+            "/anuncios/999999/edit/", data="{}", content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_invalid_json_returns_400(self):
+        self.client.force_login(self.commercial)
+        resp = self.client.put(
+            f"/anuncios/{self.notice.pk}/edit/",
+            data="isto não é json", content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+class SpecificationsServeTests(TestCase):
+    """Servir o caderno de encargos local (pdf_Anuncios) e o link no detalhe. BASE_DIR
+    temporário (override_settings) para não escrever no repositório."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "pdf_Anuncios").mkdir(parents=True)
+        self.rel = "pdf_Anuncios/20260101_ce.pdf"
+        (self.tmp / self.rel).write_bytes(b"%PDF-1.4\ncaderno\n%%EOF")
+        self.notice = Notice.objects.create(
+            notice_number="CE-1", specifications_path=self.rel,
+            proposal_deadline=date.today() + timedelta(days=5),
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_detail_exposes_specifications_url(self):
+        with override_settings(BASE_DIR=self.tmp):
+            body = self.client.get(f"/anuncios/{self.notice.pk}/").json()
+        self.assertEqual(body["specifications_url"], f"/anuncios/{self.notice.pk}/specifications/")
+
+    def test_serve_returns_pdf_inline(self):
+        with override_settings(BASE_DIR=self.tmp):
+            resp = self.client.get(f"/anuncios/{self.notice.pk}/specifications/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp["Content-Type"], "application/pdf")
+        self.assertIn("inline", resp["Content-Disposition"])
+        self.assertEqual(b"".join(resp.streaming_content), b"%PDF-1.4\ncaderno\n%%EOF")
+
+    def test_serve_404_when_no_file(self):
+        n = Notice.objects.create(notice_number="NOCE", specifications_path="",
+                                  proposal_deadline=date.today() + timedelta(days=5))
+        with override_settings(BASE_DIR=self.tmp):
+            resp = self.client.get(f"/anuncios/{n.pk}/specifications/")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_serve_blocks_path_traversal(self):
+        (self.tmp / "secret.pdf").write_bytes(b"%PDF-1.4\nsegredo")
+        self.notice.specifications_path = "pdf_Anuncios/../secret.pdf"
+        self.notice.save(update_fields=["specifications_path"])
+        with override_settings(BASE_DIR=self.tmp):
+            resp = self.client.get(f"/anuncios/{self.notice.pk}/specifications/")
+        self.assertEqual(resp.status_code, 404)

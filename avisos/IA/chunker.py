@@ -1,11 +1,14 @@
 """Divide markdown em chunks semânticos: 1 chunk por secção de heading."""
 
 import json
+import logging
 import re
 from pathlib import Path
 
 from .normalizers import normalize_text
 from ..Docling.docling_ocr import _clean_ocr
+
+logger = logging.getLogger(__name__)
 
 normalize = normalize_text
 
@@ -303,7 +306,7 @@ def chunk_by_markdown(md_text: str, grant_code: str, source: str) -> list[dict]:
         primary_cat = detected_category if detected_category != "outros" else active_category
 
         if detected_category == "outros":
-            print(f"[herdado -> {primary_cat}]: '{title[:50]}'")
+            logger.debug("[herdado -> %s]: %r", primary_cat, title[:50])
 
         prompt_source = CATEGORIA_PARA_PROMPTS.get(primary_cat, "")
 

@@ -1,5 +1,6 @@
 from django.db import models
-from pgvector.django import VectorField
+from django.db.models import Q
+from pgvector.django import HnswIndex, VectorField
 
 # Dimensão dos embeddings OpenAI (text-embedding-3-small).
 EMBEDDING_DIM = 1536
@@ -65,6 +66,10 @@ class Grant(models.Model):
     commitment_requirements = models.TextField(blank=True, null=True)
     # P2 — território e execução
     total_allocation = models.FloatField(null=True, blank=True)
+    # OVERRIDE MANUAL da taxa de financiamento mostrada. Por defeito null = a taxa é CALCULADA
+    # das linhas-filhas (PhaseArea/FinancingRate). Se preenchida (via edição), prevalece sobre
+    # o cálculo — permite corrigir/fixar a taxa à mão. Voltar a null repõe o cálculo automático.
+    financing_rate = models.FloatField(null=True, blank=True)
     low_density_territories = models.JSONField(default=list, blank=True)
     submission_limits = models.TextField(blank=True, null=True)
     absolute_execution_deadline = models.TextField(blank=True, null=True)
@@ -72,7 +77,8 @@ class Grant(models.Model):
     # P3 — financeiro
     minimum_investment = models.FloatField(null=True, blank=True)
     maximum_investment = models.FloatField(null=True, blank=True)
-    required_self_financing_limit = models.FloatField(null=True, blank=True)
+    # Percentagem/valor MÁXIMO de autofinanciamento (capitais próprios) do promotor.
+    maximum_self_financing = models.FloatField(null=True, blank=True)
     state_aid_regime = models.TextField(blank=True, null=True)
     applicable_gber_article = models.TextField(blank=True, null=True)
     contact = models.JSONField(default=list, blank=True)
@@ -99,13 +105,106 @@ class Grant(models.Model):
     # Ativo = ainda a decorrer. Fica False quando a closing_date já passou (avisos terminados
     # são escondidos do match, mas os ficheiros PDF/markdown/JSON são MANTIDOS).
     active = models.BooleanField(default=True, db_index=True)
-    # Embedding (pgvector) para pesquisa semântica — gerado pela OpenAI, guardado/pesquisado
-    # no Postgres. activity_embedding_hash deteta quando o texto do aviso mudou e força recálculo.
+    # DEPRECADO — substituído pelos embeddings especializados em `GrantEmbedding` (um por
+    # tipo: GENERAL, SECTOR, …). Mantidos por retrocompatibilidade/rollback; já não são
+    # escritos nem lidos. Podem ser removidos numa migração futura de limpeza.
     activity_embedding = VectorField(dimensions=EMBEDDING_DIM, null=True, blank=True)
     activity_embedding_hash = models.CharField(max_length=200, blank=True, default="")
 
+    class Meta:
+        indexes = [
+            # Índice PARCIAL: só contém as linhas do CONJUNTO QUENTE (avisos processados e
+            # ativos) — que o match filtra em cada pedido. Como só indexa esses ~1-2k, a query
+            # `WHERE ai_processed AND active` fica instantânea mesmo com dezenas de milhares de
+            # avisos históricos (inativos) na tabela. É o único ponto onde o histórico tocava o
+            # match; este índice resolve-o sem qualquer redesenho.
+            models.Index(
+                fields=["id"], name="grant_active_processed_idx",
+                condition=Q(ai_processed=True, active=True),
+            ),
+        ]
+
     def __str__(self):
         return self.grant_code or self.title or f"Grant #{self.pk}"
+
+
+class GrantEmbedding(models.Model):
+    """Embedding ESPECIALIZADO de um aviso — um registo por TIPO (GENERAL, SECTOR, …).
+
+    Porquê vários em vez de um só: cada tipo isola uma dimensão do aviso e é comparado de
+    forma independente com a dimensão equivalente da empresa. Num embedding único, o sinal
+    setorial ("valorização de resíduos") dilui-se no meio do texto geral (objetivos, ações,
+    regiões) e deixa de discriminar; separado, pesa por si.
+
+    Extensibilidade: acrescentar um tipo (RECIPIENT, OBJECTIVE, …) NÃO altera a estrutura da
+    base de dados — basta juntar o valor a `Type`, escrever o builder do texto e registá-lo
+    em `match/grant_embeddings.py::_TEXT_BUILDERS`. Os dados entram como linhas novas.
+    """
+
+    class Type(models.TextChoices):
+        GENERAL = "GENERAL", "Geral (conteúdo do aviso)"
+        SECTOR = "SECTOR", "Setorial (domínio tecnológico/económico)"
+
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="embeddings")
+    embedding_type = models.CharField(max_length=32, choices=Type.choices, db_index=True)
+    # Modelo que gerou o vetor (ex: "text-embedding-3-small") — permite detetar/migrar
+    # embeddings gerados por um modelo antigo sem os confundir com os atuais.
+    model = models.CharField(max_length=100)
+    embedding = VectorField(dimensions=EMBEDDING_DIM)
+    # Hash do texto embebido: é o que permite NÃO chamar a OpenAI quando o texto não mudou.
+    text_hash = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            # "Um embedding por tipo": o (re)cálculo é sempre um update_or_create desta chave.
+            models.UniqueConstraint(
+                fields=["grant", "embedding_type"], name="uniq_grant_embedding_per_type",
+            ),
+        ]
+        indexes = [
+            # HNSW para pesquisa vetorial por distância de cosseno no Postgres.
+            HnswIndex(
+                name="grant_embedding_hnsw",
+                fields=["embedding"],
+                m=16,
+                ef_construction=64,
+                opclasses=["vector_cosine_ops"],
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.grant_id} · {self.embedding_type}"
+
+
+class GrantCae(models.Model):
+    """Índice NORMALIZADO dos padrões CAE de um aviso — uma linha por padrão (prefixo + tipo).
+
+    Porquê uma tabela e não só o JSONField `included_caes`/`excluded_caes`: para o match poder
+    PREFILTRAR no SQL (com índice) quais os avisos CAE-candidatos a um cliente, em vez de
+    carregar todos os avisos e filtrar em Python. A `Grant.included_caes`/`excluded_caes`
+    continua a ser a FONTE DE VERDADE (é o que a extração escreve e a edição altera); esta
+    tabela é derivada dela e mantida em sincronia por signal (ver avisos/signals.py).
+
+    A regra fina — "o prefixo mais específico ganha" entre inclusões e exclusões — continua a
+    ser resolvida no Python (match_cae). Esta tabela só serve para o Postgres NARROWed o
+    conjunto: devolve os avisos sem lista de inclusão OU cuja inclusão bate num prefixo do
+    cliente (é impossível ser CAE-elegível fora desse conjunto).
+    """
+    INCLUDED = "included"
+    EXCLUDED = "excluded"
+    KIND_CHOICES = [(INCLUDED, INCLUDED), (EXCLUDED, EXCLUDED)]
+
+    grant = models.ForeignKey(Grant, on_delete=models.CASCADE, related_name="cae_entries")
+    prefix = models.CharField(max_length=5)          # prefixo numérico do padrão ('64', '651', '65124')
+    kind = models.CharField(max_length=8, choices=KIND_CHOICES)
+
+    class Meta:
+        indexes = [models.Index(fields=["prefix", "kind"])]
+
+    def __str__(self):
+        return f"{self.grant_id} · {self.kind} {self.prefix}"
 
 
 class BeneficiaryByAction(models.Model):

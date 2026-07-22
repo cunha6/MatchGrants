@@ -1,0 +1,20 @@
+# Linter (ruff) — corre localmente com `ruff check .` e no CI (ver .github/workflows/ci.yml).
+line-length = 100
+target-version = "py311"
+
+extend-exclude = [
+    "*/migrations/*",
+    "output",
+    "pdf_Avisos",
+    "pdf_Anuncios",
+]
+
+[lint]
+# Regras de CORREÇÃO (erros reais, imports mortos, variáveis não usadas) — sem estilo puro,
+# para o CI não falhar por cosmética.
+select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+# Reexports intencionais (fonte única em common/, nomes mantidos por compatibilidade).
+"avisos/IA/normalizers.py" = ["F401"]
+"anuncios/specifications.py" = ["F401"]

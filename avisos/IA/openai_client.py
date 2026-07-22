@@ -1,6 +1,7 @@
 """Chamadas à API do OpenAI."""
 
 import json
+import logging
 import os
 import time
 
@@ -10,6 +11,8 @@ from openai import AsyncOpenAI
 from .prompts import ROUTER_SYSTEM, build_messages_from_chunks
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Modelos que não aceitam o parâmetro temperature
 _MODELS_SEM_TEMP = ("o1", "o3", "o4", "gpt-5")
@@ -32,7 +35,7 @@ async def call_openai_text(
 ) -> str:
     """Envia um prompt de texto livre e devolve a resposta em texto (não-JSON)."""
     t = time.time()
-    print(f"  [{label}] → {model}")
+    logger.info(f"  [{label}] → {model}")
     kwargs: dict = dict(
         model=model,
         messages=[
@@ -44,7 +47,7 @@ async def call_openai_text(
     if not any(model.startswith(p) for p in _MODELS_SEM_TEMP):
         kwargs["temperature"] = 0
     response = await client.chat.completions.create(**kwargs)
-    print(f"  [{label}] OK ({time.time()-t:.1f}s)")
+    logger.info(f"  [{label}] OK ({time.time()-t:.1f}s)")
     return response.choices[0].message.content or ""
 
 
@@ -59,7 +62,7 @@ async def call_openai(
 ) -> dict:
     """Envia chunks para o OpenAI e devolve o JSON parseado."""
     t = time.time()
-    print(f"  [{label}] {len(chunks)} secções → {model}")
+    logger.info(f"  [{label}] {len(chunks)} secções → {model}")
 
     messages = build_messages_from_chunks(system_prompt, chunks)
     if extra_user:
@@ -78,7 +81,7 @@ async def call_openai(
 
     usage = response.usage
     truncated = " [TRUNCADO]" if response.choices[0].finish_reason == "length" else ""
-    print(
+    logger.info(
         f"  [{label}] OK  "
         f"in={usage.prompt_tokens} out={usage.completion_tokens} tokens  "
         f"({time.time()-t:.1f}s){truncated}"
@@ -88,7 +91,7 @@ async def call_openai(
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        print(f"  [{label}] ERRO JSON: {exc}")
+        logger.error(f"  [{label}] ERRO JSON: {exc}")
         return {}
 
 
@@ -126,5 +129,5 @@ async def classify_ambiguous_chunks(
         result = json.loads(raw)
         return {str(k): (v if isinstance(v, list) else [str(v)]) for k, v in result.items()}
     except Exception as exc:
-        print(f"  [Router] Falhou: {exc}")
+        logger.warning(f"  [Router] Falhou: {exc}")
         return {}

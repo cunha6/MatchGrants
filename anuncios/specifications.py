@@ -7,10 +7,10 @@ PDF into pdf_Anuncios/. Handles a direct PDF/ZIP and HTML pages — including JS
 """
 
 import io
+import logging
 import os
 import re
 import shutil
-import unicodedata
 import zipfile
 from datetime import datetime
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -18,6 +18,9 @@ from urllib.parse import parse_qs, unquote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from django.conf import settings
+
+# Fonte única de normalização — reexportada porque services.py importa `normalize` daqui.
+from common.text import normalize  # noqa: F401
 
 # Selenium is optional: without it, JS-portal (Vortal) downloads are skipped.
 try:
@@ -31,6 +34,8 @@ try:
     SELENIUM_OK = True
 except ImportError:
     SELENIUM_OK = False
+
+logger = logging.getLogger(__name__)
 
 TIMEOUT = 30  # seconds
 USER_AGENT = (
@@ -57,15 +62,6 @@ _DOWNLOAD_LINK_XPATH = (
 
 
 # --- Text normalization / name matching ----------------------------------
-
-def normalize(text) -> str:
-    """Lowercase + strip accents (for tolerant comparisons)."""
-    if not text:
-        return ""
-    t = unicodedata.normalize("NFKD", str(text))
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    return t.casefold()
-
 
 def _specs_normalize(name: str) -> str:
     """Lowercase, no accents, separators (_-./) -> space."""
@@ -235,7 +231,7 @@ def build_chrome():
             return Chrome(service=Service(chromedriver_bin), options=opts)
         return Chrome(service=Service(ChromeDriverManager().install()), options=opts)
     except WebDriverException as exc:
-        print(f"[Selenium] Failed to start Chrome (Vortal will not extract): {exc}")
+        logger.warning(f"[Selenium] Failed to start Chrome (Vortal will not extract): {exc}")
         return None
 
 

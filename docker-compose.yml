@@ -19,6 +19,8 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 5s
       retries: 10
+    networks:
+      - default
 
   # Chrome dedicado para o scraping (Selenium). O chromium do Debian (v150) rebenta
   # com SIGTRAP em headless/WSL2; esta imagem traz um Chrome testado para container.
@@ -30,7 +32,8 @@ services:
     ports:
       - "4444:4444"   # Selenium WebDriver
       - "7900:7900"   # noVNC (debug visual, opcional)
-
+    networks:
+      - default
   app:
     build: .
     container_name: matchgrants
@@ -51,12 +54,20 @@ services:
       - DB_PORT=5432
       # Faz o scraping usar o Chrome do container `chrome` (WebDriver remoto).
       - SELENIUM_REMOTE_URL=http://chrome:4444/wd/hub
+      - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,matchgrants
     depends_on:
       db:
         condition: service_healthy
       chrome:
         condition: service_started
+    networks:
+      - default
+      - shared-network
     restart: unless-stopped
 
 volumes:
   postgres_data:
+
+networks:
+  shared-network:
+    external: true

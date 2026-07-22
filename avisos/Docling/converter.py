@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import re
 import unicodedata
@@ -10,6 +11,8 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from .docling_ocr import _clean_ocr
+
+logger = logging.getLogger(__name__)
 
 _DATETIME_RE = re.compile(r"^\d{8}_\d{6}_")
 
@@ -99,7 +102,7 @@ def download_pdf(url: str | None, download_dir: str, reject_invitations: bool = 
 
     existing = find_existing_document(url, download_dir)
     if existing:
-        print(f"Já existe: {original_name} — download ignorado.")
+        logger.info("Já existe: %s — download ignorado.", original_name)
         return existing
 
     try:
@@ -119,10 +122,10 @@ def download_pdf(url: str | None, download_dir: str, reject_invitations: bool = 
         path = os.path.join(download_dir, f"{timestamp}_{original_name}")
         with open(path, "wb") as f:
             f.write(data)
-        print(f"Descarregado: {os.path.basename(path)}")
+        logger.info("Descarregado: %s", os.path.basename(path))
         return path
     except Exception as e:
-        print(f"Erro: {e}")
+        logger.error("Erro no download do PDF (%s): %s", url, e)
         return None
 
 
@@ -180,7 +183,7 @@ def rescue_merit_formulas(markdown: str, raw_text: str) -> str:
     insert = f"\n**Fórmulas (recuperadas do texto do PDF):**\n\n{block}\n"
 
     lines = markdown.splitlines(keepends=True)
-    acc = [_acc(l) for l in lines]
+    acc = [_acc(line) for line in lines]
 
     def find(pred):
         return next((i for i, a in enumerate(acc) if pred(a)), None)
@@ -221,7 +224,7 @@ def pdf_to_markdown(path: str, download_dir: str = "") -> tuple[str, str] | None
             f.write(markdown)
         return markdown, md_path
     except Exception as e:
-        print(f"Erro docling (conversão): {e}")
+        logger.error("Erro docling (conversão de %s): %s", path, e)
         return None
 
 
@@ -243,7 +246,7 @@ def download_document(url: str | None, download_dir: str, url_pagina: str = "") 
         if ai_data:
             from ..db_service import save_ai_grant
             save_ai_grant(ai_data, scraping_url=url_pagina or url, pdf_path=path, markdown_path=md_path)
-    except Exception as e:
-        print(f"Error saving to database: {e}")
+    except Exception:
+        logger.exception("Erro ao gravar o aviso na base de dados")
 
     return path

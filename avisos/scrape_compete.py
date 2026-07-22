@@ -125,13 +125,16 @@ def _parse_detail(html: str, url: str) -> dict:
     data: dict = {"url": url}
     data["source"] = "Compete2030"
 
+    # Guards contra mudanças no HTML do site: sem <main>/<span> o parse degrada para
+    # valores vazios em vez de rebentar o scrape com AttributeError.
     main_element = soup.find("main")
-    div_date = main_element.find("div", class_="date-badges")
+    div_date = main_element.find("div", class_="date-badges") if main_element else None
 
     publication_date = ""
     if div_date:
         span = div_date.find("span", class_=re.compile(r"text-muted"))
-        publication_date = _clean(span.get_text())
+        if span:
+            publication_date = _clean(span.get_text())
     data["data_publicacao"] = _date_normalize(publication_date)
 
     data["data_inicio"] = ""
@@ -143,7 +146,7 @@ def _parse_detail(html: str, url: str) -> dict:
                 data["data_inicio"] = m.group(0)
                 break
 
-    data["phases"] = _parse_phases(main_element)
+    data["phases"] = _parse_phases(main_element) if main_element else []
 
     info: dict[str, str] = {}
     if main_element:
@@ -297,7 +300,8 @@ _MESES = {
 
 
 def _date_normalize(texto: str) -> str:
-    m = re.search(r"(\d{1,2})\s+de\s+(\w+)\s+(\d{4})", texto, re.IGNORECASE)
+    # "(?:\s+de)?" aceita as duas formas: "10 de junho 2026" e "10 de junho DE 2026".
+    m = re.search(r"(\d{1,2})\s+de\s+(\w+)(?:\s+de)?\s+(\d{4})", texto, re.IGNORECASE)
     if m:
         dia, mes_str, ano = m.group(1), m.group(2).lower(), m.group(3)
         mes = _MESES.get(mes_str)

@@ -1,7 +1,10 @@
 """Normalizações de dados aplicadas ao JSON extraído."""
 
 import re
-import unicodedata
+
+# Fonte única de normalização de texto — reexportada aqui porque o chunker e o
+# documents.py importam `normalize_text` deste módulo.
+from common.text import normalize as normalize_text  # noqa: F401
 
 
 def normalize_grant_code(code: str) -> str:
@@ -87,16 +90,3 @@ def normalize_pp_to_percent(obj):
     return obj
 
 
-def normalize_text(text: str) -> str:
-    """Remove acentos, converte para lowercase e limpa espaços extras."""
-    if not text:
-        return ""
-
-    # 1. Remove acentos e passa a minúsculas
-    nfkd = unicodedata.normalize('NFKD', text)
-    clean_text = nfkd.encode('ascii', 'ignore').decode('ascii').lower()
-
-    # 2. Transforma múltiplos espaços, tabs e quebras de linha (\n) num único espaço
-    clean_text = re.sub(r'\s+', ' ', clean_text)
-
-    return clean_text.strip()

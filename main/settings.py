@@ -6,11 +6,25 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'django-insecure-h6dqv)z6y#ekqe5$_ug+r^c8m#s09%xehaxcfo3ux6!h@p-cvw'
+# Configuração por ambiente (produção define estas no .env; os defaults mantêm o dev igual).
+# Em produção: DJANGO_SECRET_KEY=<aleatória>, DJANGO_DEBUG=false, DJANGO_ALLOWED_HOSTS=dominio.pt
+SECRET_KEY = os.getenv(
+    'DJANGO_SECRET_KEY',
+    'django-insecure-h6dqv)z6y#ekqe5$_ug+r^c8m#s09%xehaxcfo3ux6!h@p-cvw',  # só para dev
+)
 
-DEBUG = True
+DEBUG = os.getenv('DJANGO_DEBUG', 'true').lower() in ('true', '1', 'yes')
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+ALLOWED_HOSTS = [
+    h.strip() for h in os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    if h.strip()
+]
+
+# Endurecimento automático quando DEBUG=false (produção atrás de HTTPS).
+if not DEBUG:
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SESSION_COOKIE_SECURE = os.getenv('DJANGO_COOKIES_SECURE', 'true').lower() == 'true'
+    CSRF_COOKIE_SECURE = SESSION_COOKIE_SECURE
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -25,14 +39,37 @@ INSTALLED_APPS = [
     'anuncios',
 ]
 
-# Chave da API nif.pt — lida do .env.
+# Chave(s) da API nif.pt — lidas do .env. A principal (NIF_KEY) mais alternativas opcionais
+# (NIF_KEY1..NIF_KEY4). O serviço de match roda entre elas, uma de cada vez, para distribuir
+# os pedidos por várias chaves (limites de utilização da API nif.pt).
 NIF_KEY = os.getenv('NIF_KEY')
-
-# Token da API base.gov.pt (header _AcessToken) — lido do .env.
+NIF_KEYS = [
+    k for k in (
+        os.getenv('NIF_KEY'),
+        os.getenv('NIF_KEY1'),
+        os.getenv('NIF_KEY2'),
+        os.getenv('NIF_KEY3'),
+        os.getenv('NIF_KEY4'),
+    ) if k
+]
 BASE_KEY = os.getenv('BASE_KEY')
-
-# Chave da API cttcodigopostal.pt (resolve código postal → localidade/concelho/distrito) — .env.
 CTT_KEY = os.getenv('CTT_KEY')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+
+# --- Email (notificação aos comerciais quando um aviso é adicionado/alterado) ---
+# Em dev (DEBUG) o backend por defeito é a consola: os emails são impressos no log em vez
+# de enviados. Em produção usa SMTP com as credenciais do .env (EMAIL_HOST/USER/PASSWORD…).
+EMAIL_BACKEND = os.getenv(
+    'DJANGO_EMAIL_BACKEND',
+    'django.core.mail.backends.console.EmailBackend' if DEBUG
+    else 'django.core.mail.backends.smtp.EmailBackend',
+)
+EMAIL_HOST = os.getenv('EMAIL_HOST', '')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'true').lower() == 'true'
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'MatchGrants <no-reply@matchgrants.local>')
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -89,6 +126,49 @@ DATABASES = {
 
 # Encaminha o modelo match.NifCompany para a BD 'nif'; tudo o resto vai para 'default'.
 DATABASE_ROUTERS = ['match.routers.NifRouter']
+
+# Logging para a consola (docker logs): erros das apps ficam registados com stack trace
+# em vez de se perderem — os handlers de exceção das views devolvem mensagens limpas.
+# Os logs de 'avisos' (o que a IA gerou + auditoria de quem editou o quê) e de 'anuncios'
+# (import + auditoria de edições) vão TAMBÉM para logs/*.log — a pasta está no volume do
+# compose, por isso persiste no host.
+LOGS_DIR = BASE_DIR / 'logs'
+LOGS_DIR.mkdir(exist_ok=True)
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'simple': {'format': '[{levelname}] {asctime} {name}: {message}', 'style': '{'},
+    },
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler', 'formatter': 'simple'},
+        'avisos_file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': str(LOGS_DIR / 'avisos.log'),
+            'maxBytes': 5 * 1024 * 1024,   # 5 MB por ficheiro
+            'backupCount': 5,
+            'encoding': 'utf-8',
+            'formatter': 'simple',
+        },
+        'anuncios_file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': str(LOGS_DIR / 'anuncios.log'),
+            'maxBytes': 5 * 1024 * 1024,
+            'backupCount': 5,
+            'encoding': 'utf-8',
+            'formatter': 'simple',
+        },
+    },
+    'root': {'handlers': ['console'], 'level': 'INFO'},
+    'loggers': {
+        'django': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+        # Apanha avisos.db_service (extração IA) e avisos.audit (edições) — consola + ficheiro.
+        'avisos': {'handlers': ['console', 'avisos_file'], 'level': 'INFO', 'propagate': False},
+        # Apanha anuncios.services (import/cadernos) e anuncios.audit (edições).
+        'anuncios': {'handlers': ['console', 'anuncios_file'], 'level': 'INFO', 'propagate': False},
+    },
+}
 
 LANGUAGE_CODE = 'pt-pt'
 TIME_ZONE = 'Europe/Lisbon'

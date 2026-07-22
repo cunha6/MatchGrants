@@ -1,4 +1,5 @@
 import io
+import logging
 import os
 import re
 import sys
@@ -17,9 +18,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
-from webdriver_manager.chrome import ChromeDriverManager
 
 from .Docling.converter import text_is_invitation
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://portugal2030.pt"
 LIST_URL = f"{BASE_URL}/avisos/"
@@ -95,7 +97,7 @@ def scrape_portugal2030_web() -> list[dict]:
                 try:
                     clicks = _wait_click(driver, clicks, 7)
                 except (TimeoutException, NoSuchElementException, StaleElementReferenceException):
-                    print(f"Botão desapareceu após {clicks} cliques.")
+                    logger.info("Botão desapareceu após %d cliques.", clicks)
                     break
         page_source = driver.page_source
     finally:
@@ -109,7 +111,7 @@ def _parse_main(html: str) -> list[dict]:
     main_element = soup.find("div", class_="et_pb_column_2_tb_body")
     if main_element is None:
         # Estrutura da página não encontrada (mudou, ou não renderizou). Não rebenta o scrape.
-        print("  [Portugal] AVISO: container 'et_pb_column_2_tb_body' não encontrado — 0 avisos.")
+        logger.warning("[Portugal] container 'et_pb_column_2_tb_body' não encontrado — 0 avisos.")
         return []
     avisos = main_element.find_all("li")
 
@@ -141,9 +143,11 @@ def _parse_main(html: str) -> list[dict]:
                 data[_KEY_MAP.get(dt_text, dt_text)] = dd.get_text(strip=True) if dd else ""
 
         docs_div = aviso.find("div", class_="avisos-docs")
+        # href=True evita KeyError em <a> sem href; URLs já absolutos não levam prefixo.
         documentos = [
-            {"nome": a.get_text(strip=True), "url": BASE_URL + a["href"]}
-            for a in reversed(docs_div.find_all("a"))
+            {"nome": a.get_text(strip=True),
+             "url": a["href"] if a["href"].startswith("http") else BASE_URL + a["href"]}
+            for a in reversed(docs_div.find_all("a", href=True))
         ] if docs_div else []
         data["documentos"] = documentos
 
@@ -170,7 +174,7 @@ def _parse_main(html: str) -> list[dict]:
         parsed.append(data)
 
     # 2ª passagem: verificar todos os PDFs em paralelo
-    print(f"  [Portugal] A verificar {len(urls_a_verificar)} PDFs em paralelo...")
+    logger.info("[Portugal] A verificar %d PDFs em paralelo...", len(urls_a_verificar))
     cache: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(_pdf_info, url): url for url in urls_a_verificar}
@@ -212,7 +216,7 @@ def _wait_click(driver: Chrome, clicks: int, timeout: int) -> int:
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
     driver.execute_script("arguments[0].click();", btn)
     clicks += 1
-    print(f"Carregar mais clicado ({clicks}x)")
+    logger.info("Carregar mais clicado (%dx)", clicks)
     time.sleep(timeout)
     return clicks
 

@@ -6,6 +6,7 @@ Ponto de entrada: run_pipeline(markdown, source, output_dir)
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from .merge import merge
 from .normalizers import extract_grant_code, inject_anchor, normalize_grant_code, normalize_grant_codes_json, normalize_pp_to_percent
 from .openai_client import classify_ambiguous_chunks, call_openai, call_openai_text, create_client
 from .prompts import SYSTEM_PROMPT_1, SYSTEM_PROMPT_2, SYSTEM_PROMPT_3, SYSTEM_PROMPT_4, SYSTEM_PROMPT_5, SYSTEM_PROMPT_6, SYSTEM_PROMPT_7, SYSTEM_PROMPT_CONSOLIDATE
+
+logger = logging.getLogger(__name__)
 
 # Modelo usado em cada prompt
 P1_MODEL = "gpt-5-mini-2025-08-07"
@@ -32,25 +35,25 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
     json_dir = output_dir / "json"
     json_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{'─' * 60}")
-    print(f"  Documento: {source}")
-    print(f"{'─' * 60}")
+    logger.info(f"\n{'─' * 60}")
+    logger.info(f"  Documento: {source}")
+    logger.info(f"{'─' * 60}")
 
     # 1. Chunking
-    print("\n[1/2] Chunking semântico")
+    logger.info("\n[1/2] Chunking semântico")
     chunks = chunk_by_markdown(markdown, grant_code=source, source=source)
 
     cats: dict[str, int] = {}
     for c in chunks:
         cats[c["category"]] = cats.get(c["category"], 0) + 1
     for cat, n in sorted(cats.items()):
-        print(f"  [{cat}] {n} secção(ões)")
-    print(f"  Total: {len(chunks)} chunks")
+        logger.info(f"  [{cat}] {n} secção(ões)")
+    logger.info(f"  Total: {len(chunks)} chunks")
 
     # Routing multi-label: o LLM classifica TODOS os chunks. A categoria por keyword
     # (chunker) é unida com as categorias do LLM — um chunk pode pertencer a vários prompts.
     client = create_client()
-    print(f"\n  [Router] a classificar {len(chunks)} chunks → LLM")
+    logger.info(f"\n  [Router] a classificar {len(chunks)} chunks → LLM")
     routed = await classify_ambiguous_chunks(client, chunks)
     for chunk in chunks:
         labels: set[str] = set()
@@ -65,7 +68,7 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
     # Chunks sem qualquer categoria → fallback para P1 (rede de segurança)
     fallback = [c for c in chunks if not c["categories"]]
     n_multi = sum(1 for c in chunks if len(c["categories"]) > 1)
-    print(f"  [Router] {n_multi} chunks multi-categoria, {len(fallback)} sem categoria (→P1)")
+    logger.info(f"  [Router] {n_multi} chunks multi-categoria, {len(fallback)} sem categoria (→P1)")
 
     # Distribui os chunks pelos 6 prompts por interseção de categorias
     p1_chunks = [c for c in chunks if c["categories"] & CATS_P1] + fallback
@@ -109,18 +112,18 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
             p3_ids.add(id(c))
 
     # 2. OpenAI — P1 primeiro para obter o notice_code, depois P2–P6 em paralelo
-    print("\n[2/2] OpenAI")
+    logger.info("\n[2/2] OpenAI")
 
     r1 = await call_openai(client, SYSTEM_PROMPT_1, p1_chunks, "P1 Identificação", P1_MODEL)
 
     notice_code = extract_grant_code(r1)
     if notice_code:
         notice_code = normalize_grant_code(notice_code)
-        print(f"  Âncora: {notice_code!r}")
+        logger.info(f"  Âncora: {notice_code!r}")
     else:
-        print("  WARNING: grant_code not found in P1")
+        logger.warning("grant_code not found in P1")
 
-    print("\n  P2–P6 em paralelo ...")
+    logger.info("\n  P2–P6 em paralelo ...")
     t = time.time()
     r2, r3, r4, r5, r6 = await asyncio.gather(
         call_openai(client, inject_anchor(SYSTEM_PROMPT_2, notice_code), p2_chunks, "P2 Território+Fases",     P2_MODEL),
@@ -129,10 +132,10 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
         call_openai(client, inject_anchor(SYSTEM_PROMPT_5, notice_code), p5_chunks, "P5 Despesas+Indicadores", P5_MODEL),
         call_openai(client, inject_anchor(SYSTEM_PROMPT_6, notice_code), p6_chunks, "P6 Documentos",           P6_MODEL),
     )
-    print(f"\n  Concluído em {time.time()-t:.1f}s")
+    logger.info(f"\n  Concluído em {time.time()-t:.1f}s")
 
     # Merge e normalização final
-    print("\n  Merge:")
+    logger.info("\n  Merge:")
     result = merge(r1, r2, r3, r4, r5, r6)
     result = normalize_grant_codes_json(result)
 
@@ -149,7 +152,7 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
 
     if p7_chunks:
         fields_before = _count_empty_fields(result)
-        print(f"\n  [P7] {len(annex_chunks)} Anexos + {len(body_chunks)} corpo | {fields_before} campos vazios")
+        logger.info(f"\n  [P7] {len(annex_chunks)} Anexos + {len(body_chunks)} corpo | {fields_before} campos vazios")
         json_completo = json.dumps(result, ensure_ascii=False, indent=2)
         empty_fields_str = ", ".join(f"`{c}`" for c in empty_fields) if empty_fields else "nenhum"
         system_p7 = (
@@ -178,19 +181,19 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
             result = normalize_grant_codes_json(result)
             fields_after = _count_empty_fields(result)
             if updated_fields:
-                print(f"  [P7] Aviso preencheu: {updated_fields}")
+                logger.info(f"  [P7] Aviso preencheu: {updated_fields}")
             if updated_lists:
-                print(f"  [P7] Listas atualizadas: {updated_lists}")
-            print(f"  [P7] {fields_before - fields_after} campos Aviso preenchidos ({fields_after} ainda vazios)")
+                logger.info(f"  [P7] Listas atualizadas: {updated_lists}")
+            logger.info(f"  [P7] {fields_before - fields_after} campos Aviso preenchidos ({fields_after} ainda vazios)")
         else:
-            print("  [P7] Sem alterações — mantém resultado do merge")
+            logger.info("  [P7] Sem alterações — mantém resultado do merge")
 
         not_captured = r7.get("not_captured", []) if isinstance(r7, dict) else []
         if not_captured:
             result["Grant"]["to_explore"] = not_captured
-            print(f"  [P7] {len(not_captured)} temas para aprofundar → Grant.to_explore")
+            logger.info(f"  [P7] {len(not_captured)} temas para aprofundar → Grant.to_explore")
     else:
-        print("\n  [P7] Sem chunks relevantes — skipped")
+        logger.info("\n  [P7] Sem chunks relevantes — skipped")
 
     if extra:
         result.update(extra)
@@ -200,7 +203,7 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
 
     json_file = json_dir / f"{source}.json"
     json_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n  JSON guardado: {json_file}")
+    logger.info(f"\n  JSON guardado: {json_file}")
 
     return result
 

@@ -1,8 +1,10 @@
 """User service layer — operates on django.contrib.auth User."""
 
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
-from django.core.paginator import Paginator
+from django.db import IntegrityError, transaction
+from common.pagination import paginate_queryset
 from .models import UserProfile
 
 _VALID_ROLES = {UserProfile.ADMIN, UserProfile.COMMERCIAL, UserProfile.COMPOSER, UserProfile.CLIENT}
@@ -25,7 +27,8 @@ def get_all_users(role=None, active=True, filters=None, page=1, page_size=50) ->
     (e.g. {"profile__main_cae__startswith": "62"}).
     Returns {total, page, page_size, num_pages, users}.
     """
-    users = User.objects.all().order_by("id")
+    # select_related evita o N+1 do _serialize (1 query em vez de 1+N por página).
+    users = User.objects.select_related("profile").order_by("id")
     if active is not None:
         users = users.filter(is_active=active)
     if role:
@@ -33,16 +36,7 @@ def get_all_users(role=None, active=True, filters=None, page=1, page_size=50) ->
     if filters:
         users = users.filter(**filters)
 
-    total = users.count()
-    paginator = Paginator(users, page_size)
-    page_obj = paginator.get_page(page)
-    return {
-        "total": total,
-        "page": page_obj.number,
-        "page_size": page_size,
-        "num_pages": paginator.num_pages,
-        "users": [_serialize(u) for u in page_obj],
-    }
+    return paginate_queryset(users, page, page_size, _serialize, "users")
 
 
 def set_active(user_id: int, active: bool) -> bool | None:
@@ -81,13 +75,20 @@ def create_user(data) -> dict:
     if email and User.objects.filter(email=email).exists():
         raise ValueError("This email is already registered.")
 
-    user = User.objects.create_user(
-        username=username,
-        email=data.get("email"),
-        password=data.get("password"),
-    )
-    # The signal already creates the profile (client); apply role + entity fields
-    _apply_profile(user, data)
+    # Atómico: user + perfil criados juntos (nunca fica um user sem perfil aplicado).
+    # O IntegrityError cobre a corrida entre o .exists() acima e o create (usernames
+    # concorrentes) — vira 400 em vez de 500.
+    try:
+        with transaction.atomic():
+            user = User.objects.create_user(
+                username=username,
+                email=data.get("email"),
+                password=data.get("password"),
+            )
+            # The signal already creates the profile (client); apply role + entity fields
+            _apply_profile(user, data)
+    except IntegrityError:
+        raise ValueError("username already exists")
     return _serialize(user)
 
 
@@ -120,8 +121,12 @@ def update_user(user_id: int, data) -> dict | None:
     if data.get("password"):
         user.set_password(data["password"])
 
-    user.save()
-    _apply_profile(user, data)
+    try:
+        with transaction.atomic():
+            user.save()
+            _apply_profile(user, data)
+    except IntegrityError:
+        raise ValueError("username already exists")
     return _serialize(user)
 
 
@@ -154,9 +159,14 @@ def change_password(user_id: int, new_password, current_password=None, by_admin:
 
 
 def _validate_password(password) -> None:
-    """Password policy. For now: must have more than 8 characters."""
+    """Password policy: mais de 8 caracteres + AUTH_PASSWORD_VALIDATORS do Django
+    (rejeita passwords demasiado comuns, só numéricas, etc.)."""
     if password is None or len(password) <= _PASSWORD_MIN_LENGTH:
         raise ValueError("Password must have more than 8 characters.")
+    try:
+        validate_password(password)
+    except ValidationError as e:
+        raise ValueError("; ".join(e.messages))
 
 
 def _normalize_secondary_cae(value):

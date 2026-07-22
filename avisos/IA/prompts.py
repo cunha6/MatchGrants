@@ -576,6 +576,21 @@ REGRAS CRÍTICAS:
        {"nome": "«Repartição A»", "dotacao": "40.000.000,00"},
        {"nome": "«Repartição B»", "dotacao": "60.000.000,00"}
      ]
+
+   CASO FREQUENTE — REPARTIÇÃO POR TIPOLOGIA DE OPERAÇÃO (OBRIGATÓRIO CAPTURAR):
+   Quando a tabela de dotação reparte o orçamento por TIPOLOGIA DE OPERAÇÃO — normalmente uma
+   linha por tipologia, cada uma com o seu montante (ex: "«código+designação da tipologia 1» —
+   X€", "«tipologia 2» — Y€", "«tipologia 3» — Z€") — cada tipologia é UM sub-registo de
+   `distribuicao`: {"nome": <código E designação da tipologia, TAL COMO no aviso>,
+   "dotacao": <montante da tipologia, no formato do aviso>}. O `dotacao_orcamental` da linha
+   mantém-se o TOTAL (a soma); é PROIBIDO criar uma PhaseArea separada por cada tipologia — a
+   repartição por tipologia vive SEMPRE dentro de `distribuicao`. Exemplo de FORMA (placeholders
+   — usa os códigos/designações e montantes REAIS do aviso):
+     "distribuicao": [
+       {"nome": "«Tipologia 1 — descrição»", "dotacao": "6.000.000"},
+       {"nome": "«Tipologia 2 — descrição»", "dotacao": "2.000.000"},
+       {"nome": "«Tipologia 3 — descrição»", "dotacao": "600.000"}
+     ]
    CONSISTÊNCIA DOS NOMES (OBRIGATÓRIO): dentro do MESMO aviso, usa SEMPRE exatamente o MESMO
    `nome` para a mesma repartição em TODAS as linhas/fundos (mesma grafia, maiúsculas e acentos).
    Se numa linha escreves um rótulo, repete-o IGUAL nas outras — variações da mesma coisa (ex:
@@ -738,9 +753,11 @@ REGRAS (CRÍTICO):
    existir no texto, não deixes null; se só existir o limiar de repartição, deixa null (é
    preenchido no enriquecimento).
 
-8. AUTOFINANCIAMENTO: Extrai para `limite_autofinanciamento_exigido` a percentagem mínima
-   obrigatória de capitais próprios exigida ao promotor (ex: "mínimo de 5% de capitais
-   próprios"). Se houver fórmulas, ignora as fórmulas e foca-te apenas na percentagem fixa.
+8. AUTOFINANCIAMENTO: Extrai para `autofinanciamento_maximo` o valor MÁXIMO de autofinanciamento
+   (capitais próprios) do promotor — a percentagem ou montante mais alto que o texto admita/exija
+   como comparticipação própria (ex: "autofinanciamento até 60%", "capitais próprios no máximo de
+   X€"). Se o texto der um intervalo, usa o limite superior. Se houver fórmulas, ignora-as e
+   foca-te apenas no valor máximo fixo.
 
 9. TAXAS GEOGRÁFICAS E PRÉMIOS: Se a taxa base variar por região/ilha (ex: 50% S. Miguel,
    60% Corvo), detalha tudo em taxa_base. Se existirem prémios de realização (majorações
@@ -760,7 +777,7 @@ REGRA DE TIPAGEM — CRÍTICO:
    ERRADO:    "max_global_rate": "45.0"
    Esta regra aplica-se a: base_rate, regional_bonus, max_global_rate,
    minimis_accumulation_limit, budget_allocation, max_financing_rate,
-   minimum_investment, maximum_investment, required_self_financing_limit.
+   minimum_investment, maximum_investment, autofinanciamento_maximo.
    NUNCA uses aspas em valores que sejam Float no esquema.
 
 ESQUEMA DE DADOS ESPERADO:
@@ -769,7 +786,7 @@ ESQUEMA DE DADOS ESPERADO:
     "grant_code": "String",
     "minimum_investment": null,
     "maximum_investment": null,
-    "required_self_financing_limit": null,
+    "autofinanciamento_maximo": null,
     "state_aid_regime": "String ou null",
     "applicable_gber_article": "String ou null",
     "payment_methods": ["List de Strings com modalidades e condições detalhadas"],
@@ -891,6 +908,18 @@ REGRAS CRÍTICAS:
    c) Para cada pai de nível 2 com filhos, os critérios de nível 3.
    Só depois de teres o inventário completo começas a escrever o JSON.
 
+0a. ANEXO DOS CRITÉRIOS DE SELEÇÃO — PROCURA-O E LÊ-O (FONTE PRINCIPAL):
+   A grelha COMPLETA dos critérios de seleção (com os filhos, descrições e ponderações) está
+   muitas vezes num ANEXO próprio, e não no corpo do aviso. Identifica-o pelo CONTEÚDO do
+   título — "Critérios de Seleção", "Grelha de Avaliação", "Referencial de Mérito",
+   "Metodologia de Avaliação" — que costuma vir rotulado como "Anexo A.2", "Anexo A - 2" ou
+   semelhante (o rótulo VARIA de aviso para aviso; identifica pelo conteúdo, não pelo número).
+   Se esse anexo existir no texto recebido, é a FONTE PRINCIPAL da grelha: lê-o por inteiro e
+   preenche a partir dele os critérios de nível 1 e TODOS os filhos, com o rótulo
+   (criterion_name), a DESCRIÇÃO (o que cada critério avalia / como se pontua), o `weight`
+   (ponderação) e a `formula` de cada nível que tenha filhos. O corpo do aviso apenas
+   complementa (fórmula global, escala de pontos, critérios de desempate).
+
 0b. FÓRMULA ALGÉBRICA → PESOS RELATIVOS AO PAI DIRETO (CRÍTICO):
    Cada critério tem `weight` = o SEU coeficiente na sub-fórmula do PAI DIRETO × 100.
    - Nível 1 (MP = 0,2A + 0,3B + 0,1C + 0,4D): A=20, B=30, C=10, D=40 (o pai é o MP; somam 100).
@@ -966,9 +995,13 @@ REGRAS CRÍTICAS:
    ORDEM DE DECISÃO OBRIGATÓRIA:
    1) Existe fórmula explícita no texto (ex: "MP = 0,30A + 0,25B + 0,20C + 0,25D")? → copia-a
       EXATAMENTE.
-   2) Senão, os PESOS de nível 1 estão explícitos numa grelha/tabela? → constrói a fórmula
-      com esses pesos (coeficiente = peso/100).
-   3) Senão (nem fórmula nem pesos de nível 1 explícitos no documento) → `project_merit_formula` = null.
+   2) NÃO há linha "MP = …" escrita, MAS os critérios de nível 1 (A, B, C, D…) têm ponderações
+      /pesos numa grelha, tabela ou texto? → CONSTRÓI TU a fórmula a partir desses pesos:
+      MP = (pesoA/100)×A + (pesoB/100)×B + …
+      Ex: A=30, B=25, C=20, D=25  →  "MP = 0,30A + 0,25B + 0,20C + 0,25D".
+      É OBRIGATÓRIO construir o MP neste caso — NÃO deixes null quando existem as ponderações
+      dos critérios de nível 1, mesmo que o aviso nunca escreva a fórmula por extenso.
+   3) Só se NÃO houver fórmula NEM ponderações de nível 1 no documento → `project_merit_formula` = null.
    PROIBIDO ABSOLUTO — NÃO INVENTAR PESOS IGUAIS: nunca escrevas "MP = 0.25A + 0.25B + 0.25C
    + 0.25D" (ou qualquer distribuição uniforme) só porque existem N critérios de nível 1 e o
    documento não indica os pesos. A distribuição igualitária NUNCA se assume ao nível 1.

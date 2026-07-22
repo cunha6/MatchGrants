@@ -27,4 +27,10 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+# Produção: gunicorn (o docker-compose de dev sobrepõe este CMD com runserver+migrate).
+# Workers GTHREAD: o heartbeat corre no loop do processo, independente da duração dos
+# pedidos — o scrape dos avisos pode demorar 10, 30, 60+ minutos sem ser morto.
+# (Com workers `sync`, o --timeout mataria qualquer pedido mais longo que ele.)
+# O --timeout fica assim só para o que deve: recuperar workers realmente crashados.
+CMD ["gunicorn", "main.wsgi:application", "--bind", "0.0.0.0:8000", \
+     "--workers", "2", "--worker-class", "gthread", "--threads", "4", "--timeout", "120"]

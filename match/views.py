@@ -6,6 +6,8 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
+from users.models import UserProfile
+from users.permissions import require_role
 from .services import (
     NifMatchingService, NifValidationError, NifServiceError, MissingClientDataError,
     promote_viewer_to_client,
@@ -31,7 +33,12 @@ def evaluate_nif(request):
     mais informações: quando o nif.pt não traz CAE ou localização, a resposta 422 diz
     o que falta; o cliente reenvia o mesmo pedido já com esses campos preenchidos.
 
-    - 200: {company, nif, matches[]}
+    O viewer (lead) só é registado quando o pedido vem SEM autenticação — é aí que faz
+    sentido guardar quem consultou os apoios. Um utilizador autenticado (admin, composer…)
+    está a consultar, não a gerar lead: nesse caso `viewer_user_id` vem a None e nada é
+    escrito na BD.
+
+    - 200: {company, nif, viewer_user_id (None se autenticado), matches[]}
     - 400: NIF em falta, inválido, inexistente ou contribuinte inativo
     - 422: faltam dados obrigatórios -> {error, needs_more_info, missing_fields[]}
     - 502: falha de configuração/comunicação com a API externa
@@ -48,7 +55,11 @@ def evaluate_nif(request):
         "entity_type": data.get("entity_type"),
     }
     try:
-        result = NifMatchingService().evaluate(nif, overrides=overrides)
+        result = NifMatchingService().evaluate(
+            nif, overrides=overrides,
+            # Só quem NÃO está autenticado gera um viewer (lead).
+            create_viewer=not request.user.is_authenticated,
+        )
     except NifValidationError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
     except MissingClientDataError as exc:
@@ -63,11 +74,16 @@ def evaluate_nif(request):
 
 
 @csrf_exempt
+@require_role(UserProfile.ADMIN, UserProfile.COMMERCIAL)
 @require_http_methods(["POST"])
 def promote_viewer(request, nif):
     """POST /match/promote/<nif>/ -> promove o viewer existente a client (is_active=True).
 
+    Restrito a admin/commercial: promover ATIVA a conta (is_active=True) — aberto,
+    qualquer pessoa podia reativar contas desativadas.
+
     - 200: {user_id, nif, role, is_active, has_login}
+    - 401/403: sem sessão / sem permissão
     - 404: não existe nenhum viewer/registo com esse NIF
     """
     result = promote_viewer_to_client(str(nif).strip())

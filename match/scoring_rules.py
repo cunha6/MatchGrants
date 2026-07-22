@@ -12,16 +12,8 @@ fonte de dados das oportunidades.
 """
 
 import re
-import unicodedata
 
-
-def _normalize(text) -> str:
-    """minúsculas + sem acentos + espaços colapsados (para comparações tolerantes)."""
-    if text is None:
-        return ""
-    text = unicodedata.normalize("NFKD", str(text))
-    text = "".join(c for c in text if not unicodedata.combining(c))
-    return " ".join(text.lower().split())
+from common.text import normalize as _normalize
 
 
 # --- Matchers -------------------------------------------------------------
@@ -126,22 +118,43 @@ def match_location(client: dict, opportunity: dict) -> bool:
     return any(re.search(r"\b" + re.escape(token) + r"\b", text) for token in client_tokens)
 
 
+def _word_pattern(phrase: str) -> re.Pattern:
+    """Regex da frase por PALAVRAS INTEIRAS (plural 's' opcional em cada palavra).
+
+    Evita falsos positivos por substring — 'media' já não casa dentro de 'imediata',
+    nem 'cim' dentro de 'decimo' — que ativavam indevidamente o filtro rígido e
+    excluíam clientes elegíveis. Opera sobre texto normalizado (sem acentos)."""
+    words = [re.escape(w) + "s?" for w in phrase.split()]
+    return re.compile(r"\b" + r"\s+".join(words) + r"\b")
+
+
+# "micro" também aparece colado ("microempresas") — palavra única, precisa de padrão próprio.
+_MICRO_PAT = re.compile(r"\bmicro(empresas?)?\b")
+_PME_PAT = _word_pattern("pme")
+_PME_PHRASE_PAT = _word_pattern("pequenas e medias")
+_PEQUENA_PAT = _word_pattern("pequena")
+_MEDIA_PAT = _word_pattern("media")
+_GRANDE_PAT = _word_pattern("grande")
+_NAO_PME_PAT = _word_pattern("nao pme")
+
+# Padrões que indicam que a dimensão é admitida (por dimensão do cliente).
+_DIMENSION_MATCH_PATTERNS = {
+    "micro":   (_MICRO_PAT, _PME_PAT, _PME_PHRASE_PAT),
+    "pequena": (_PEQUENA_PAT, _PME_PAT, _PME_PHRASE_PAT),
+    "media":   (_MEDIA_PAT, _PME_PAT, _PME_PHRASE_PAT),
+    "grande":  (_GRANDE_PAT, _NAO_PME_PAT),
+}
+
+
 def match_dimension(client: dict, opportunity: dict) -> bool:
     """A dimensão da empresa do cliente é admitida nos critérios da oportunidade."""
     dimension = _normalize(client.get("dimension"))
     if not dimension:
         return False
 
-    # PME = micro + pequena + média
-    synonyms = {
-        "micro": ("micro", "microempresa", "pme"),
-        "pequena": ("pequena", "pequenas empresas", "pme"),
-        "media": ("media", "medias empresas", "pme"),
-        "grande": ("grande", "grandes empresas", "nao pme"),
-    }.get(dimension, (dimension,))
-
+    patterns = _DIMENSION_MATCH_PATTERNS.get(dimension, (_word_pattern(dimension),))
     text = opportunity.get("eligibility_text", "")
-    return any(syn in text for syn in synonyms)
+    return any(p.search(text) for p in patterns)
 
 
 # Sinónimos por tipo de beneficiário (texto normalizado, sem acentos). Fonte única usada
@@ -160,15 +173,27 @@ ENTITY_TYPE_SYNONYMS = {
     "ong":            ("ong", "organizacao nao governamental", "ipss", "sem fins lucrativos"),
 }
 
+# Padrões compilados (palavra inteira) por tipo — "micro" usa o padrão próprio para
+# apanhar também "microempresas"; os restantes vêm de _word_pattern(sinónimo).
+_ENTITY_TYPE_PATTERNS = {
+    etype: tuple(_MICRO_PAT if syn == "micro" else _word_pattern(syn) for syn in synonyms)
+    for etype, synonyms in ENTITY_TYPE_SYNONYMS.items()
+}
+
 
 def match_entity_type(client: dict, opportunity: dict) -> bool:
-    """O tipo/natureza da entidade do cliente é admitido nos critérios da oportunidade."""
+    """O tipo/natureza da entidade do cliente é admitido nos critérios da oportunidade.
+
+    Lê o `beneficiary_text` (destinatários finais + beneficiários por ação) — QUEM se pode
+    candidatar — e não o `eligibility_text`, que inclui as CONDIÇÕES legais. O boilerplate
+    "não ser uma empresa em dificuldade" fazia um aviso para entidades gestoras de resíduos
+    parecer um aviso para empresas."""
     entity_type = _normalize(client.get("entity_type"))
     if not entity_type:
         return False
-    synonyms = ENTITY_TYPE_SYNONYMS.get(entity_type, (entity_type,))
-    text = opportunity.get("eligibility_text", "")
-    return any(syn in text for syn in synonyms)
+    patterns = _ENTITY_TYPE_PATTERNS.get(entity_type, (_word_pattern(entity_type),))
+    text = opportunity.get("beneficiary_text", "")
+    return any(p.search(text) for p in patterns)
 
 
 # --- Classificação de dimensão (UE PME) -----------------------------------
@@ -191,11 +216,11 @@ def classify_dimension(employees, revenue) -> str | None:
         r = float(revenue) if revenue is not None else 0.0
     except (TypeError, ValueError):
         r = 0.0
-    if e < 10 and r <= 2_000_000:
+    if e < 10 and r <= 2000000:
         return "micro"
-    if e < 50 and r <= 10_000_000:
+    if e < 50 and r <= 10000000:
         return "pequena"
-    if e < 250 and r <= 50_000_000:
+    if e < 250 and r <= 50000000:
         return "media"
     return "grande"
 
@@ -210,15 +235,15 @@ def grant_allowed_dimensions(eligibility_text: str) -> set[str]:
     """
     t = eligibility_text or ""
     allowed: set[str] = set()
-    if "pme" in t or "pequenas e medias" in t:
+    if _PME_PAT.search(t) or _PME_PHRASE_PAT.search(t):
         allowed |= {"micro", "pequena", "media"}
-    if "micro" in t:
+    if _MICRO_PAT.search(t):
         allowed.add("micro")
-    if "pequena" in t:
+    if _PEQUENA_PAT.search(t):
         allowed.add("pequena")
-    if "media" in t:
+    if _MEDIA_PAT.search(t):
         allowed.add("media")
-    if "grande" in t or "nao pme" in t:
+    if _GRANDE_PAT.search(t) or _NAO_PME_PAT.search(t):
         allowed.add("grande")
     return allowed
 
@@ -251,23 +276,26 @@ def eligible_dimension(client: dict, opportunity: dict) -> bool:
     return dim in allowed
 
 
-def grant_allowed_entity_types(eligibility_text: str) -> set[str]:
-    """Tipos de beneficiário admitidos pelo aviso, lidos do texto de elegibilidade.
+def grant_allowed_entity_types(beneficiary_text: str) -> set[str]:
+    """Tipos de beneficiário admitidos pelo aviso, lidos do texto de QUEM SE PODE CANDIDATAR
+    (destinatários finais + beneficiários por ação) — nunca das condições legais.
 
     Conjunto vazio ⇒ o aviso não restringe o tipo (todos elegíveis). Usa os mesmos sinónimos
     do matcher — se o texto mencionar o tipo, considera-o admitido."""
-    t = eligibility_text or ""
+    t = beneficiary_text or ""
     allowed: set[str] = set()
-    for etype, synonyms in ENTITY_TYPE_SYNONYMS.items():
-        if any(syn in t for syn in synonyms):
+    for etype, patterns in _ENTITY_TYPE_PATTERNS.items():
+        if any(p.search(t) for p in patterns):
             allowed.add(etype)
     return allowed
 
 
 def eligible_entity_type(client: dict, opportunity: dict) -> bool:
     """OK se o aviso não restringe o tipo de beneficiário, se o tipo do cliente é admitido,
-    ou se o tipo do cliente é desconhecido (não dá para provar inelegibilidade)."""
-    allowed = grant_allowed_entity_types(opportunity.get("eligibility_text", ""))
+    ou se o tipo do cliente é desconhecido (não dá para provar inelegibilidade).
+
+    Lê de `beneficiary_text` (quem se pode candidatar), não do `eligibility_text` (condições)."""
+    allowed = grant_allowed_entity_types(opportunity.get("beneficiary_text", ""))
     if not allowed:
         return True
     etype = _normalize(client.get("entity_type"))

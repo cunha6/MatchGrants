@@ -361,7 +361,7 @@
     "financial_execution_targets": ["metas de execução", "taxa de execução", "execução financeira"],
     "state_aid_regime": ["auxílios de estado", "de minimis", "rgic", "651/2014"],
     "low_density_territories": ["baixa densidade", "territórios de baixa densidade"],
-    "required_self_financing_limit": ["capitais próprios", "autofinanciamento"],
+    "maximum_self_financing": ["capitais próprios", "autofinanciamento"],
     "maximum_investment": ["apoio máximo", "investimento máximo", "máximo por candidatura", "despesa elegível total", "inferior a", "milhões euros", "não pode exceder"],
     "minimum_investment": ["despesa elegível total", "mínimo de despesa", "investimento mínimo", "custo mínimo", "despesa elegível total de", "elegível total de"],
     "monitoring_indicators": ["indicadores de acompanhamento"],

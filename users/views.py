@@ -5,6 +5,7 @@ from django.core.cache import cache
 from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
+from common.pagination import parse_pagination
 from . import service
 from .models import UserProfile
 from .permissions import require_role, get_role
@@ -17,10 +18,6 @@ _CLIENT_ONLY_CREATORS = (UserProfile.COMMERCIAL, UserProfile.COMPOSER)
 # Login brute-force throttle (per username).
 _LOGIN_MAX_ATTEMPTS = 5
 _LOGIN_LOCK_SECONDS = 300
-
-# Pagination defaults.
-_DEFAULT_PAGE_SIZE = 50
-_MAX_PAGE_SIZE = 200
 
 # Filterable fields on the list -> ORM lookup.
 # main_cae uses a prefix match (first characters of the CAE are enough).
@@ -54,20 +51,6 @@ def _build_filters(request, allowed_fields) -> dict:
         else:
             filters[_FILTER_FIELDS[field]] = raw
     return filters
-
-
-def _pagination(request):
-    """Read ?page and ?page_size from the query string (clamped)."""
-    try:
-        page = max(1, int(request.GET.get("page", 1)))
-    except (TypeError, ValueError):
-        page = 1
-    try:
-        page_size = int(request.GET.get("page_size", _DEFAULT_PAGE_SIZE))
-    except (TypeError, ValueError):
-        page_size = _DEFAULT_PAGE_SIZE
-    page_size = max(1, min(page_size, _MAX_PAGE_SIZE))
-    return page, page_size
 
 
 def _payload(request):
@@ -121,7 +104,7 @@ def users_all(request):
     - Admin: filters by ?role= and ?active=true|false|all (default: active only) plus all fields.
     """
     try:
-        page, page_size = _pagination(request)
+        page, page_size = parse_pagination(request)
         if get_role(request.user) == UserProfile.COMMERCIAL:
             allowed = set(_FILTER_FIELDS) - {"address"}
             filters = _build_filters(request, allowed)
@@ -309,16 +292,7 @@ def users_change_password(request, user_id):
 @require_role(UserProfile.ADMIN)
 @require_http_methods(["DELETE"])
 def users_delete(request, user_id):
-
-    requester_role = get_role(request.user)
-    is_admin = (requester_role == UserProfile.ADMIN)
-
-    if not is_admin and request.user.id != int(user_id):
-        return JsonResponse(
-            {"error": "You do not have permission to delete users."},
-            status=403
-        )
-
+    """Soft-delete de um utilizador (is_active=False). Admin only — o decorator garante-o."""
     try:
         success = service.delete_user(user_id)
         if not success:

@@ -1,10 +1,15 @@
+import logging
 import re
+
+from django.db import transaction
 
 from .models import (
     Grant, BeneficiaryByAction, Phase, CoveredArea,
     PhaseArea, FinancingRate, ExpenseLimit, NonCompliancePenalty,
     EvaluationMethodology,
 )
+
+logger = logging.getLogger(__name__)  # 'avisos.db_service' → consola + logs/avisos.log
 
 # Campos cuja fonte de verdade é o scrape do HTML. A IA nunca os sobrescreve.
 _HTML_LOCKED_FIELDS = (
@@ -39,7 +44,7 @@ _GRANT_AI_FIELDS = [
     "dnsh_principle", "commitment_requirements", "total_allocation",
     "low_density_territories", "submission_limits", "absolute_execution_deadline",
     "financial_execution_targets", "minimum_investment", "maximum_investment",
-    "required_self_financing_limit", "state_aid_regime", "applicable_gber_article",
+    "maximum_self_financing", "state_aid_regime", "applicable_gber_article",
     "contact", "payment_methods", "project_selection_criteria", "eligible_expenses",
     "ineligible_expenses", "output_indicators", "result_indicators",
     "monitoring_indicators", "beneficiary_obligations", "communication_obligations",
@@ -94,6 +99,7 @@ def save_scraped_grant(grant_dict: dict, source: str) -> Grant | None:
     return grant
 
 
+@transaction.atomic
 def save_ai_grant(
     dados_ia: dict,
     scraping_url: str = "",
@@ -101,6 +107,8 @@ def save_ai_grant(
     markdown_path: str = "",
     force_overwrite: bool = False,
 ) -> Grant | None:
+    # Atómico: o delete+recreate das relações (fases, áreas, taxas…) nunca fica a meio —
+    # um erro faz rollback completo em vez de deixar o aviso sem filhos.
     aviso_data = dados_ia.get("Grant", {})
     grant_code = aviso_data.get("grant_code")
 
@@ -216,13 +224,13 @@ def save_ai_grant(
     ExpenseLimit.objects.bulk_create([
         ExpenseLimit(
             grant=grant,
-            expense_category=l.get("expense_category"),
-            applicable_ocs_methodology=l.get("applicable_ocs_methodology"),
-            max_absolute_value=l.get("max_absolute_value"),
-            max_percentage_value=l.get("max_percentage_value"),
-            calculation_base=l.get("calculation_base"),
-            specific_conditions=l.get("specific_conditions"),
-        ) for l in dados_ia.get("ExpenseLimit", [])
+            expense_category=lim.get("expense_category"),
+            applicable_ocs_methodology=lim.get("applicable_ocs_methodology"),
+            max_absolute_value=lim.get("max_absolute_value"),
+            max_percentage_value=lim.get("max_percentage_value"),
+            calculation_base=lim.get("calculation_base"),
+            specific_conditions=lim.get("specific_conditions"),
+        ) for lim in dados_ia.get("ExpenseLimit", [])
     ])
 
     NonCompliancePenalty.objects.bulk_create([
@@ -251,13 +259,34 @@ def save_ai_grant(
         ) for m in dados_ia.get("EvaluationMethodology", [])
     ])
 
-    # Pré-calcula o embedding da atividade do aviso, para o match semântico ficar SEMPRE pronto
-    # (não depende de correr `embed_grants` nem de o calcular à la carte no 1º match). Best-effort:
-    # sem OPENAI_API_KEY ou em falha, embed() devolve None e a gravação do aviso segue na mesma.
+    # Registo do que a IA gerou (auditável em logs/avisos.log): campos preenchidos vs vazios
+    # e contagem das entidades relacionadas. O JSON completo fica em output/json/<fonte>.json.
+    filled = [f for f in _GRANT_AI_FIELDS if getattr(grant, f, None) not in (None, [], "")]
+    empty = [f for f in _GRANT_AI_FIELDS if f not in filled]
+    logger.info(
+        "IA GEROU aviso %s (id=%s, url=%s): %d/%d campos preenchidos | vazios: %s | "
+        "fases=%d áreas=%d dotações=%d taxas=%d limites=%d penalizações=%d metodologias=%d "
+        "beneficiários=%d | markdown=%s",
+        grant.grant_code or "?", grant.pk, grant.scraping_url,
+        len(filled), len(_GRANT_AI_FIELDS), ", ".join(empty) or "nenhum",
+        len(dados_ia.get("phases", [])), len(dados_ia.get("CoveredArea", [])),
+        len(dados_ia.get("PhaseArea", [])), len(dados_ia.get("FinancingRate", [])),
+        len(dados_ia.get("ExpenseLimit", [])), len(dados_ia.get("NonCompliancePenalty", [])),
+        len(dados_ia.get("EvaluationMethodology", [])),
+        len(dados_ia.get("BeneficiaryByAction", [])),
+        markdown_path or grant.markdown_path,
+    )
+
+    # Pré-calcula os embeddings do aviso (um por tipo: GENERAL, SECTOR…), para o match
+    # semântico ficar SEMPRE pronto — o match só lê, nunca gera. Só chama a OpenAI para os
+    # tipos cujo texto mudou. Best-effort: sem OPENAI_API_KEY ou em falha, fica por gerar
+    # (o match cai para taxa+dotação) e a gravação do aviso segue na mesma.
+    # Import diferido: match.grant_embeddings importa avisos.models (evita import circular).
     try:
-        from match.embeddings import ensure_grant_embedding
-        ensure_grant_embedding(grant)
+        from match.grant_embeddings import save_grant_embeddings
+        save_grant_embeddings(grant)
     except Exception:
-        pass
+        logger.exception("Falha ao gerar os embeddings do aviso %s (segue sem semântica).",
+                         grant.grant_code or grant.pk)
 
     return grant

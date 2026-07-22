@@ -332,7 +332,7 @@ class Grant(_Base):
     # P3 — financeiro
     minimum_investment:                  CoercedFloat = Field(default=None, alias="investimento_minimo")
     maximum_investment:                  CoercedFloat = Field(default=None, alias="investimento_maximo")
-    required_self_financing_limit:       CoercedFloat = Field(default=None, alias="limite_autofinanciamento_exigido")
+    maximum_self_financing:              CoercedFloat = Field(default=None, alias="autofinanciamento_maximo")
     state_aid_regime:                    CoercedStr   = Field(default=None, alias="regime_auxilio_estado")
     applicable_gber_article:             CoercedStr   = Field(default=None, alias="artigo_rgbc_aplicavel")
     contact:                             CoercedList  = Field(default_factory=list, alias="contacto")

@@ -16,30 +16,10 @@ Funções puras (operam sobre listas de dicts) — sem ORM, fáceis de testar.
 """
 
 import re
-import unicodedata
 from datetime import datetime
 
-
-def _norm(text) -> str:
-    if not text:
-        return ""
-    t = unicodedata.normalize("NFKD", str(text))
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    return " ".join(t.lower().split())
-
-
-def _parse_dt(text):
-    """Converte uma data ISO-ish ('2026-04-30T15:00:00' ou '2026-04-30') em datetime, ou None."""
-    if not text:
-        return None
-    s = str(text).strip().replace("Z", "")
-    try:
-        return datetime.fromisoformat(s[:19])
-    except ValueError:
-        try:
-            return datetime.strptime(s[:10], "%Y-%m-%d")
-        except ValueError:
-            return None
+from common.text import normalize as _norm
+from common.dates import parse_datetime as _parse_dt
 
 
 def active_phase_id(phases: list[dict], now: datetime | None = None) -> int | None:

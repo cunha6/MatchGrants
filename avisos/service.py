@@ -7,9 +7,11 @@ consolidada > alteração > base), consolida diffs sobre o base quando necessár
 então corre o pipeline de extração uma única vez.
 """
 
+import logging
 import os
-import re
-from datetime import date, datetime
+from datetime import date
+
+from common.dates import parse_date as _parse_closing_date
 
 from .scrape_compete import scrape_compete2030_web
 from .scrape_portugal import scrape_portugal2030_web
@@ -22,9 +24,25 @@ from .documents import (
 )
 from .db_service import save_scraped_grant, save_ai_grant
 from .models import Grant, GrantDocument
+from .notifications import notify_grants
 
 # Tipos de documento que entram na seleção do canónico / consolidação
 _PRIMARY_TYPES = (BASE, REPUBLICATION, AMENDMENT, RECTIFICATION)
+
+logger = logging.getLogger(__name__)
+
+
+def _process_grant_safe(grant: dict, download_dir: str, source_label: str):
+    """`_process_grant` isolado por aviso: um erro (OpenAI, PDF corrompido, validação)
+    NÃO aborta o scrape inteiro — fica no log e o processamento continua no aviso seguinte."""
+    try:
+        return _process_grant(grant, download_dir, source_label)
+    except Exception:
+        logger.exception(
+            "Erro ao processar o aviso %r (%s) — a continuar com os seguintes.",
+            grant.get("grant_code") or grant.get("title"), source_label,
+        )
+        return None
 
 
 def _candidate_documents(grant: dict) -> list[dict]:
@@ -133,7 +151,7 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     # Rede de segurança: PDFs onde o texto cru saiu pobre (ex: capa mal extraída) e a Natureza
     # só ficou legível depois da conversão. Se for convite, ignoramos e apagamos os ficheiros.
     if text_is_invitation(canonical_md):
-        print(f"  [Convite] {source_name}: Natureza=convite — ignorado")
+        logger.info("[Convite] %s: Natureza=convite — ignorado", source_name)
         _discard_files(path, md_path)
         return None
 
@@ -155,11 +173,11 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
             bconv = pdf_to_markdown(bpath, download_dir) if bpath else None
             base_md = bconv[0] if bconv else None
         if base_md:
-            print(f"  [Consolidação] {source_name}: aplicar diff sobre base")
+            logger.info("[Consolidação] %s: aplicar diff sobre base", source_name)
             final_md = consolidate_markdowns(base_md, [canonical_md])
         else:
             needs_review = True
-            print(f"  [Consolidação] {source_name}: diff sem base — marcado needs_review")
+            logger.warning("[Consolidação] %s: diff sem base — marcado needs_review", source_name)
 
     # annex_documents: TODOS os documentos da página do aviso — apenas nome + url
     # no JSON de saída (não são descarregados, ficam só para referência).
@@ -189,67 +207,52 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     return grant_rec
 
 
-def _parse_closing_date(text) -> date | None:
-    """Interpreta a closing_date (texto livre) numa date, ou None se não der.
-    Aceita ISO (2026-09-30[T…]), DD/MM/AAAA e AAAA/MM/DD (com '/' ou '-')."""
-    if not text:
-        return None
-    s = str(text).strip()
-    try:
-        return datetime.fromisoformat(s[:19].replace("Z", "")).date()
-    except ValueError:
-        pass
-    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", s)   # DD/MM/AAAA
-    if m:
-        d, mo, y = (int(x) for x in m.groups())
-    else:
-        m = re.search(r"\b(\d{4})[/-](\d{1,2})[/-](\d{1,2})\b", s)   # AAAA/MM/DD
-        if not m:
-            return None
-        y, mo, d = (int(x) for x in m.groups())
-    try:
-        return date(y, mo, d)
-    except ValueError:
-        return None
-
-
 def deactivate_expired_grants(today: date | None = None) -> int:
     """Sincroniza Grant.active com a closing_date: terminados (data < hoje) → active=False;
     ainda a decorrer ou sem data legível → active=True (reativa se foi prorrogado). MANTÉM os
     ficheiros (PDF/markdown/JSON). Devolve o nº de registos cujo estado mudou."""
     today = today or date.today()
-    changed = 0
+    to_update = []
     for grant in Grant.objects.only("id", "closing_date", "active"):
         closing = _parse_closing_date(grant.closing_date)
         want_active = not (closing is not None and closing < today)
         if grant.active != want_active:
             grant.active = want_active
-            grant.save(update_fields=["active"])
-            changed += 1
-    if changed:
-        print(f"  [Avisos] {changed} aviso(s) mudaram de estado ativo/inativo (por data de fim).")
-    return changed
+            to_update.append(grant)
+    if to_update:
+        Grant.objects.bulk_update(to_update, ["active"])
+        logger.info("[Avisos] %d aviso(s) mudaram de estado ativo/inativo (por data de fim).",
+                    len(to_update))
+    return len(to_update)
+
+
+def _scrape(scraper, download_dir: str, source_label: str) -> list[dict]:
+    """Corre um scraper de fonte, processa cada aviso (isolado por erros), desativa os
+    terminados e envia UM email-resumo aos comerciais dos avisos processados (novos/atualizados).
+    Devolve os dicts de origem dos avisos processados (o que a rota expõe)."""
+    all_data = scraper()
+    new_grants, records = [], []
+    for g in all_data:
+        rec = _process_grant_safe(g, download_dir, source_label)
+        if rec:
+            new_grants.append(g)
+            records.append(rec)
+    deactivate_expired_grants()
+    if records:
+        notify_grants(records, action="adicionados ou atualizados")
+    return new_grants
 
 
 def scrape_compete() -> list[dict]:
-    all_data = scrape_compete2030_web()
-    new_grants = [g for g in all_data if _process_grant(g, "pdf_Avisos/compete", "compete")]
-    deactivate_expired_grants()
-    return new_grants
+    return _scrape(scrape_compete2030_web, "pdf_Avisos/compete", "compete")
 
 
 def scrape_portugal() -> list[dict]:
-    all_data = scrape_portugal2030_web()
-    new_grants = [g for g in all_data if _process_grant(g, "pdf_Avisos/portugal", "portugal")]
-    deactivate_expired_grants()
-    return new_grants
+    return _scrape(scrape_portugal2030_web, "pdf_Avisos/portugal", "portugal")
 
 
 def scrape_prr() -> list[dict]:
-    all_data = scrape_prr_web()
-    new_grants = [g for g in all_data if _process_grant(g, "pdf_Avisos/prr", "prr")]
-    deactivate_expired_grants()
-    return new_grants
+    return _scrape(scrape_prr_web, "pdf_Avisos/prr", "prr")
 
 
 def scrape_todos() -> dict:

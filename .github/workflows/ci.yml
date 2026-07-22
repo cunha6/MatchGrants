@@ -1,0 +1,51 @@
+# CI: lint (ruff) + testes (Django) em cada push/PR.
+# O job de testes usa Postgres com pgvector (a mesma imagem do docker-compose).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg15
+        env:
+          POSTGRES_DB: matchgrants
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-retries 10
+    env:
+      DB_NAME: matchgrants
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: localhost
+      DB_PORT: "5432"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      # docling puxa torch — a cache do pip evita re-descarregar em cada corrida.
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: coverage run manage.py test match users anuncios avisos --noinput
+      # Percentagem por ficheiro (linhas em falta incluídas) no log do CI.
+      - run: coverage report

@@ -1,13 +1,12 @@
 """
-Embeddings OpenAI para a procura semântica por atividade da empresa.
+Camada GENÉRICA de embeddings: falar com a API da OpenAI e comparar vetores.
 
-O embedding de cada aviso é caro de calcular repetidamente, por isso fica em CACHE no
-próprio Grant (campos `activity_embedding` + `activity_embedding_hash`): calcula-se uma vez
-e reutiliza-se; se o texto do aviso mudar, o hash deixa de bater e recalcula-se. No match,
-só se calcula 1 embedding novo — o da atividade do cliente.
+Responsabilidade única — não sabe o que é um aviso nem um anúncio. É a base partilhada por:
+  • `match/grant_embeddings.py`  → embeddings especializados dos avisos (GENERAL, SECTOR, …)
+  • `anuncios/embeddings.py`     → embeddings dos anúncios
 
-Degradação graciosa: sem OPENAI_API_KEY (ou em falha de rede), `embed`/`embed_many`
-devolvem None e o ranking simplesmente não usa relevância semântica (cai para taxa+dotação).
+Degradação graciosa: sem OPENAI_API_KEY (ou em falha de rede/API), as funções devolvem None
+e quem chama segue sem semântica (o ranking cai para os critérios não-semânticos).
 """
 
 import hashlib
@@ -32,8 +31,8 @@ def _get_client() -> OpenAI | None:
     return _client
 
 
-def embed(text: str) -> list[float] | None:
-    """Embedding de um texto (ou None se vazio / sem API / erro)."""
+def generate_embedding(text: str) -> list[float] | None:
+    """Vetor de um texto com o modelo `MODEL`. None se vazio / sem API / erro."""
     text = (text or "").strip()
     if not text:
         return None
@@ -47,8 +46,13 @@ def embed(text: str) -> list[float] | None:
         return None
 
 
+# Alias retrocompatível: `anuncios/embeddings.py` e código existente chamam `embed`.
+embed = generate_embedding
+
+
 def embed_many(texts: list[str]) -> list[list[float] | None]:
-    """Embeddings em lote (1 chamada). Entradas vazias → None na posição respetiva."""
+    """Embeddings de vários textos numa ÚNICA chamada à API (evita chamadas repetidas).
+    Entradas vazias → None na posição respetiva; a ordem do resultado espelha a entrada."""
     idx = [i for i, t in enumerate(texts) if (t or "").strip()]
     out: list[list[float] | None] = [None] * len(texts)
     if not idx:
@@ -85,17 +89,17 @@ def cosine(a, b) -> float:
 
 
 def text_hash(text: str) -> str:
-    """Hash estável do texto que foi embebido — deteta quando o aviso mudou."""
+    """Hash estável do texto embebido — deteta quando o texto mudou e força recálculo."""
     return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
 
 
 def semantic_search(queryset, query_text: str, field: str = "activity_embedding", k: int = 10):
     """Top-k registos do `queryset` semanticamente próximos de `query_text`, ordenados por
-    distância de cosseno CALCULADA NO POSTGRES (pgvector). Serve avisos e anúncios (qualquer
-    modelo com uma coluna VectorField). Devolve [] se não houver API para embutir a query.
+    distância de cosseno CALCULADA NO POSTGRES (pgvector). Serve qualquer modelo com uma
+    coluna VectorField. Devolve [] se não houver API para embutir a query.
     """
     from pgvector.django import CosineDistance
-    qvec = embed(query_text)
+    qvec = generate_embedding(query_text)
     if qvec is None:
         return []
     return list(
@@ -103,39 +107,3 @@ def semantic_search(queryset, query_text: str, field: str = "activity_embedding"
         .annotate(distance=CosineDistance(field, qvec))
         .order_by("distance")[:k]
     )
-
-
-def grant_embedding_text(grant) -> str:
-    """Texto representativo do aviso para a comparação semântica com o perfil do cliente.
-
-    Junta o que o aviso FINANCIA (título, objetivo, objetivo específico, tipologia, ações,
-    setores-alvo) + a sua abrangência (regiões elegíveis), para casar com a atividade E a
-    localização do cliente. Fica de fora a burocracia (elegibilidade formal, documentos).
-    """
-    parts = [
-        grant.title, grant.objective, grant.specific_objective,
-        grant.operation_typology, grant.covered_actions,
-    ]
-    parts += list(grant.target_technology_sectors or [])
-    if grant.eligible_regions:
-        parts.append("Regiões elegíveis: " + ", ".join(str(r) for r in grant.eligible_regions))
-    return "\n".join(str(p) for p in parts if p)
-
-
-def ensure_grant_embedding(grant):
-    """Embedding do aviso, da cache (Grant.activity_embedding) quando o texto não mudou;
-    senão calcula-o e persiste. Devolve o vetor ou None (sem API/erro).
-
-    Chamado ao GRAVAR o aviso (db_service) para que fique sempre pronto — assim o match não
-    depende de correr o comando `embed_grants` nem de calcular embeddings à la carte.
-    """
-    text = grant_embedding_text(grant)
-    h = text_hash(text)
-    if grant.activity_embedding is not None and grant.activity_embedding_hash == h:
-        return grant.activity_embedding
-    vec = embed(text)
-    if vec is not None:
-        grant.activity_embedding = vec
-        grant.activity_embedding_hash = h
-        grant.save(update_fields=["activity_embedding", "activity_embedding_hash"])
-    return vec

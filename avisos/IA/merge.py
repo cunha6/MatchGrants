@@ -1,8 +1,11 @@
 """Combina as respostas dos 6 prompts num único JSON e aplica correções pós-merge."""
 
+import logging
 import re
 
 from .pydantic_models import Grant, parse_p1, parse_p2, parse_p3, parse_p4, parse_p5, parse_p6
+
+logger = logging.getLogger(__name__)
 
 
 def _first_non_null(*dicts: dict) -> dict:
@@ -61,7 +64,7 @@ def merge(r1: dict, r2: dict, r3: dict, r4: dict, r5: dict, r6: dict) -> dict:
         "CoveredArea":            [a.model_dump() for a in areas],
         "PhaseArea":              [fa_item.model_dump() for fa_item in fa],
         "FinancingRate":          [t.model_dump() for t in rates],
-        "ExpenseLimit":           [l.model_dump() for l in limits],
+        "ExpenseLimit":           [lim.model_dump() for lim in limits],
         "NonCompliancePenalty":   [p.model_dump() for p in penalties],
         "EvaluationMethodology":  [m.model_dump() for m in methodologies],
     }
@@ -113,6 +116,6 @@ def merge(r1: dict, r2: dict, r3: dict, r4: dict, r5: dict, r6: dict) -> dict:
         ]
 
     filled_count = sum(1 for v in result["Grant"].values() if v not in (None, [], ""))
-    print(f"  Grant: {filled_count}/{len(result['Grant'])} campos preenchidos")
+    logger.info("Grant: %d/%d campos preenchidos", filled_count, len(result["Grant"]))
 
     return result

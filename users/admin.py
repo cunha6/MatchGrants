@@ -1,3 +1,1 @@
-from django.contrib import admin
-
-# Register your models here.
+# Sem modelos registados no Django admin (a gestão de utilizadores é feita pela API).

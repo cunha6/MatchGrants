@@ -7,10 +7,11 @@ from the listing. The tender-specifications download lives in specifications.py.
 """
 
 import os
+import logging
 import subprocess
 import sys
 import time
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import requests
@@ -18,8 +19,12 @@ from django.conf import settings
 from django.db import connection
 from django.db.models import Q
 
+from common.dates import parse_date as _parse_date
+from common.files import safe_media_path
 from .models import Notice
-from .specifications import build_chrome, fetch_specifications, normalize
+from .specifications import SPECS_DIR, build_chrome, fetch_specifications, normalize
+
+logger = logging.getLogger(__name__)
 
 API_URL = "https://www.base.gov.pt/APIBase2/GetInfoAnuncio"
 TIMEOUT = 30  # seconds
@@ -78,22 +83,6 @@ def _pick(raw: dict, *keys):
         v = low.get(k.lower())
         if v not in (None, ""):
             return v
-    return None
-
-
-def _parse_date(value):
-    if not value:
-        return None
-    s = str(value).strip()
-    try:
-        return datetime.fromisoformat(s).date()
-    except ValueError:
-        pass
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
     return None
 
 
@@ -263,7 +252,7 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
     try:
         for raw in raw_list:
             if should_stop and should_stop():
-                print("  [import_notices] cancelled (a new import started).")
+                logger.info("  [import_notices] cancelled (a new import started).")
                 break
             description = _pick(raw, "descricaoAnuncio", "DescricaoAnuncio") or ""
             if not matched_keywords(description):
@@ -288,16 +277,16 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
                 reused = existing_specifications_path(number)
                 if reused:
                     data["specifications_path"] = reused
-                    print(f"  [{number}] Specifications already downloaded -> {os.path.basename(reused)}")
+                    logger.info(f"  [{number}] Specifications already downloaded -> {os.path.basename(reused)}")
                 elif data["procedure_documents_url"]:
-                    print(f"  [{number}] Looking for specifications...")
+                    logger.info(f"  [{number}] Looking for specifications...")
                     connection.close()  # avoid a stale DB connection during the long download
                     path = fetch_specifications(data["procedure_documents_url"], driver_factory=driver_factory)
                     data["specifications_path"] = path
-                    print(f"  [{number}] {'OK -> ' + os.path.basename(path) if path else 'No specifications found.'}")
+                    logger.info(f"  [{number}] {'OK -> ' + os.path.basename(path) if path else 'No specifications found.'}")
                 else:
                     data["specifications_path"] = ""
-                    print(f"  [{number}] No procedure-documents link.")
+                    logger.info(f"  [{number}] No procedure-documents link.")
 
             status = _upsert_notice(data)
             if status == "created":
@@ -311,6 +300,9 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
         if driver:
             driver.quit()
 
+    # Sincroniza o estado: qualquer anúncio cujo prazo de proposta já passou fica active=False.
+    deactivated = deactivate_expired()
+
     return {
         "num_days": num_days,
         "total_received": len(raw_list),
@@ -318,6 +310,7 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
         "created": created,
         "updated": updated,
         "unchanged": unchanged,
+        "deactivated_expired": deactivated,
     }
 
 
@@ -334,7 +327,7 @@ def download_missing_specifications() -> dict:
     )
     total = len(pending)
     downloaded = missing = 0
-    print(f"[backfill specs] {total} notices without specifications to process...")
+    logger.info(f"[backfill specs] {total} notices without specifications to process...")
 
     driver_cache = {}
 
@@ -348,22 +341,22 @@ def download_missing_specifications() -> dict:
         for pk, number, docs_url in pending:
             _heartbeat_lock()
             connection.close()  # avoid a stale DB connection during the long download
-            print(f"  [{number}] Looking for specifications...")
+            logger.info(f"  [{number}] Looking for specifications...")
             path = fetch_specifications(docs_url, driver_factory=driver_factory)
             if path:
                 Notice.objects.filter(pk=pk).update(specifications_path=path)
                 downloaded += 1
-                print(f"  [{number}] OK, saved -> {os.path.basename(path)}")
+                logger.info(f"  [{number}] OK, saved -> {os.path.basename(path)}")
             else:
                 missing += 1
-                print(f"  [{number}] No specifications found.")
+                logger.info(f"  [{number}] No specifications found.")
     finally:
         driver = driver_cache.get("driver")
         if driver:
             driver.quit()
         mark_import_end()
 
-    print(f"[backfill specs] done — downloaded: {downloaded}, missing: {missing}")
+    logger.info(f"[backfill specs] done — downloaded: {downloaded}, missing: {missing}")
     return {"pending": total, "downloaded": downloaded, "missing": missing}
 
 
@@ -523,8 +516,22 @@ def filter_notices(params):
     return qs.order_by(ORDERING.get(order_by, "-publication_date"))
 
 
+def serialize_notice_summary(n: Notice) -> dict:
+    """Resumo ENXUTO para a listagem (o front-end mostra só o essencial; o detalhe vem do
+    GET /anuncios/<id>/). Análogo ao resumo dos avisos."""
+    return {
+        "id": n.id,
+        "notice_number": n.notice_number,
+        "entity_name": n.entity_name,
+        "act_type": n.act_type,
+        "base_price": float(n.base_price) if n.base_price is not None else None,
+        "proposal_deadline": n.proposal_deadline.isoformat() if n.proposal_deadline else None,
+        "active": n.active,
+    }
+
+
 def serialize_notice(n: Notice) -> dict:
-    """Convert a Notice to a JSON-serializable dict."""
+    """Convert a Notice to a JSON-serializable dict (detalhe completo)."""
     return {
         "id": n.id,
         "notice_number": n.notice_number,
@@ -547,6 +554,12 @@ def serialize_notice(n: Notice) -> dict:
         "proposal_period_days": n.proposal_period_days,
         "procedure_documents_url": n.procedure_documents_url,
         "specifications_path": n.specifications_path,
+        # Link para abrir o caderno de encargos local (só se o ficheiro existir em disco).
+        # O front-end abre-o com target="_blank".
+        "specifications_url": (
+            f"/anuncios/{n.id}/specifications/"
+            if safe_media_path(n.specifications_path, SPECS_DIR) else None
+        ),
         "proposal_deadline": n.proposal_deadline.isoformat() if n.proposal_deadline else None,
         "active": n.active,
     }

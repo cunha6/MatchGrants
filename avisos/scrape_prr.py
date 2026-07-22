@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import shutil
@@ -12,6 +13,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://recuperarportugal.gov.pt"
 LIST_URL = f"{BASE_URL}/candidaturas-prr/#1624904725473-df8f5226-5d16/"
@@ -85,7 +88,7 @@ def _get_driver() -> WebDriver:
 
 def scrape_prr_web() -> list[dict]:
     all_data: list[dict] = []
-    print("A iniciar scraping do PRR...")
+    logger.info("A iniciar scraping do PRR...")
 
     driver = _open_grants()
     try:
@@ -103,12 +106,12 @@ def _open_grants() -> WebDriver:
 
     aberto_btn = wait.until(EC.element_to_be_clickable((By.ID, "aberto-btn")))
     aberto_btn.click()
-    print("Clicou em 'Abertos'")
+    logger.info("Clicou em 'Abertos'")
     time.sleep(1)
 
     pesquisar_btn = wait.until(EC.element_to_be_clickable((By.ID, "pesquisar-btn")))
     pesquisar_btn.click()
-    print("Clicou em 'Pesquisar Avisos'")
+    logger.info("Clicou em 'Pesquisar Avisos'")
     time.sleep(2)
 
     return driver
@@ -119,7 +122,9 @@ def _parse_grants(driver: WebDriver, all_data: list[dict]) -> None:
     panels = soup.find_all("div", class_="vc_tta-panel", attrs={"data-vc-content": ".vc_tta-panel-body"})
 
     for type_panel in panels:
-        grants_type = type_panel.find("span", class_="vc_tta-title-text").get_text(strip=True)
+        # Guard: sem o span do título (HTML mudou), segue com tipo vazio em vez de rebentar.
+        title_span = type_panel.find("span", class_="vc_tta-title-text")
+        grants_type = title_span.get_text(strip=True) if title_span else ""
 
         for grant_subdiv in type_panel.find_all("div", class_=["entidadespublicas", "empresaspublicas", "ben", "accordion"]):
             chev = grant_subdiv.find("div", id="prr-arrow-chev", class_="arrow-chev")
@@ -182,7 +187,7 @@ def _parse_grants(driver: WebDriver, all_data: list[dict]) -> None:
 
                     if last_doc_link is None and "ver documentação" in text.lower():
                         link = detail.find("a")
-                        last_doc_link = link["href"] if link else None
+                        last_doc_link = link.get("href") if link else None
 
                     if last_contact is None and "contacto para informações" in text.lower():
                         link = detail.find("a")
