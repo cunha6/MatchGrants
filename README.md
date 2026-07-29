@@ -30,7 +30,7 @@ passa os melhores por uma camada final de validação por LLM.
 | `avisos` | Avisos (`Grant`) e tabelas-filhas; scraping (Portugal/Compete/PRR); pipeline IA (P1–P7); embeddings; edição; serviço de PDFs. |
 | `match` | Motor de matching: nif.pt, elegibilidade (`scoring_rules`), relevância semântica, validação LLM. |
 | `anuncios` | Anúncios de contratação pública (`Notice`) + embeddings próprios. |
-| `users` | Perfis (`UserProfile`), papéis (admin/commercial/composer/client/viewer), permissões. |
+| `users` | Perfis (`UserProfile`), papéis (admin/commercial_grants/commercial_public/client/viewer), permissões. |
 | `common` | Utilitários partilhados: normalização de texto (`text`), datas (`dates`), CAE (`cae`), paginação (`pagination`), ficheiros (`files`). |
 
 ---
@@ -131,14 +131,31 @@ docker compose exec app python manage.py test
 
 ## Endpoints principais
 
+Especificação completa (todas as rotas, todos os métodos, corpo dos pedidos/respostas) em
+**[docs/openapi.yaml](docs/openapi.yaml)** — navegável em `/docs/` (Swagger UI) com a app a
+correr.
+
+As rotas de `avisos` e `anuncios` seguem a **mesma forma**, propositadamente — cada app tem um
+único recurso "raiz" (aviso / anúncio) com o mesmo conjunto de ações:
+
+| Ação | avisos | anuncios |
+|------|--------|----------|
+| Listar (paginado, filtros, `?q=`, `?order_by=`) | `GET /avisos/list/` | `GET /anuncios/list/` |
+| Opções dinâmicas dos filtros | — | `GET /anuncios/filters/` |
+| Detalhe | `GET /avisos/<id>/` | `GET /anuncios/<id>/` |
+| Editar | `PUT/PATCH /avisos/<id>/edit/` | `PUT/PATCH /anuncios/<id>/edit/` |
+| Documento(s) | `GET /avisos/<id>/document/` | `GET /anuncios/<id>/document/cadernoEncargos/`, `GET /anuncios/<id>/document/programaConcurso/` |
+| Disparar ingestão (scrape/import) | `POST /avisos/` (todas as fontes), `POST /avisos/compete/`, `POST /avisos/portugal/`, `POST /avisos/prr/` | `POST /anuncios/` (`?num_days=`, 15 por omissão) |
+
+Outras rotas:
+
 | Método | Rota | Descrição |
 |--------|------|-----------|
 | POST | `/match/evaluate-nif/` | Match de um NIF → avisos elegíveis ordenados. |
-| POST | `/match/promote/<nif>/` | Promove um *viewer* (lead) a *client* (admin/commercial). |
-| GET | `/avisos/list/` | Listagem paginada de avisos (filtros + `?order_by=`). |
-| PUT/PATCH | `/avisos/<id>/edit/` | Edição de um aviso (escalares + coleções). |
-| POST | `/avisos/`, `/compete/`, `/portugal/`, `/prr/` | Disparar scraping. |
-| GET | `/anuncios/…` | Anúncios de contratação pública. |
+| POST | `/match/promote/<nif>/` | Promove um *viewer* (lead) a *client* (admin/commercial_grants/commercial_public). |
+| GET | `/planned-grants/` | Avisos previstos (Plano Anual) a partir de hoje, paginados/ordenáveis. |
+| GET | `/planned-grants/sync/` | Sincroniza o Plano Anual a partir do Excel oficial. |
+| GET | `/news/weekly/` | Newsletter semanal (novos/atualizados avisos+anúncios, próximos avisos). |
 | — | `/users/…` | Gestão de utilizadores/perfis. |
 
 ---

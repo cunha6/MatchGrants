@@ -1,4 +1,5 @@
-"""Endpoints da app avisos: listagem/detalhe (público), edição (admin+commercial) e
+"""Endpoints da app avisos: listagem (exige sessão), detalhe (público — um aviso de cada vez,
+usado a partir do match sem login), edição (admin+commercial_grants+commercial_public) e
 scrape (aberto, para automação diária). As views são magras — a lógica vive em service/db."""
 
 import json
@@ -9,6 +10,7 @@ from datetime import date
 
 from django.core.exceptions import ValidationError
 from django.db import DataError, IntegrityError, transaction
+from django.db.models import Q
 from django.http import FileResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_POST
@@ -16,10 +18,12 @@ from django.views.decorators.http import require_http_methods, require_POST
 from common.dates import parse_date
 from common.files import safe_media_path
 from common.pagination import paginate
+from common.text import normalize as _normalize
 from users.models import UserProfile
 from users.permissions import require_role
 from . import service
 from match.ranking import _norm, max_financing_rate_from_rates
+from match.scoring_rules import eligible_cae, grant_allowed_dimensions
 from .models import FinancingRate, Grant, PhaseArea
 from .notifications import notify_grants
 
@@ -36,14 +40,18 @@ def _audit_value(value, limit: int = 300) -> str:
     s = repr(value)
     return s if len(s) <= limit else s[:limit] + "…[truncado]"
 
-# Editar um aviso (endpoint próprio) — só ADMIN e COMMERCIAL.
-_EDIT_ROLES = (UserProfile.ADMIN, UserProfile.COMMERCIAL)
+# Editar um aviso (endpoint próprio) — ADMIN + os dois comerciais (avisos é domínio de ambos:
+# COMMERCIAL_GRANTS é especialista, COMMERCIAL_PUBLIC acumula avisos+anúncios).
+_EDIT_ROLES = (UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC)
 
 # Campos NÃO editáveis (além da chave primária): são reescritos a cada processamento do
 # aviso — `annex_documents` vem fresco do scrape da página e `applicable_legislation` da
 # extração da IA. Editá-los à mão dava a ilusão de persistência: a alteração seria
-# silenciosamente descartada no próximo scrape/extração.
-_NON_EDITABLE_FIELDS = frozenset({"annex_documents", "applicable_legislation"})
+# silenciosamente descartada no próximo scrape/extração. `last_update_source`/`last_updated_by`
+# são geridos pelo próprio código (não pelo payload do cliente) — ver grants_edit.
+_NON_EDITABLE_FIELDS = frozenset({
+    "annex_documents", "applicable_legislation", "last_update_source", "last_updated_by",
+})
 
 # "Tudo menos o id" (e os campos regenerados acima): qualquer outro campo próprio do aviso
 # pode ser editado.
@@ -52,8 +60,9 @@ _EDITABLE_FIELDS = frozenset(
     if not f.primary_key and f.name not in _NON_EDITABLE_FIELDS
 )
 
-# Não expostos na resposta (vetor de embedding e o seu hash — ruído binário/interno).
-_DETAIL_SKIP = {"activity_embedding", "activity_embedding_hash"}
+# Não expostos na resposta tal-qual (vetor de embedding/hash — ruído binário/interno;
+# `last_updated_by` é uma FK — não serializável diretamente, tratada à parte em _grant_detail).
+_DETAIL_SKIP = {"activity_embedding", "activity_embedding_hash", "last_updated_by"}
 
 
 # --- Helpers de ranking/serialização ---------------------------------------
@@ -136,6 +145,9 @@ def _grant_detail(grant: Grant) -> dict:
     """Serialização COMPLETA do aviso (todos os campos + relações) para o GET de detalhe."""
     data = {f.name: getattr(grant, f.name)
             for f in grant._meta.fields if f.name not in _DETAIL_SKIP}
+    # Quem/o quê fez a última escrita: 'scrape' (pipeline) ou 'manual' (edição) + o utilizador,
+    # quando aplicável (username, não o objeto User — que não é serializável em JSON).
+    data["last_updated_by"] = grant.last_updated_by.username if grant.last_updated_by_id else None
     # `financing_rate` = valor EFETIVO (override manual ou calculado). `financing_rate_manual`
     # diz ao front-end se está fixado à mão (para o formulário mostrar "auto" vs valor fixo).
     data["financing_rate"] = _financing_rate(grant)
@@ -232,6 +244,48 @@ def _in_date_range(text, date_from, date_to) -> bool:
     return True
 
 
+def _cae_matches(grant: Grant, cae: str) -> bool:
+    """O CAE pesquisado é elegível no aviso, com a REGRA DO PREFIXO (reutiliza `match.eligible_cae`):
+    um aviso com incluído '55***' casa com '55849'; um com incluído '55847' NÃO casa com '55848'.
+    Aviso sem restrição de CAE casa com qualquer CAE."""
+    return eligible_cae(
+        {"cae_codes": [cae]},
+        {"included_caes": grant.included_caes or [], "excluded_caes": grant.excluded_caes or []},
+    )
+
+
+def _dimensions_match(grant: Grant, dims: set[str]) -> bool:
+    """O aviso admite alguma das dimensões pedidas. Reutiliza `grant_allowed_dimensions` sobre o
+    mesmo texto de elegibilidade do match (critérios de beneficiário + destinatários finais).
+    Aviso sem restrição de dimensão admite todas."""
+    text = _normalize(" | ".join(str(p) for p in (
+        list(grant.beneficiary_eligibility_criteria or []) + list(grant.final_recipients or [])
+    )))
+    allowed = grant_allowed_dimensions(text)
+    return not allowed or bool(dims & allowed)
+
+
+def _region_matches(grant: Grant, region: str) -> bool:
+    """A região pesquisada casa com as regiões elegíveis OU as áreas abrangidas do aviso
+    (contains bidirecional sobre texto normalizado). Aviso sem regiões nem áreas (âmbito não
+    restrito) casa com qualquer pesquisa."""
+    haystack = [_normalize(r) for r in (grant.eligible_regions or []) if r]
+    haystack += [_normalize(a.geographic_area) for a in grant.covered_areas.all() if a.geographic_area]
+    haystack = [h for h in haystack if h]
+    if not haystack:
+        return True
+    return any(region in h or h in region for h in haystack)
+
+
+def _dimension_params(request) -> set[str]:
+    """Dimensões pedidas em `?dimension=` — aceita repetido (?dimension=micro&dimension=media) e
+    separado por vírgulas (?dimension=micro,media). Normalizadas (micro/pequena/media/grande)."""
+    raw = []
+    for value in request.GET.getlist("dimension"):
+        raw += value.split(",")
+    return {_normalize(d) for d in raw if d.strip()}
+
+
 # Ordenações suportadas por ?order_by= (default: publication_recent). Cada uma dá (chave de
 # ordenação, reverse) sobre um "row" já calculado (ver grants_list) — nunca sobre a página
 # devolvida: a lista inteira que passa nos filtros é ordenada ANTES de paginar, por isso o
@@ -249,8 +303,16 @@ _ORDER_BY = {
 }
 
 
+@require_role(UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC,
+              UserProfile.CLIENT)
 def grants_list(request):
-    """Listagem PÚBLICA e ENXUTA dos avisos. Filtros opcionais:
+    """Listagem ENXUTA dos avisos — exige sessão (qualquer papel exceto viewer). Sem login só
+    se acede ao match e ao detalhe de UM aviso específico (grants_detail, esse sim público) —
+    nunca à listagem completa. Filtros opcionais:
+      ?q=                                               (pesquisa em código do aviso + título)
+      ?cae=                                             (CAE elegível — regra do prefixo: '55***' casa '55849')
+      ?region=                                          (região elegível OU área abrangida)
+      ?dimension=micro|pequena|media|grande            (repetível/CSV — avisos que admitem alguma delas)
       ?active=true|false|all
       ?publication_from=YYYY-MM-DD & ?publication_to=  (data de publicação)
       ?closing_from= & ?closing_to=                    (data final)
@@ -260,10 +322,18 @@ def grants_list(request):
       ?page= & ?page_size=                             (paginação, default 50, máx. 200)
     A ordenação é feita sobre TODOS os avisos que passam nos filtros, não só na página
     devolvida — o 1º resultado é sempre o de maior dotação/taxa (ou data mais próxima/recente)
-    do conjunto inteiro, independentemente de estar ou não na 1ª página por inserção na BD."""
+    do conjunto inteiro, independentemente de estar ou não na 1ª página por inserção na BD.
+    A pesquisa (`q`) filtra o QUERYSET INTEIRO no SQL, antes da paginação — pesquisa em TODOS
+    os avisos, não só na página devolvida. CAE/região/dimensão reutilizam as MESMAS regras de
+    elegibilidade do motor de match (prefixo de CAE, dimensões admitidas, região/área abrangida);
+    um aviso SEM restrição no critério filtrado casa com qualquer valor (é aberto a todos)."""
     qs = Grant.objects.filter(ai_processed=True).prefetch_related(
-        "phases", "phase_areas", "financing_rates",
+        "phases", "phase_areas", "financing_rates", "covered_areas",
     )
+    q = (request.GET.get("q") or "").strip()
+    if q:
+        qs = qs.filter(Q(grant_code__icontains=q) | Q(title__icontains=q))
+
     active = (request.GET.get("active") or "true").lower()
     if active == "true":
         qs = qs.filter(active=True)
@@ -281,6 +351,10 @@ def grants_list(request):
     close_from, close_to = parse_date(request.GET.get("closing_from")), parse_date(request.GET.get("closing_to"))
     rate_min = _float_param(request, "rate_min")
     rate_max = _float_param(request, "rate_max")
+    # Filtros de elegibilidade (aplicados em Python, com as regras do match).
+    cae = (request.GET.get("cae") or "").strip()
+    region = _normalize(request.GET.get("region"))
+    dimensions = _dimension_params(request)
     today = date.today()
 
     rows = []
@@ -288,6 +362,12 @@ def grants_list(request):
         if not _in_date_range(grant.publication_date, pub_from, pub_to):
             continue
         if not _in_date_range(grant.closing_date, close_from, close_to):
+            continue
+        if cae and not _cae_matches(grant, cae):
+            continue
+        if region and not _region_matches(grant, region):
+            continue
+        if dimensions and not _dimensions_match(grant, dimensions):
             continue
         rate = _financing_rate(grant)
         if rate_min is not None and (rate is None or rate < rate_min):
@@ -426,6 +506,13 @@ def grants_edit(request, pk):
             changes[f] = (old, data[f])
         setattr(grant, f, data[f])
 
+    # Qualquer escrita por este endpoint (escalares OU coleções) é uma edição MANUAL — marca a
+    # origem e quem a fez, para se distinguir do que o pipeline de scrape/IA grava.
+    is_write = bool(updated or collection_keys)
+    if is_write:
+        grant.last_update_source = Grant.SOURCE_MANUAL
+        grant.last_updated_by = request.user
+
     try:
         # Valida campos escalares alterados + constrói as linhas das coleções (sem tocar na BD).
         if updated:
@@ -436,7 +523,7 @@ def grants_edit(request, pk):
         prepared = {key: _prepare_collection_rows(grant, key, data[key]) for key in collection_keys}
         # Aplica tudo numa transação: escalares + substituição de cada coleção.
         with transaction.atomic():
-            if updated:
+            if is_write:
                 grant.save()
             for model, related, rows in prepared.values():
                 getattr(grant, related).all().delete()

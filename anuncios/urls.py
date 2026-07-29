@@ -3,10 +3,13 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
-    path("", views.list_notices, name="list_notices"),                       # LISTAGEM — pública
-    path("importar/", views.import_notices, {"num_days": 15}, name="import_notices"),
-    path("importar/<int:num_days>/", views.import_notices, name="import_notices_days"),
+    path("list/", views.list_notices, name="list_notices"),                  # LISTAGEM — exige sessão
+    path("filters/", views.notice_filters, name="notice_filters"),           # opções dos selects — exige sessão
     path("<int:pk>/edit/", views.notice_edit, name="notice_edit"),           # EDIÇÃO — admin/commercial (PUT/PATCH)
-    path("<int:pk>/specifications/", views.serve_notice_specifications, name="notice_specifications"),
-    path("<int:pk>/", views.notice_detail, name="notice_detail"),            # DETALHE — público
+    path("<int:pk>/document/cadernoEncargos/", views.serve_notice_specifications,
+        name="notice_specifications"),                                      # exige sessão
+    path("<int:pk>/document/programaConcurso/", views.serve_notice_program,
+        name="notice_program"),                                             # exige sessão
+    path("<int:pk>/", views.notice_detail, name="notice_detail"),            # DETALHE — exige sessão (não faz parte do match)
+    path("", views.import_notices, name="import_notices"),                   # importar — ABERTO (POST, ?num_days=), automação
 ]

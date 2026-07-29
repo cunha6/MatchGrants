@@ -11,8 +11,6 @@ A view limita-se a invocar `NifMatchingService().evaluate(nif)`.
 import logging
 import re
 import threading
-from datetime import date
-from decimal import Decimal, InvalidOperation
 
 import requests
 from django.conf import settings
@@ -87,26 +85,6 @@ def promote_viewer_to_client(nif: str) -> dict | None:
         "is_active": user.is_active,
         "has_login": user.has_usable_password(),
     }
-
-
-def _to_decimal(value):
-    """Converte o capital social (ex: '0.00') em Decimal; None se não der."""
-    if value in (None, ""):
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def _to_date(value):
-    """Converte a data de início de atividade (ISO) em date; None se ausente/inválida."""
-    if not value:
-        return None
-    try:
-        return date.fromisoformat(str(value)[:10])
-    except ValueError:
-        return None
 
 
 def _company_general_text(metadata: dict) -> str:
@@ -514,14 +492,20 @@ class NifMatchingService:
 
     @transaction.atomic
     def create_or_update_viewer(self, metadata: dict) -> User:
-        """Cria/atualiza um utilizador role=viewer com os dados do nif.pt.
+        """Cria/atualiza um utilizador role=viewer com os dados MÍNIMOS do lead.
 
         Idempotente pelo NIF: se já existir um perfil com o mesmo NIF, atualiza-o em
         vez de duplicar. O utilizador fica com username=NIF e password inutilizável
         (sem login até um admin definir credenciais).
+
+        Só grava dados DIRETOS do nif.pt (público) — NIF, CAE, natureza jurídica, atividade,
+        morada, NUTS, dimensão. Deliberadamente NÃO grava: tipo de entidade (é INFERIDO por
+        nós a partir do nome+natureza, não um campo do nif.pt), capital social, faturação/nº
+        empregados, nem contactos (email/telefone/site/fax) — quem faz o match sem login não
+        deixa esses dados na BD. (Um utilizador AUTENTICADO nunca chega a chamar este método —
+        ver `evaluate`.)
         """
         nif = metadata["nif"]
-        contacts = metadata.get("contacts") or {}
 
         profile = UserProfile.objects.filter(nif=nif).select_related("user").first()
         if profile:
@@ -540,36 +524,32 @@ class NifMatchingService:
             # antigas que possam não o ter.
             profile, _ = UserProfile.objects.get_or_create(user=user)
 
-        email = contacts.get("email")
-        if email and not user.email:
-            user.email = email
-            user.save(update_fields=["email"])
-
         main_cae = metadata.get("main_cae")
         profile.nif = nif
-        profile.entity_type = metadata.get("entity_type")
         # Dimensão do SQLite -> entity_size do perfil (mesmas choices). `or` preserva um
         # valor manual já existente quando a dimensão é desconhecida.
         profile.entity_size = metadata.get("dimension") or profile.entity_size
+        profile.activity = metadata.get("activity") or profile.activity
+        # CAE e natureza jurídica: campos DIRETOS do nif.pt (record["cae"] / structure.nature),
+        # não inferidos por nós — por isso entram, ao contrário de entity_type (esse é
+        # calculado por infer_entity_type a partir do nome + desta mesma natureza).
         if main_cae and len(main_cae) == 5:
             profile.main_cae = main_cae
         profile.secondary_cae = [c for c in (metadata.get("secondary_cae") or []) if len(str(c)) == 5]
-        profile.address = metadata.get("address") or profile.address
-        profile.region = metadata.get("region") or profile.region
         profile.nature = metadata.get("nature")
-        profile.activity = metadata.get("activity") or profile.activity
-        profile.capital = _to_decimal(metadata.get("capital"))
-        profile.capital_currency = metadata.get("capital_currency")
-        profile.phone = contacts.get("phone")
-        profile.website = contacts.get("website")
-        profile.fax = contacts.get("fax")
+        # Morada.
+        profile.address = metadata.get("address") or profile.address
         profile.city = metadata.get("city")
         profile.county = metadata.get("county")
         profile.parish = metadata.get("parish")
         profile.postal_code = metadata.get("postal_code")
-        incorporation = _to_date(metadata.get("start_date"))
-        if incorporation:
-            profile.incorporation_date = incorporation
+        # NUTS: a região é reaproveitada para guardar a NUTS II RESOLVIDA (nuts.json, a mesma
+        # que os avisos usam), não o texto bruto do nif.pt — cai para este só se a resolução
+        # de NUTS falhar (concelho não encontrado em nuts.json).
+        profile.region = (
+            metadata.get("nuts_ii_old") or metadata.get("nuts_ii") or metadata.get("region")
+            or profile.region
+        )
 
         # Role/estado: só aplica viewer+inativo a contas novas ou que ainda sejam viewer.
         # Um viewer promovido a client mantém o role e o is_active — uma nova avaliação

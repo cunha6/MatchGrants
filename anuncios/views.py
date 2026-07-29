@@ -23,11 +23,24 @@ logger = logging.getLogger(__name__)
 # Trilho de auditoria das edições de anúncios (quem alterou o quê) → consola + logs/anuncios.log.
 audit_logger = logging.getLogger("anuncios.audit")
 
-# Editar um anúncio — só ADMIN e COMMERCIAL (mesma regra dos avisos).
-_EDIT_ROLES = (UserProfile.ADMIN, UserProfile.COMMERCIAL)
+# Editar um anúncio — só ADMIN e COMMERCIAL_PUBLIC (é o comercial "dono" deste domínio;
+# COMMERCIAL_GRANTS não tem acesso a anúncios de todo).
+_EDIT_ROLES = (UserProfile.ADMIN, UserProfile.COMMERCIAL_PUBLIC)
 
-# "Tudo menos o id": qualquer campo próprio do anúncio pode ser editado, exceto a chave primária.
-_EDITABLE_FIELDS = frozenset(f.name for f in Notice._meta.fields if not f.primary_key)
+# Ver anúncios (listagem/detalhe/documentos) — admin, commercial_public e client. Anúncios não
+# têm relação nenhuma com o match: quem não tem login só acede ao match, nunca aos anúncios.
+_VIEW_ROLES = (UserProfile.ADMIN, UserProfile.COMMERCIAL_PUBLIC, UserProfile.CLIENT)
+
+# `last_update_source`/`last_updated_by` são geridos pelo próprio código (não pelo payload do
+# cliente) — ver notice_edit.
+_NON_EDITABLE_FIELDS = frozenset({"last_update_source", "last_updated_by"})
+
+# "Tudo menos o id" (e os campos regenerados acima): qualquer outro campo próprio do anúncio
+# pode ser editado.
+_EDITABLE_FIELDS = frozenset(
+    f.name for f in Notice._meta.fields
+    if not f.primary_key and f.name not in _NON_EDITABLE_FIELDS
+)
 
 
 def _audit_value(value, limit: int = 300) -> str:
@@ -38,15 +51,19 @@ def _audit_value(value, limit: int = 300) -> str:
 
 @csrf_exempt
 @require_POST
-def import_notices(request, num_days=15):
-    """Query the base.gov.pt API, filter by keywords and store notices in the DB.
+def import_notices(request):
+    """POST /anuncios/?num_days=N — query the base.gov.pt API, filter by keywords and store
+    notices in the DB. `num_days` é opcional (15 por omissão).
 
     POST only — it has side effects (writes to the DB and spawns the extraction process),
     so it must not be a safe GET. Registers the notices immediately (fast) and then kills
     any previous extraction and (re)launches the tender-specifications download in a
-    SEPARATE process (survives the runserver reloads). num_days comes from the route:
-    /anuncios/importar/ (15 by default) or /anuncios/importar/<n>/.
+    SEPARATE process (survives the runserver reloads).
     """
+    try:
+        num_days = int(request.GET.get("num_days", 15))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "'num_days' tem de ser um inteiro."}, status=400)
     try:
         # 1) Fast notice registration (no specifications download) — quick response.
         summary = services.import_notices(num_days, download_specs=False)
@@ -63,20 +80,34 @@ def import_notices(request, num_days=15):
         return JsonResponse({"error": str(e)}, status=500)
 
 
+@require_role(*_VIEW_ROLES)
 def list_notices(request):
-    """Listagem ENXUTA dos anúncios (não expirados), com filtros, ordenação e paginação.
+    """Listagem ENXUTA dos anúncios (não inativos por omissão), com pesquisa, filtros,
+    ordenação e paginação. Exige sessão — anúncios não fazem parte do match.
 
-    Query params: act_type, procedure_type, contract_type, order_by, page, page_size
-    (default 50, máx. 200). See services.filter_notices / services.ORDERING. O detalhe
-    completo vem de GET /anuncios/<id>/.
+    Query params: q (pesquisa em descrição/entidade/número — sobre TODOS os anúncios, não só a
+    página), status ('active'/'inactive'/'to_fix' — por omissão mostra ativos + por corrigir,
+    escondendo os inativos), act_type, procedure_type, contract_type, order_by, page, page_size
+    (default 50, máx. 200). See services.filter_notices / services.ORDERING. O detalhe completo
+    vem de GET /anuncios/<id>/.
     """
     qs = services.filter_notices(request.GET)
     payload = paginate(request, qs, services.serialize_notice_summary, items_key="notices")
     return JsonResponse(payload, json_dumps_params={"ensure_ascii": False, "indent": 2})
 
 
+@require_role(*_VIEW_ROLES)
+def notice_filters(request):
+    """GET /anuncios/filters/ — valores de act_type/contract_types REALMENTE presentes entre os
+    anúncios navegáveis, para popular os selects de filtro dinamicamente (nunca uma opção sem
+    resultados, nunca um valor novo em falta). Exige sessão."""
+    return JsonResponse(services.filter_options(), json_dumps_params={"ensure_ascii": False, "indent": 2})
+
+
+@require_role(*_VIEW_ROLES)
 def notice_detail(request, pk):
-    """Detalhe COMPLETO de um anúncio (público)."""
+    """Detalhe COMPLETO de um anúncio. Exige sessão — ao contrário dos avisos, os anúncios não
+    são acedidos a partir do match, por isso não há aqui exceção para quem não tem login."""
     notice = Notice.objects.filter(pk=pk).first()
     if notice is None:
         return JsonResponse({"error": "Anúncio não encontrado."}, status=404)
@@ -112,6 +143,10 @@ def notice_edit(request, pk):
             changes[f] = (old, data[f])
         setattr(notice, f, data[f])
     if updated:
+        # Qualquer escrita por este endpoint é uma edição MANUAL — marca a origem e quem a fez,
+        # para se distinguir do que a importação (base.gov.pt) grava.
+        notice.last_update_source = Notice.SOURCE_MANUAL
+        notice.last_updated_by = request.user
         try:
             # Valida SÓ os campos alterados (400 com detalhe, em vez de 500): campos não
             # tocados ficam de fora — registos antigos podem ter valores que já não validam.
@@ -153,15 +188,28 @@ def notice_edit(request, pk):
     )
 
 
-def serve_notice_specifications(request, pk):
-    """Serve o caderno de encargos (pdf_Anuncios, de specifications_path) para abrir no browser
-    (inline). Público. O front-end liga a este URL com target=\"_blank\"."""
-    notice = Notice.objects.filter(pk=pk).only("id", "specifications_path").first()
+def _serve_notice_document(pk, field: str, missing_msg: str):
+    """Serve um documento local do anúncio (o campo `field` guarda o caminho relativo, sob
+    pdf_Anuncios/) para abrir no browser (inline). Base comum ao caderno de encargos e ao
+    programa de concurso — o front-end liga a estes URLs com target=\"_blank\"."""
+    notice = Notice.objects.filter(pk=pk).only("id", field).first()
     if notice is None:
         return JsonResponse({"error": "Anúncio não encontrado."}, status=404)
-    path = safe_media_path(notice.specifications_path, _ANUNCIOS_DIR)
+    path = safe_media_path(getattr(notice, field), _ANUNCIOS_DIR)
     if not path:
-        return JsonResponse({"error": "Caderno de encargos não disponível."}, status=404)
+        return JsonResponse({"error": missing_msg}, status=404)
     ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
     return FileResponse(open(path, "rb"), content_type=ctype,
                         as_attachment=False, filename=os.path.basename(path))
+
+
+@require_role(*_VIEW_ROLES)
+def serve_notice_specifications(request, pk):
+    """Serve o caderno de encargos (de specifications_path). Exige sessão."""
+    return _serve_notice_document(pk, "specifications_path", "Caderno de encargos não disponível.")
+
+
+@require_role(*_VIEW_ROLES)
+def serve_notice_program(request, pk):
+    """Serve o programa de concurso (de program_path). Exige sessão."""
+    return _serve_notice_document(pk, "program_path", "Programa de concurso não disponível.")

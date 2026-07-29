@@ -503,6 +503,34 @@ class ViewerCreationTests(TestCase):
         self.assertFalse(UserProfile.objects.filter(nif="500829993").exists())
         self.assertFalse(User.objects.filter(username="500829993").exists())
 
+    def test_anonymous_match_saves_only_minimal_fields(self):
+        # Sem login: só dados DIRETOS do nif.pt (NIF, CAE, natureza, atividade, morada) +
+        # NUTS (resolvida) + dimensão. NADA de tipo de entidade (é INFERIDO por nós, não um
+        # campo do nif.pt), capital social, faturação/nº empregados, ou contactos.
+        with self.fetch, self.vectors:
+            NifMatchingService().evaluate("500829993", create_viewer=True)
+        profile = UserProfile.objects.get(nif="500829993")
+
+        # Guardados — campos DIRETOS do nif.pt.
+        self.assertEqual(profile.activity, "Consultadoria de gestão")
+        self.assertEqual(profile.address, "Rua X")
+        self.assertEqual(profile.city, "Porto")
+        self.assertEqual(profile.main_cae, "70220")
+        self.assertEqual(profile.nature, "LDA")
+        # NUTS: a região resolvida (nuts.json a partir da cidade/concelho), não o texto bruto
+        # do nif.pt ("Norte" vindo de geo.region coincide aqui, mas a fonte é a NUTS resolvida).
+        self.assertEqual(profile.region, "Norte")
+
+        # NÃO guardados — entity_type é INFERIDO (não um campo do nif.pt); capital/contactos
+        # ficam fora por decisão de minimização, mesmo vindo do nif.pt.
+        self.assertIsNone(profile.entity_type)
+        self.assertIsNone(profile.capital)
+        self.assertIsNone(profile.phone)
+        self.assertIsNone(profile.website)
+        self.assertIsNone(profile.fax)
+        user = User.objects.get(username="500829993")
+        self.assertEqual(user.email, "")
+
     def test_authenticated_match_does_not_touch_existing_profile(self):
         # Um perfil já existente não pode ser alterado por um match de um admin.
         user = User.objects.create_user("cliente_x", password="Xk93!vTq21mZ")

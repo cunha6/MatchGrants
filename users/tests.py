@@ -15,7 +15,7 @@ class UserCreateSecurityTests(TestCase):
 
         # 2. Commercial
         self.commercial_user = User.objects.create_user(username="commercial_creator", password="123", email="com@mail.com")
-        UserProfile.objects.filter(user=self.commercial_user).update(role=UserProfile.COMMERCIAL)
+        UserProfile.objects.filter(user=self.commercial_user).update(role=UserProfile.COMMERCIAL_GRANTS)
 
         # 3. Client
         self.client_user = User.objects.create_user(username="normal_client", password="123", email="client@mail.com")
@@ -90,7 +90,7 @@ class UserCreateSecurityTests(TestCase):
             "username": "new_commercial",
             "password": "strongPassword123",  # Fixed: Needs > 8 characters
             "email": "commercial@mail.com",
-            "role": UserProfile.COMMERCIAL,
+            "role": UserProfile.COMMERCIAL_GRANTS,
         }
 
         response = self.client.post(
@@ -102,7 +102,7 @@ class UserCreateSecurityTests(TestCase):
         self.assertEqual(response.status_code, 201)
 
         new_user = User.objects.get(username="new_commercial")
-        self.assertEqual(new_user.profile.role, UserProfile.COMMERCIAL)
+        self.assertEqual(new_user.profile.role, UserProfile.COMMERCIAL_GRANTS)
 
     # --- TEST 5: Public Rule (No Login -> Forces Client) ---
     def test_public_user_is_forced_to_client_role(self):
@@ -256,7 +256,7 @@ class UserUpdateSecurityTests(TestCase):
 
         payload = {
             "address": "Address Edited By Admin",
-            "role": UserProfile.COMPOSER,
+            "role": UserProfile.COMMERCIAL_PUBLIC,
         }
         response = self.client.put(
             self._update_url(self.target_user.id),
@@ -268,7 +268,7 @@ class UserUpdateSecurityTests(TestCase):
 
         self.target_user.profile.refresh_from_db()
         self.assertEqual(self.target_user.profile.address, "Address Edited By Admin")
-        self.assertEqual(self.target_user.profile.role, UserProfile.COMPOSER)
+        self.assertEqual(self.target_user.profile.role, UserProfile.COMMERCIAL_PUBLIC)
 
     # --- TEST 5: Unauthenticated User ---
     def test_unauthenticated_user_cannot_update(self):
@@ -355,7 +355,7 @@ class UserDeleteSecurityTests(TestCase):
 
         # 3. Commercial
         self.commercial_user = User.objects.create_user(username="commercial_delete", password="123")
-        UserProfile.objects.filter(user=self.commercial_user).update(role=UserProfile.COMMERCIAL)
+        UserProfile.objects.filter(user=self.commercial_user).update(role=UserProfile.COMMERCIAL_GRANTS)
 
         self.base_url = "/users/"
 
@@ -511,11 +511,15 @@ class UserActivateAndMeTests(TestCase):
         UserProfile.objects.filter(user=self.admin_user).update(role=UserProfile.ADMIN)
 
         self.commercial_user = User.objects.create_user(username="comm_act", password="123", email="c@act.com")
-        UserProfile.objects.filter(user=self.commercial_user).update(role=UserProfile.COMMERCIAL)
+        UserProfile.objects.filter(user=self.commercial_user).update(role=UserProfile.COMMERCIAL_GRANTS)
 
-        # User already deactivated (soft-deleted)
+        # User already deactivated (soft-deleted) — role=client, o que o commercial pode gerir.
         self.inactive_user = User.objects.create_user(username="inactive_usr", password="123", email="i@act.com", is_active=False)
         UserProfile.objects.filter(user=self.inactive_user).update(role=UserProfile.CLIENT)
+
+        # Outro admin, também inativo — fora do alcance do commercial (só viewer/client).
+        self.inactive_admin = User.objects.create_user(username="inactive_admin", password="123", email="ia@act.com", is_active=False)
+        UserProfile.objects.filter(user=self.inactive_admin).update(role=UserProfile.ADMIN)
 
         self.base_url = "/users/"
 
@@ -526,7 +530,7 @@ class UserActivateAndMeTests(TestCase):
         response = self.client.get(f"{self.base_url}me/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["username"], "comm_act")
-        self.assertEqual(response.json()["role"], UserProfile.COMMERCIAL)
+        self.assertEqual(response.json()["role"], UserProfile.COMMERCIAL_GRANTS)
 
     def test_me_requires_authentication(self):
         response = self.client.get(f"{self.base_url}me/")
@@ -553,12 +557,28 @@ class UserActivateAndMeTests(TestCase):
         self.inactive_user.refresh_from_db()
         self.assertTrue(self.inactive_user.is_active)
 
-    def test_non_admin_cannot_reactivate(self):
+    def test_commercial_can_reactivate_client(self):
+        # Novo: "editar... Utilizadores do tipo Viewer e Client" inclui reativar.
         self.client.login(username="comm_act", password="123")
+        response = self.client.post(f"{self.base_url}{self.inactive_user.id}/activate/")
+        self.assertEqual(response.status_code, 200)
+        self.inactive_user.refresh_from_db()
+        self.assertTrue(self.inactive_user.is_active)
+
+    def test_commercial_cannot_reactivate_admin(self):
+        self.client.login(username="comm_act", password="123")
+        response = self.client.post(f"{self.base_url}{self.inactive_admin.id}/activate/")
+        self.assertEqual(response.status_code, 403)
+        self.inactive_admin.refresh_from_db()
+        self.assertFalse(self.inactive_admin.is_active)  # Remains inactive
+
+    def test_client_cannot_reactivate_anyone(self):
+        User.objects.create_user(username="cli_act", password="123", email="cl@act.com")
+        self.client.login(username="cli_act", password="123")
         response = self.client.post(f"{self.base_url}{self.inactive_user.id}/activate/")
         self.assertEqual(response.status_code, 403)
         self.inactive_user.refresh_from_db()
-        self.assertFalse(self.inactive_user.is_active)  # Remains inactive
+        self.assertFalse(self.inactive_user.is_active)
 
 
 class UserListFilterTests(TestCase):
@@ -568,18 +588,19 @@ class UserListFilterTests(TestCase):
         self.admin = User.objects.create_user(username="adm_f", password="123", email="a@f.com")
         UserProfile.objects.filter(user=self.admin).update(role=UserProfile.ADMIN)
         self.commercial = User.objects.create_user(username="comm_f", password="123", email="c@f.com")
-        UserProfile.objects.filter(user=self.commercial).update(role=UserProfile.COMMERCIAL)
+        UserProfile.objects.filter(user=self.commercial).update(role=UserProfile.COMMERCIAL_GRANTS)
 
-        def make_client(username, main_cae, region, address):
+        def make_user(username, role, main_cae, region, address):
             u = User.objects.create_user(username=username, password="123", email=f"{username}@f.com")
             UserProfile.objects.filter(user=u).update(
-                role=UserProfile.CLIENT, main_cae=main_cae, region=region, address=address,
+                role=role, main_cae=main_cae, region=region, address=address,
             )
             return u
 
-        self.ca = make_client("client_a", "62010", "Norte", "Street A")
-        self.cb = make_client("client_b", "62020", "Sul", "Street B")
-        self.cc = make_client("client_c", "47110", "Norte", "Street C")
+        # viewer (lead do match sem login) e client — os dois tipos que o commercial gere.
+        self.ca = make_user("client_a", UserProfile.VIEWER, "62010", "Norte", "Street A")
+        self.cb = make_user("client_b", UserProfile.CLIENT, "62020", "Sul", "Street B")
+        self.cc = make_user("client_c", UserProfile.VIEWER, "47110", "Norte", "Street C")
 
         self.base_url = "/users/"
 
@@ -597,13 +618,39 @@ class UserListFilterTests(TestCase):
         resp = self.client.get(f"{self.base_url}?main_cae=62010")
         self.assertEqual(self._usernames(resp), {"client_a"})
 
-    # --- commercial only sees clients (never admin/commercial) ---
-    def test_commercial_only_sees_clients(self):
+    # --- commercial sees viewer AND client (never admin/commercial/superuser) ---
+    def test_commercial_sees_viewers_and_clients(self):
         self.client.login(username="comm_f", password="123")
         names = self._usernames(self.client.get(f"{self.base_url}"))
         self.assertNotIn("adm_f", names)
         self.assertNotIn("comm_f", names)
+        # client_a/client_c são viewer, client_b é client — os três aparecem.
         self.assertEqual(names, {"client_a", "client_b", "client_c"})
+
+    def test_commercial_sees_inactive_viewers(self):
+        # Os viewers criados pelo match sem login ficam is_active=False — o commercial tem de
+        # os ver mesmo assim (é precisamente a lista de leads a converter).
+        self.ca.is_active = False
+        self.ca.save(update_fields=["is_active"])
+        self.client.login(username="comm_f", password="123")
+        names = self._usernames(self.client.get(f"{self.base_url}"))
+        self.assertIn("client_a", names)
+
+    def test_commercial_never_sees_superuser_even_with_matching_role(self):
+        # Um superuser tem profile.role='client' por omissão (o signal não o promove) — sem a
+        # exclusão explícita, calharia dentro de qualquer filtro por role. Aqui simula-se o caso
+        # mais direto: um superuser cujo profile.role foi posto a 'viewer'.
+        su = User.objects.create_superuser(username="root_f", password="123", email="r@f.com")
+        UserProfile.objects.filter(user=su).update(role=UserProfile.VIEWER)
+        self.client.login(username="comm_f", password="123")
+        names = self._usernames(self.client.get(f"{self.base_url}"))
+        self.assertNotIn("root_f", names)
+
+    def test_admin_sees_superuser(self):
+        User.objects.create_superuser(username="root_f2", password="123", email="r2@f.com")
+        self.client.login(username="adm_f", password="123")
+        names = self._usernames(self.client.get(f"{self.base_url}"))
+        self.assertIn("root_f2", names)
 
     # --- commercial CANNOT filter by address (param ignored) ---
     def test_commercial_cannot_filter_by_address(self):
@@ -623,7 +670,78 @@ class UserListFilterTests(TestCase):
         self.client.login(username="comm_f", password="123")
         resp = self.client.get(f"{self.base_url}?region=Norte")
         self.assertEqual(self._usernames(resp), {"client_a", "client_c"})
-        
+
+    # --- detail endpoint: mesma regra (commercial só vê viewer, nunca superuser) ---
+    def test_commercial_can_view_viewer_detail(self):
+        self.client.login(username="comm_f", password="123")
+        resp = self.client.get(f"{self.base_url}{self.ca.id}/")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_commercial_cannot_view_admin_detail(self):
+        self.client.login(username="comm_f", password="123")
+        resp = self.client.get(f"{self.base_url}{self.admin.id}/")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_commercial_cannot_view_superuser_detail_even_as_viewer_role(self):
+        su = User.objects.create_superuser(username="root_f3", password="123", email="r3@f.com")
+        UserProfile.objects.filter(user=su).update(role=UserProfile.VIEWER)
+        self.client.login(username="comm_f", password="123")
+        resp = self.client.get(f"{self.base_url}{su.id}/")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_commercial_can_view_client_detail(self):
+        self.client.login(username="comm_f", password="123")
+        resp = self.client.get(f"{self.base_url}{self.cb.id}/")
+        self.assertEqual(resp.status_code, 200)
+
+    # --- update endpoint: commercial edita viewer/client de outrem, mas não o próprio role ---
+    def test_commercial_can_update_client_profile(self):
+        self.client.login(username="comm_f", password="123")
+        resp = self.client.put(
+            f"{self.base_url}{self.cb.id}/update/",
+            data=json.dumps({"address": "Rua Nova"}), content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.cb.profile.refresh_from_db()
+        self.assertEqual(self.cb.profile.address, "Rua Nova")
+
+    def test_commercial_cannot_change_role_via_update(self):
+        self.client.login(username="comm_f", password="123")
+        self.client.put(
+            f"{self.base_url}{self.cb.id}/update/",
+            data=json.dumps({"role": UserProfile.ADMIN}), content_type="application/json",
+        )
+        self.cb.profile.refresh_from_db()
+        self.assertEqual(self.cb.profile.role, UserProfile.CLIENT)  # ignorado
+
+    def test_commercial_cannot_update_admin_profile(self):
+        self.client.login(username="comm_f", password="123")
+        resp = self.client.put(
+            f"{self.base_url}{self.admin.id}/update/",
+            data=json.dumps({"address": "Invasão"}), content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    # --- password reset: commercial reseta a de viewer/client sem saber a atual ---
+    def test_commercial_can_reset_client_password(self):
+        self.client.login(username="comm_f", password="123")
+        resp = self.client.post(
+            f"{self.base_url}{self.cb.id}/password/",
+            data=json.dumps({"password": "novaPassword123"}), content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.cb.refresh_from_db()
+        self.assertTrue(self.cb.check_password("novaPassword123"))
+
+    def test_commercial_cannot_reset_admin_password(self):
+        self.client.login(username="comm_f", password="123")
+        resp = self.client.post(
+            f"{self.base_url}{self.admin.id}/password/",
+            data=json.dumps({"password": "novaPassword123"}), content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 403)
+
+
 class UserFieldValidationTests(TestCase):
     def setUp(self):
         self.client = Client()

@@ -6,14 +6,16 @@ from django.db import models
 class UserProfile(models.Model):
     # --- Roles ---
     ADMIN = "admin"
-    COMMERCIAL = "commercial"
-    COMPOSER = "composer"
+    # Split do antigo "commercial": um por domínio de dados (avisos/grants vs. anúncios de
+    # contratação pública). COMMERCIAL_PUBLIC acumula os dois (avisos + anúncios).
+    COMMERCIAL_GRANTS = "commercial_grants"
+    COMMERCIAL_PUBLIC = "commercial_public"
     CLIENT = "client"
     VIEWER = "viewer"
     ROLE_CHOICES = [
         (ADMIN, "Admin"),
-        (COMMERCIAL, "Commercial"),
-        (COMPOSER, "Composer"),
+        (COMMERCIAL_GRANTS, "Commercial Grants"),
+        (COMMERCIAL_PUBLIC, "Commercial Public"),
         (CLIENT, "Client"),
         (VIEWER, "Viewer"),
     ]

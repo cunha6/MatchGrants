@@ -24,7 +24,7 @@ def require_role(*roles):
     """
     Restrict the view to the given roles.
     401 if not authenticated, 403 if the role is not allowed.
-    Usage: @require_role("admin", "commercial")
+    Usage: @require_role(UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS)
     """
     def decorator(view):
         @wraps(view)

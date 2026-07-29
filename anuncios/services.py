@@ -22,7 +22,7 @@ from django.db.models import Q
 from common.dates import parse_date as _parse_date
 from common.files import safe_media_path
 from .models import Notice
-from .specifications import SPECS_DIR, build_chrome, fetch_specifications, normalize
+from .specifications import SPECS_DIR, build_chrome, fetch_documents, normalize
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ KEYWORDS = [
     "Território", "Territorial", "Ecologia", "Ecológica", "Ecológico",
     "Compras públicas", "Compras sustentáveis", "Compras ecológicas", "ECO 360",
     "Turismo", "Interior", "Valorização", "Recursos", "Projeto", "Verdes",
-    "Ambiental", "Ambiente", "Pegada Ecológica", "Pegada Carbono", "Serviços",
+    "Ambiental", "Ambiente", "Pegada Ecológica", "Pegada Carbono",
 ]
 _NORM_KEYWORDS = [normalize(k) for k in KEYWORDS]
 
@@ -206,22 +206,38 @@ def _upsert_notice(data: dict) -> str:
     if not changed:
         return "unchanged"
 
-    obj.save(update_fields=changed + ["updated_at"])
+    # A última escrita foi a importação — mesmo que o anúncio já tivesse sido editado à mão
+    # antes, a origem passa a refletir esta escrita mais recente (ver Notice.last_update_source).
+    obj.last_update_source = Notice.SOURCE_SCRAPE
+    obj.last_updated_by = None
+    obj.save(update_fields=changed + [
+        "updated_at", "last_update_source", "last_updated_by",
+    ])
     return "updated"
 
 
-def existing_specifications_path(notice_number: str) -> str:
-    """Return the already-saved specifications path for this notice, if the file exists."""
+def _existing_doc_path(notice_number: str, field: str) -> str:
+    """Caminho já guardado (no campo `field`) deste anúncio, se o ficheiro ainda existir em disco."""
     if not notice_number:
         return ""
     path = (
         Notice.objects.filter(notice_number=notice_number)
-        .values_list("specifications_path", flat=True)
+        .values_list(field, flat=True)
         .first()
     )
     if path and (settings.BASE_DIR / path).exists():
         return path
     return ""
+
+
+def existing_specifications_path(notice_number: str) -> str:
+    """Return the already-saved specifications path for this notice, if the file exists."""
+    return _existing_doc_path(notice_number, "specifications_path")
+
+
+def existing_program_path(notice_number: str) -> str:
+    """Caminho do programa de concurso já guardado deste anúncio, se o ficheiro existir."""
+    return _existing_doc_path(notice_number, "program_path")
 
 
 # --- Import ----------------------------------------------------------------
@@ -265,28 +281,47 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
             if not data["notice_number"]:
                 continue  # no natural key -> cannot deduplicate
 
+            # Estado: sem prazo -> corrigir; prazo passado -> inativo (encerrado, não vale a
+            # pena pedir correção); em aberto mas SEM PREÇO -> corrigir também (falta um dado
+            # essencial num anúncio ainda relevante); caso contrário, ativo.
             deadline = data["proposal_deadline"]
-            data["active"] = bool(deadline and deadline >= today)
+            if deadline is None:
+                data["status"] = Notice.StatusChoices.TO_FIX
+            elif deadline < today:
+                data["status"] = Notice.StatusChoices.INACTIVE
+            elif data["base_price"] is None:
+                data["status"] = Notice.StatusChoices.TO_FIX
+            else:
+                data["status"] = Notice.StatusChoices.ACTIVE
 
-            # Specifications (only when download_specs): reuse the already-downloaded file,
-            # else try to download (sharing the Chrome). Log per notice.
+            # Documentos base — caderno de encargos + programa de concurso (só quando
+            # download_specs): reutiliza os já descarregados, senão obtém ambos numa passagem
+            # (partilhando o Chrome). "" não sobrescreve um caminho já guardado.
             number = data["notice_number"]
             if not download_specs:
-                data["specifications_path"] = ""  # "" does not overwrite a stored path
+                data["specifications_path"] = ""
+                data["program_path"] = ""
             else:
-                reused = existing_specifications_path(number)
-                if reused:
-                    data["specifications_path"] = reused
-                    logger.info(f"  [{number}] Specifications already downloaded -> {os.path.basename(reused)}")
+                reused_specs = existing_specifications_path(number)
+                reused_program = existing_program_path(number)
+                if reused_specs and reused_program:
+                    data["specifications_path"] = reused_specs
+                    data["program_path"] = reused_program
+                    logger.info(f"  [{number}] Documentos já descarregados.")
                 elif data["procedure_documents_url"]:
-                    logger.info(f"  [{number}] Looking for specifications...")
+                    logger.info(f"  [{number}] À procura dos documentos (CE + programa)...")
                     connection.close()  # avoid a stale DB connection during the long download
-                    path = fetch_specifications(data["procedure_documents_url"], driver_factory=driver_factory)
-                    data["specifications_path"] = path
-                    logger.info(f"  [{number}] {'OK -> ' + os.path.basename(path) if path else 'No specifications found.'}")
+                    docs = fetch_documents(data["procedure_documents_url"], driver_factory=driver_factory)
+                    data["specifications_path"] = reused_specs or docs["specifications"]
+                    data["program_path"] = reused_program or docs["program"]
+                    logger.info(
+                        f"  [{number}] CE: {os.path.basename(data['specifications_path']) or '—'} | "
+                        f"Programa: {os.path.basename(data['program_path']) or '—'}"
+                    )
                 else:
                     data["specifications_path"] = ""
-                    logger.info(f"  [{number}] No procedure-documents link.")
+                    data["program_path"] = ""
+                    logger.info(f"  [{number}] Sem link para as peças do procedimento.")
 
             status = _upsert_notice(data)
             if status == "created":
@@ -300,7 +335,7 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
         if driver:
             driver.quit()
 
-    # Sincroniza o estado: qualquer anúncio cujo prazo de proposta já passou fica active=False.
+    # Sincroniza o estado: qualquer anúncio cujo prazo de proposta já passou fica status=inactive.
     deactivated = deactivate_expired()
 
     return {
@@ -315,19 +350,20 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
 
 
 def download_missing_specifications() -> dict:
-    """Backfill: for notices with no specifications_path (but with a documents link),
-    download the tender specifications and store the path in the DB.
+    """Backfill: para anúncios a que falta o caderno de encargos OU o programa de concurso (mas
+    com link para as peças), descarrega os que faltam e guarda os caminhos na BD.
 
-    Works only over the DB (does not hit the API). Uses one shared Chrome. Returns a summary.
+    Só toca na BD (não chama a API). Usa um único Chrome partilhado. Devolve um resumo.
     """
     pending = list(
         Notice.objects.exclude(procedure_documents_url="")
-        .filter(specifications_path="")
-        .values_list("pk", "notice_number", "procedure_documents_url")
+        .filter(Q(specifications_path="") | Q(program_path=""))
+        .values_list("pk", "notice_number", "procedure_documents_url",
+                     "specifications_path", "program_path")
     )
     total = len(pending)
     downloaded = missing = 0
-    logger.info(f"[backfill specs] {total} notices without specifications to process...")
+    logger.info(f"[backfill docs] {total} anúncios com documentos em falta a processar...")
 
     driver_cache = {}
 
@@ -338,25 +374,31 @@ def download_missing_specifications() -> dict:
 
     mark_import_start()
     try:
-        for pk, number, docs_url in pending:
+        for pk, number, docs_url, has_specs, has_program in pending:
             _heartbeat_lock()
             connection.close()  # avoid a stale DB connection during the long download
-            logger.info(f"  [{number}] Looking for specifications...")
-            path = fetch_specifications(docs_url, driver_factory=driver_factory)
-            if path:
-                Notice.objects.filter(pk=pk).update(specifications_path=path)
+            logger.info(f"  [{number}] À procura dos documentos (CE + programa)...")
+            docs = fetch_documents(docs_url, driver_factory=driver_factory)
+            # Só preenche o que falta — nunca sobrescreve um caminho já existente.
+            updates = {}
+            if not has_specs and docs["specifications"]:
+                updates["specifications_path"] = docs["specifications"]
+            if not has_program and docs["program"]:
+                updates["program_path"] = docs["program"]
+            if updates:
+                Notice.objects.filter(pk=pk).update(**updates)
                 downloaded += 1
-                logger.info(f"  [{number}] OK, saved -> {os.path.basename(path)}")
+                logger.info(f"  [{number}] OK -> {', '.join(os.path.basename(v) for v in updates.values())}")
             else:
                 missing += 1
-                logger.info(f"  [{number}] No specifications found.")
+                logger.info(f"  [{number}] Nenhum documento novo encontrado.")
     finally:
         driver = driver_cache.get("driver")
         if driver:
             driver.quit()
         mark_import_end()
 
-    logger.info(f"[backfill specs] done — downloaded: {downloaded}, missing: {missing}")
+    logger.info(f"[backfill docs] concluído — descarregados: {downloaded}, sem novos: {missing}")
     return {"pending": total, "downloaded": downloaded, "missing": missing}
 
 
@@ -480,25 +522,66 @@ def spawn_specifications_download() -> bool:
 
 
 def deactivate_expired() -> int:
-    """Mark active=False the notices whose proposal deadline has passed. Returns the count."""
-    return Notice.objects.filter(active=True, proposal_deadline__lt=date.today()).update(active=False)
+    """Marca status=INACTIVE os anúncios ativos cujo prazo de propostas já passou. Retorna a
+    contagem. Não mexe nos que estão 'to_fix' (sem prazo) — esses só saem desse estado quando o
+    prazo for preenchido (nova importação ou edição manual)."""
+    return Notice.objects.filter(
+        status=Notice.StatusChoices.ACTIVE, proposal_deadline__lt=date.today(),
+    ).update(status=Notice.StatusChoices.INACTIVE)
 
 
 # --- Listing with filters --------------------------------------------------
 
+def _browsable_notices():
+    """Anúncios NÃO inativos (ativos ou por corrigir) — a base da listagem, sem filtros
+    próprios. Fonte única partilhada por `filter_notices` e `filter_options`, para o select de
+    filtros nunca oferecer um valor que na listagem daria zero resultados."""
+    return Notice.objects.exclude(status=Notice.StatusChoices.INACTIVE)
+
+
+def filter_options() -> dict:
+    """Valores de `act_type` e `contract_types` REALMENTE presentes entre os anúncios
+    navegáveis (não expirados) — para popular os selects de filtro dinamicamente, em vez de
+    uma lista estática que poderia oferecer opções sem resultados (ou faltar valores novos).
+
+    `act_type` é uma coluna simples (distinct em SQL); `contract_types` é uma lista JSON por
+    anúncio — achatada e deduplicada em Python (o conjunto de anúncios navegáveis é pequeno)."""
+    qs = _browsable_notices()
+    act_types = sorted(
+        qs.exclude(act_type="").values_list("act_type", flat=True).distinct()
+    )
+    contract_types = sorted({
+        ct for types in qs.values_list("contract_types", flat=True) for ct in (types or []) if ct
+    })
+    statuses = [{"value": value, "label": label} for value, label in Notice.StatusChoices.choices]
+    return {"act_types": act_types, "contract_types": contract_types, "statuses": statuses}
+
+
 def filter_notices(params):
     """Build the listing queryset from the request query params.
 
-    Always excludes expired notices (proposal_deadline < today). Notices with no deadline
-    are kept (nothing to expire).
+    By default excludes inactive notices (proposal deadline expired) — notices with no
+    deadline ('to_fix') are kept, since they still need attention. Passing `status` (one of
+    Notice.StatusChoices) overrides this and returns exactly that status, including inactive.
 
-    Supported params: act_type, procedure_type, contract_type (exact / membership),
-    order_by (one of ORDERING).
+    Supported params: q (search in description/entity_name/notice_number), status, act_type,
+    procedure_type, contract_type (exact / membership), order_by (one of ORDERING).
+
+    `q` filtra o QUERYSET INTEIRO no SQL — pesquisa em TODOS os anúncios da BD, não só na
+    página devolvida (a paginação corta DEPOIS, em common.pagination.paginate).
     """
-    today = date.today()
-    qs = Notice.objects.filter(
-        Q(proposal_deadline__gte=today) | Q(proposal_deadline__isnull=True)
-    )
+    status = params.get("status")
+    if status in Notice.StatusChoices.values:
+        qs = Notice.objects.filter(status=status)
+    else:
+        qs = _browsable_notices()
+
+    q = (params.get("q") or "").strip()
+    if q:
+        qs = qs.filter(
+            Q(description__icontains=q) | Q(entity_name__icontains=q)
+            | Q(notice_number__icontains=q)
+        )
 
     act_type = params.get("act_type")
     if act_type:
@@ -522,11 +605,13 @@ def serialize_notice_summary(n: Notice) -> dict:
     return {
         "id": n.id,
         "notice_number": n.notice_number,
+        "description": n.description,
         "entity_name": n.entity_name,
         "act_type": n.act_type,
+        "contract_types": n.contract_types,
         "base_price": float(n.base_price) if n.base_price is not None else None,
         "proposal_deadline": n.proposal_deadline.isoformat() if n.proposal_deadline else None,
-        "active": n.active,
+        "status": n.status,
     }
 
 
@@ -557,9 +642,19 @@ def serialize_notice(n: Notice) -> dict:
         # Link para abrir o caderno de encargos local (só se o ficheiro existir em disco).
         # O front-end abre-o com target="_blank".
         "specifications_url": (
-            f"/anuncios/{n.id}/specifications/"
+            f"/anuncios/{n.id}/document/cadernoEncargos/"
             if safe_media_path(n.specifications_path, SPECS_DIR) else None
         ),
+        # Caminho local + link do programa de concurso (sob pdf_Anuncios/programa_Concurso/).
+        # O front-end abre-o com target="_blank", tal como o caderno de encargos.
+        "program_path": n.program_path,
+        "program_url": (
+            f"/anuncios/{n.id}/document/programaConcurso/"
+            if safe_media_path(n.program_path, SPECS_DIR) else None
+        ),
         "proposal_deadline": n.proposal_deadline.isoformat() if n.proposal_deadline else None,
-        "active": n.active,
+        "status": n.status,
+        # Origem da última escrita ('scrape'/'manual') + quem a fez (username), quando manual.
+        "last_update_source": n.last_update_source,
+        "last_updated_by": n.last_updated_by.username if n.last_updated_by_id else None,
     }

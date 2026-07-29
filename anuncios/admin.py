@@ -7,10 +7,10 @@ from .models import Notice
 class NoticeAdmin(admin.ModelAdmin):
     list_display = (
         "notice_number", "entity_name", "act_type", "procedure_type",
-        "base_price", "publication_date", "proposal_deadline", "active",
+        "base_price", "publication_date", "proposal_deadline", "status",
         "specifications_path",
     )
-    list_filter = ("active", "act_type", "procedure_type", "environmental_criteria", "year")
+    list_filter = ("status", "act_type", "procedure_type", "environmental_criteria", "year")
     search_fields = ("notice_number", "incm_id", "entity_name", "description", "entity_nif")
     list_editable = ("specifications_path",)  # edit the specs path inline in the list
     date_hierarchy = "publication_date"
@@ -32,7 +32,7 @@ class NoticeAdmin(admin.ModelAdmin):
             "description": "Add/edit/remove the local path of the tender specifications PDF.",
         }),
         ("Deadline & status", {
-            "fields": ("proposal_period_days", "proposal_deadline", "active",
+            "fields": ("proposal_period_days", "proposal_deadline", "status",
                        "created_at", "updated_at"),
         }),
     )

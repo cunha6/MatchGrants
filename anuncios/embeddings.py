@@ -36,5 +36,5 @@ def search_notices(query: str, k: int = 10, only_active: bool = True) -> list:
     from .models import Notice
     qs = Notice.objects.all()
     if only_active:
-        qs = qs.filter(active=True)
+        qs = qs.filter(status=Notice.StatusChoices.ACTIVE)
     return emb.semantic_search(qs, query, field="activity_embedding", k=k)

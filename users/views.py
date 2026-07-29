@@ -11,9 +11,28 @@ from .models import UserProfile
 from .permissions import require_role, get_role
 
 # All roles (any authenticated user)
-_ALL_ROLES = (UserProfile.ADMIN, UserProfile.COMMERCIAL, UserProfile.COMPOSER, UserProfile.CLIENT)
+_ALL_ROLES = (UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC,
+              UserProfile.CLIENT)
+# The two comerciais: gerem utilizadores do tipo viewer/client (ver/editar), cada um no seu
+# domínio de dados (avisos vs. avisos+anúncios) — só o ADMIN tem mais do que isto.
+_COMMERCIAL_ROLES = (UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC)
+# Roles de utilizador que os comerciais podem ver/gerir (nunca admin, nunca outro comercial).
+_COMMERCIAL_MANAGED_ROLES = (UserProfile.VIEWER, UserProfile.CLIENT)
 # Roles that may only create 'client' users
-_CLIENT_ONLY_CREATORS = (UserProfile.COMMERCIAL, UserProfile.COMPOSER)
+_CLIENT_ONLY_CREATORS = _COMMERCIAL_ROLES
+
+
+def _can_manage(role: str | None, target_role: str | None, is_self: bool,
+                 is_superuser: bool = False) -> bool:
+    """Pode `role` gerir (ver/editar) um utilizador com `target_role`?
+    Admin e o próprio utilizador: sempre. Um comercial: só viewer/client, nunca um superuser."""
+    if is_self:
+        return True
+    if role == UserProfile.ADMIN:
+        return True
+    if role in _COMMERCIAL_ROLES:
+        return target_role in _COMMERCIAL_MANAGED_ROLES and not is_superuser
+    return False
 
 # Login brute-force throttle (per username).
 _LOGIN_MAX_ATTEMPTS = 5
@@ -95,22 +114,25 @@ def logout_view(request):
     return JsonResponse({"message": "Logged out"})
 
 
-@require_role(UserProfile.ADMIN, UserProfile.COMMERCIAL)
+@require_role(UserProfile.ADMIN, *_COMMERCIAL_ROLES)
 @require_http_methods(["GET"])
 def users_all(request):
     """
     List users (paginated via ?page and ?page_size).
-    - Commercial: only active clients; can filter every field except address.
-    - Admin: filters by ?role= and ?active=true|false|all (default: active only) plus all fields.
+    - Commercial (grants ou public): utilizadores viewer e client — os viewers (leads do match
+      sem login) ficam sempre is_active=False, por isso sem filtro de estado; nunca superusers;
+      pode filtrar todos os campos exceto address.
+    - Admin: filters by ?role= and ?active=true|false|all (default: active only) plus all
+      fields; é o único que vê superusers e outros admins/comerciais.
     """
     try:
         page, page_size = parse_pagination(request)
-        if get_role(request.user) == UserProfile.COMMERCIAL:
+        if get_role(request.user) in _COMMERCIAL_ROLES:
             allowed = set(_FILTER_FIELDS) - {"address"}
             filters = _build_filters(request, allowed)
             data = service.get_all_users(
-                role=UserProfile.CLIENT, active=True, filters=filters,
-                page=page, page_size=page_size,
+                role=_COMMERCIAL_MANAGED_ROLES, active=None, filters=filters,
+                page=page, page_size=page_size, exclude_superuser=True,
             )
         else:  # admin — all filters
             filters = _build_filters(request, set(_FILTER_FIELDS))
@@ -137,13 +159,23 @@ def users_me(request):
 
 
 @csrf_exempt
-@require_role(UserProfile.ADMIN)
+@require_role(UserProfile.ADMIN, *_COMMERCIAL_ROLES)
 @require_http_methods(["POST"])
 def users_activate(request, user_id):
-    """Reactivate a user (is_active=True). Admin only."""
-    ok = service.set_active(user_id, True)
-    if ok is None:
+    """Reactivate a user (is_active=True). Admin: qualquer um. Comercial: só viewer/client
+    (nunca outro admin/comercial/superuser) — mesma regra do users_detail/update."""
+    target = service.get_user_detail(user_id)
+    if target is None:
         return JsonResponse({"error": "User not found"}, status=404)
+
+    role = get_role(request.user)
+    if not _can_manage(role, target.get("role"), request.user.id == int(user_id),
+                        target.get("is_superuser")):
+        return JsonResponse(
+            {"error": "You do not have permission to activate this user."}, status=403
+        )
+
+    service.set_active(user_id, True)
     return JsonResponse(
         service.get_user_detail(user_id),
         json_dumps_params={"ensure_ascii": False, "indent": 2},
@@ -163,9 +195,9 @@ def user_by_id(request, user_id):
 def users_detail(request, user_id):
     """
     User detail with role-based access:
-    - admin: any user
-    - commercial: clients only (plus themselves)
-    - composer / client: themselves only
+    - admin: any user (só ele vê superusers)
+    - commercial (grants ou public): viewer/client apenas (plus themselves), nunca superusers
+    - client: themselves only
     """
     try:
         data = service.get_user_detail(user_id)
@@ -174,13 +206,7 @@ def users_detail(request, user_id):
 
         role = get_role(request.user)
         is_self = request.user.id == int(user_id)
-        if role == UserProfile.ADMIN or is_self:
-            allowed = True
-        elif role == UserProfile.COMMERCIAL:
-            allowed = data.get("role") == UserProfile.CLIENT
-        else:
-            allowed = False
-        if not allowed:
+        if not _can_manage(role, data.get("role"), is_self, data.get("is_superuser")):
             return JsonResponse(
                 {"error": "You do not have permission to view this user."}, status=403
             )
@@ -194,7 +220,7 @@ def users_detail(request, user_id):
 def users_create(request):
     """Create a user, validating the role according to who creates it:
     - admin: any role
-    - commercial / composer: may only create 'client'
+    - commercial (grants ou public): may only create 'client'
     - client: may not create users
     """
     try:
@@ -211,7 +237,7 @@ def users_create(request):
                 {"error": "You can only create 'client' users."}, status=403
             )
 
-        # only admin keeps the requested role; others (commercial/composer) become client
+        # only admin keeps the requested role; others (the commercial roles) become client
         if requester_role != UserProfile.ADMIN:
             payload = {k: v for k, v in payload.items() if k != "role"}
 
@@ -227,13 +253,20 @@ def users_create(request):
 @require_role(*_ALL_ROLES)
 @require_http_methods(["PUT"])
 def users_update(request, user_id):
+    """- admin: qualquer utilizador, qualquer campo (incl. role).
+    - commercial (grants ou public): qualquer utilizador viewer/client, exceto o próprio role.
+    - client: só o próprio perfil, exceto o próprio role."""
     try:
         payload = _payload(request)
 
         requester_role = get_role(request.user)
         is_admin = (requester_role == UserProfile.ADMIN)
+        is_self = request.user.id == int(user_id)
 
-        if not is_admin and request.user.id != int(user_id):
+        target = service.get_user_detail(user_id)
+        if target is None:
+            return JsonResponse({"error": "User not found"}, status=404)
+        if not _can_manage(requester_role, target.get("role"), is_self, target.get("is_superuser")):
             return JsonResponse(
                 {"error": "You do not have permission to edit other users."},
                 status=403
@@ -259,21 +292,30 @@ def users_update(request, user_id):
 @require_role(*_ALL_ROLES)
 @require_http_methods(["POST"])
 def users_change_password(request, user_id):
-    """Change password. Each user changes their own (current validated); admin resets any."""
+    """Change password. Each user changes their own (current validated); admin resets any;
+    commercial (grants ou public) reseta a de viewer/client (sem validar a password atual,
+    tal como o admin — não é deles)."""
     try:
         payload = _payload(request)
-        is_admin = get_role(request.user) == UserProfile.ADMIN
-        # non-admins may only change their own password
-        if not is_admin and request.user.id != user_id:
+        role = get_role(request.user)
+        is_admin = role == UserProfile.ADMIN
+        is_self = request.user.id == user_id
+
+        target = service.get_user_detail(user_id)
+        if target is None:
+            return JsonResponse({"error": "User not found"}, status=404)
+        if not _can_manage(role, target.get("role"), is_self, target.get("is_superuser")):
             return JsonResponse(
                 {"error": "You do not have permission to change another user's password."},
                 status=403,
             )
+        # reset direto (sem validar a password atual) para quem gere a conta de outrem.
+        by_admin = is_admin or (role in _COMMERCIAL_ROLES and not is_self)
         ok = service.change_password(
             user_id,
             payload.get("password"),
             current_password=payload.get("current_password"),
-            by_admin=is_admin,
+            by_admin=by_admin,
         )
         if ok is None:
             return JsonResponse({"error": "User not found"}, status=404)

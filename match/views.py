@@ -34,7 +34,7 @@ def evaluate_nif(request):
     o que falta; o cliente reenvia o mesmo pedido já com esses campos preenchidos.
 
     O viewer (lead) só é registado quando o pedido vem SEM autenticação — é aí que faz
-    sentido guardar quem consultou os apoios. Um utilizador autenticado (admin, composer…)
+    sentido guardar quem consultou os apoios. Um utilizador autenticado (admin, client…)
     está a consultar, não a gerar lead: nesse caso `viewer_user_id` vem a None e nada é
     escrito na BD.
 
@@ -74,12 +74,12 @@ def evaluate_nif(request):
 
 
 @csrf_exempt
-@require_role(UserProfile.ADMIN, UserProfile.COMMERCIAL)
+@require_role(UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC)
 @require_http_methods(["POST"])
 def promote_viewer(request, nif):
     """POST /match/promote/<nif>/ -> promove o viewer existente a client (is_active=True).
 
-    Restrito a admin/commercial: promover ATIVA a conta (is_active=True) — aberto,
+    Restrito a admin/comerciais: promover ATIVA a conta (is_active=True) — aberto,
     qualquer pessoa podia reativar contas desativadas.
 
     - 200: {user_id, nif, role, is_active, has_login}

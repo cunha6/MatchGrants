@@ -7,7 +7,10 @@ from django.db import IntegrityError, transaction
 from common.pagination import paginate_queryset
 from .models import UserProfile
 
-_VALID_ROLES = {UserProfile.ADMIN, UserProfile.COMMERCIAL, UserProfile.COMPOSER, UserProfile.CLIENT}
+_VALID_ROLES = {
+    UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC,
+    UserProfile.CLIENT,
+}
 
 # Minimum password length (must be more than 8 characters).
 _PASSWORD_MIN_LENGTH = 8
@@ -19,12 +22,17 @@ _PROFILE_FIELDS = (
 )
 
 
-def get_all_users(role=None, active=True, filters=None, page=1, page_size=50) -> dict:
+def get_all_users(role=None, active=True, filters=None, page=1, page_size=50,
+                   exclude_superuser=False) -> dict:
     """
     List users, filtered by role, state and extra fields, with pagination.
+    role: a single role string, or a list/tuple of roles (role__in).
     active=True -> only active; active=False -> only inactive; active=None -> all.
     filters: dict {orm_lookup: value} already built by the view
     (e.g. {"profile__main_cae__startswith": "62"}).
+    exclude_superuser: esconde superusers do Django — só o admin os vê (get_role trata
+    superuser como admin, mas o profile.role em si fica 'client' por omissão, por isso um
+    superuser pode calhar dentro de um filtro por role sem esta exclusão explícita).
     Returns {total, page, page_size, num_pages, users}.
     """
     # select_related evita o N+1 do _serialize (1 query em vez de 1+N por página).
@@ -32,7 +40,12 @@ def get_all_users(role=None, active=True, filters=None, page=1, page_size=50) ->
     if active is not None:
         users = users.filter(is_active=active)
     if role:
-        users = users.filter(profile__role=role)
+        if isinstance(role, (list, tuple, set)):
+            users = users.filter(profile__role__in=role)
+        else:
+            users = users.filter(profile__role=role)
+    if exclude_superuser:
+        users = users.exclude(is_superuser=True)
     if filters:
         users = users.filter(**filters)
 
@@ -259,6 +272,7 @@ def _serialize(user: User) -> dict:
         "role": profile.role if profile else None,
         "is_active": user.is_active,
         "is_staff": user.is_staff,
+        "is_superuser": user.is_superuser,
         "date_joined": user.date_joined.isoformat() if user.date_joined else None,
     }
     if profile:
@@ -285,7 +299,7 @@ def _validate_required_data(data, current_role=None, is_update=False):
     """Validate the required fields according to the user's role."""
     role = data.get("role", current_role or UserProfile.CLIENT)
 
-    if role in (UserProfile.ADMIN, UserProfile.COMMERCIAL, UserProfile.COMPOSER):
+    if role in (UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC):
         required_fields = ["username", "email"]
         if not is_update:
             required_fields.append("password")

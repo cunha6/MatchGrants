@@ -17,10 +17,12 @@ logger = logging.getLogger("avisos.audit")
 
 
 def commercial_emails() -> list[str]:
-    """Emails dos utilizadores commercial ativos (com email preenchido)."""
+    """Emails dos utilizadores comerciais ativos (com email preenchido) com acesso a avisos —
+    commercial_grants (especialista) e commercial_public (acumula avisos+anúncios)."""
     return list(
         UserProfile.objects.filter(
-            role=UserProfile.COMMERCIAL, user__is_active=True,
+            role__in=(UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC),
+            user__is_active=True,
         )
         .exclude(user__email="")
         .values_list("user__email", flat=True)

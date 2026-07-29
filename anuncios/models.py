@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 from pgvector.django import VectorField
 
@@ -95,11 +96,47 @@ class Notice(models.Model):
                   "Can be added/edited/removed manually.",
     )
 
+    # Local path do "Programa de Concurso" (Programa do Procedimento / PC / PP) — o outro
+    # documento base do procedimento, descarregado junto do caderno de encargos. Mesma
+    # semântica de specifications_path: vazio se não encontrado; editável à mão.
+    program_path = models.CharField(
+        max_length=500, blank=True, default="",
+        verbose_name="Competition Program (local path)",
+        help_text="Local path (under pdf_Anuncios/) of the competition program "
+                  "(Programa de Concurso) PDF. Can be added/edited/removed manually.",
+    )
+
     proposal_deadline = models.DateField(null=True, blank=True, verbose_name="Proposal Deadline")
 
-    # Active = still within the proposal deadline. Updated on import; the listing also
-    # filters dynamically by date so expired notices are never shown.
-    active = models.BooleanField(default=True, db_index=True, verbose_name="Active")
+    # Options for `status`
+    class StatusChoices(models.TextChoices):
+        ACTIVE = 'active', 'Ativo'
+        INACTIVE = 'inactive', 'Inativo'
+        # Sem prazo de propostas identificado na importação — precisa de correção manual
+        # antes de poder ser dado como ativo ou inativo.
+        TO_FIX = 'to_fix', 'Corrigir'
+
+    # Estado do anúncio. Calculado na importação a partir de `proposal_deadline`: sem prazo ->
+    # 'to_fix'; prazo expirado -> 'inactive'; caso contrário -> 'active'. `deactivate_expired`
+    # atualiza para 'inactive' os que expiram entre importações. Também editável manualmente.
+    status = models.CharField(
+        max_length=10, choices=StatusChoices.choices, default=StatusChoices.ACTIVE,
+        db_index=True, verbose_name="Status",
+    )
+
+    # Origem da ÚLTIMA escrita neste anúncio: 'scrape' (import do base.gov.pt) ou 'manual'
+    # (PUT/PATCH em /anuncios/<id>/edit/). Ver Grant.last_update_source (mesma semântica).
+    SOURCE_SCRAPE = "scrape"
+    SOURCE_MANUAL = "manual"
+    LAST_UPDATE_SOURCE_CHOICES = [(SOURCE_SCRAPE, "Scrape/Importação"), (SOURCE_MANUAL, "Manual")]
+    last_update_source = models.CharField(
+        max_length=10, choices=LAST_UPDATE_SOURCE_CHOICES, default=SOURCE_SCRAPE, db_index=True,
+    )
+    # Utilizador que fez a última edição MANUAL; None quando a última escrita foi da importação.
+    last_updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="+",
+    )
 
     # Embedding (pgvector) para pesquisa semântica — gerado pela OpenAI.
     activity_embedding = VectorField(dimensions=EMBEDDING_DIM, null=True, blank=True)

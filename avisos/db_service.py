@@ -95,6 +95,10 @@ def save_scraped_grant(grant_dict: dict, source: str) -> Grant | None:
             changed = True
 
     if changed:
+        # A última escrita foi o scrape do HTML — mesmo que o aviso já tivesse sido editado à
+        # mão antes, a origem passa a refletir esta escrita mais recente.
+        grant.last_update_source = Grant.SOURCE_SCRAPE
+        grant.last_updated_by = None
         grant.save()
     return grant
 
@@ -149,6 +153,9 @@ def save_ai_grant(
     if markdown_path:
         grant.markdown_path = markdown_path
     grant.ai_processed = True
+    # A última escrita foi a extração IA do pipeline — não um humano.
+    grant.last_update_source = Grant.SOURCE_SCRAPE
+    grant.last_updated_by = None
     grant.save()
 
     grant.beneficiaries_by_action.all().delete()

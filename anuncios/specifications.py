@@ -45,6 +45,9 @@ USER_AGENT = (
 
 # Destination folder (relative to project root) and accepted document extensions.
 SPECS_DIR = "pdf_Anuncios"
+# Subpasta (dentro de SPECS_DIR) onde fica o programa de concurso, separado do caderno de
+# encargos (que fica na raiz de pdf_Anuncios/).
+PROGRAM_SUBDIR = "programa_Concurso"
 DOC_EXTENSIONS = (".pdf", ".docx")
 
 # Specifications-name match (over the normalized name: lowercase, no accents,
@@ -53,6 +56,12 @@ DOC_EXTENSIONS = (".pdf", ".docx")
 #   WEAK   -> "ce" as an isolated token (also appears in annexes, e.g. "Anexo V do CE").
 _SPECS_STRONG_RE = re.compile(r"caderno|encargo|cad[ _.\-]enc")
 _SPECS_WEAK_RE = re.compile(r"\bce\b")
+
+# Competition-program-name match ("Programa de Concurso" / "Programa do Procedimento"):
+#   STRONG -> "programa (de) concurso|procedimento".
+#   WEAK   -> the "PC"/"PP" abbreviation as an isolated token.
+_PROGRAM_STRONG_RE = re.compile(r"programa\s+(de\s+|do\s+)?(concurso|procedimento)")
+_PROGRAM_WEAK_RE = re.compile(r"\b(pc|pp)\b")
 
 # Document download links inside a rendered SPA (e.g. Vortal).
 _DOWNLOAD_LINK_XPATH = (
@@ -81,6 +90,19 @@ def is_specifications(name: str) -> bool:
     return bool(_SPECS_STRONG_RE.search(n) or _SPECS_WEAK_RE.search(n))
 
 
+def is_program_strong(name: str) -> bool:
+    """STRONG match: name says 'programa (de) concurso/procedimento'."""
+    return bool(name) and bool(_PROGRAM_STRONG_RE.search(_specs_normalize(name)))
+
+
+def is_program(name: str) -> bool:
+    """True if the name is a competition-program doc (strong OR isolated 'PC'/'PP')."""
+    if not name:
+        return False
+    n = _specs_normalize(name)
+    return bool(_PROGRAM_STRONG_RE.search(n) or _PROGRAM_WEAK_RE.search(n))
+
+
 # --- File helpers ---------------------------------------------------------
 
 def _is_docx_internally(zip_bytes: bytes) -> bool:
@@ -92,8 +114,8 @@ def _is_docx_internally(zip_bytes: bytes) -> bool:
         return False
 
 
-def _specs_dir():
-    d = settings.BASE_DIR / SPECS_DIR
+def _specs_dir(subdir: str = ""):
+    d = settings.BASE_DIR / SPECS_DIR / subdir if subdir else settings.BASE_DIR / SPECS_DIR
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -107,16 +129,17 @@ def _url_filename(url: str) -> str:
     return unquote(parsed.path.split("/")[-1]) or "Caderno de Encargos.pdf"
 
 
-def _save_bytes(name: str, content: bytes) -> str:
-    """Save to pdf_Anuncios/ with the original name prefixed by a timestamp.
+def _save_bytes(name: str, content: bytes, subdir: str = "") -> str:
+    """Save to pdf_Anuncios/[subdir/] with the original name prefixed by a timestamp.
 
     Format: '{YYYYMMDD_HHMMSS}_{original name}'. Returns the path relative to the root.
+    `subdir` separa o programa de concurso (PROGRAM_SUBDIR) do caderno de encargos (raiz).
     """
-    original = os.path.basename(name) or "Caderno de Encargos.pdf"
+    original = os.path.basename(name) or "documento.pdf"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"{timestamp}_{original}"
-    (_specs_dir() / fname).write_bytes(content)
-    return f"{SPECS_DIR}/{fname}"
+    (_specs_dir(subdir) / fname).write_bytes(content)
+    return f"{SPECS_DIR}/{subdir}/{fname}" if subdir else f"{SPECS_DIR}/{fname}"
 
 
 # --- HTTP ------------------------------------------------------------------
@@ -159,30 +182,61 @@ def _response_filename(resp) -> str:
 
 # --- Finders (ZIP / HTML) -------------------------------------------------
 
-def _find_in_zip(zip_bytes: bytes) -> str:
-    """Read the ZIP and extract the specifications PDF (or the first PDF as fallback)."""
+def _find_in_zip(zip_bytes: bytes, matcher=is_specifications, subdir: str = "") -> str:
+    """Read the ZIP and extract the PDF matching `matcher` (or the first PDF as fallback)."""
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             pdfs = [i for i in zf.infolist()
                     if not i.is_dir() and i.filename.lower().endswith(DOC_EXTENSIONS)]
             if not pdfs:
                 return ""
-            for info in pdfs:  # prefer a file whose name matches the specifications
-                if is_specifications(info.filename):
-                    return _save_bytes(info.filename, zf.read(info))
+            for info in pdfs:  # prefer a file whose name matches
+                if matcher(info.filename):
+                    return _save_bytes(info.filename, zf.read(info), subdir)
             info = pdfs[0]  # fallback: first document, keep its name
-            return _save_bytes(info.filename, zf.read(info))
+            return _save_bytes(info.filename, zf.read(info), subdir)
     except zipfile.BadZipFile:
         return ""
 
 
-def _find_in_html(html, base_url: str, cookies: dict | None = None) -> str:
-    """Row by row: if a table row mentions the specifications, follow its link(s)."""
+def _pair_documents_in_zip(zip_bytes: bytes) -> dict:
+    """De um ZIP de peças do procedimento, extrai AMBOS: o caderno de encargos e o programa de
+    concurso. Quando o programa não está identificado pelo nome, é tomado como OUTRO PDF junto
+    do caderno de encargos ("o pdf que está junto do CE"). Devolve {"specifications","program"}
+    com os caminhos guardados (ou "" cada). Nunca aponta os dois para o mesmo ficheiro."""
+    empty = {"specifications": "", "program": ""}
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            pdfs = [i for i in zf.infolist()
+                    if not i.is_dir() and i.filename.lower().endswith(DOC_EXTENSIONS)]
+            if not pdfs:
+                return empty
+            program = next((i for i in pdfs if is_program(i.filename)), None)
+            specs = next((i for i in pdfs if is_specifications(i.filename)), None)
+            # Fallback do CE: 1.º PDF que não seja o programa (comportamento histórico: apanha
+            # o 1.º PDF quando nenhum tem nome de caderno de encargos).
+            if specs is None:
+                specs = next((i for i in pdfs if i is not program), None)
+            # Fallback do programa: outro PDF junto do caderno de encargos.
+            if program is None and specs is not None:
+                program = next((i for i in pdfs if i is not specs), None)
+            return {
+                "specifications": _save_bytes(specs.filename, zf.read(specs)) if specs else "",
+                "program": (_save_bytes(program.filename, zf.read(program), PROGRAM_SUBDIR)
+                            if program and program is not specs else ""),
+            }
+    except zipfile.BadZipFile:
+        return empty
+
+
+def _find_in_html(html, base_url: str, cookies: dict | None = None,
+                  matcher=is_specifications, subdir: str = "") -> str:
+    """Row by row: if a table row mentions the wanted document (`matcher`), follow its link(s)."""
     soup = BeautifulSoup(html, "lxml")
     candidates = []
     for tr in soup.find_all("tr"):
         tr_text = tr.get_text(separator=" ", strip=True)
-        if is_specifications_strong(tr_text) or is_specifications(tr_text):
+        if matcher(tr_text):
             for a in tr.find_all("a", href=True):
                 href = a["href"].strip()
                 if href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
@@ -196,11 +250,11 @@ def _find_in_html(html, base_url: str, cookies: dict | None = None) -> str:
         content = resp.content
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if _looks_pdf(resp):
-            return _save_bytes(_response_filename(resp), content)
+            return _save_bytes(_response_filename(resp), content, subdir)
         if content[:2] == b"PK" and _is_docx_internally(content):
-            return _save_bytes(_response_filename(resp), content)
+            return _save_bytes(_response_filename(resp), content, subdir)
         if content[:2] == b"PK" or "zip" in ctype:
-            path = _find_in_zip(content)
+            path = _find_in_zip(content, matcher=matcher, subdir=subdir)
             if path:
                 return path
     return ""
@@ -279,45 +333,61 @@ def _render_html(url: str, driver=None):
 
 # --- Public entry point ---------------------------------------------------
 
-def fetch_specifications(url: str, driver_factory=None) -> str:
-    """Find and download the tender specifications (PDF) from the procedure-documents URL.
+def fetch_documents(url: str, driver_factory=None) -> dict:
+    """Encontra e descarrega os DOIS documentos base do procedimento — caderno de encargos e
+    programa de concurso — a partir do URL das peças, numa ÚNICA passagem (a página/SPA é
+    obtida/renderizada uma só vez). Devolve {"specifications": path|"", "program": path|""}.
 
-    Handles: direct ZIP, direct PDF (only if the name matches specifications) and HTML.
-    For HTML it tries static first; if that fails (JS SPA, e.g. Vortal) it renders with a
-    headless browser and searches the built DOM. Returns the path relative to the project
-    root, or "" if not found.
-
-    `driver_factory`: optional callable returning a shared Chrome (reused across the whole
-    import). Without it, each render creates and closes its own browser.
+    Trata: ZIP direto (empareilha ambos), PDF direto (classifica pelo nome), HTML estático e,
+    em fallback, página renderizada por browser (SPA, ex: Vortal). `driver_factory`: callable
+    opcional que devolve um Chrome partilhado (reutilizado por todo o import).
     """
+    empty = {"specifications": "", "program": ""}
     if not url:
-        return ""
+        return empty
     resp = _get(url)
     if not resp:
-        return ""
+        return empty
 
     content = resp.content
     ctype = (resp.headers.get("Content-Type") or "").lower()
     final_url = resp.url.lower().split("?")[0]
 
-    # Direct ZIP (magic bytes 'PK', Content-Type or extension).
+    # ZIP direto: empareilha CE + programa a partir dos PDFs lá dentro.
     if content[:2] == b"PK" or "zip" in ctype or final_url.endswith(".zip"):
-        return _find_in_zip(content)
+        return _pair_documents_in_zip(content)
 
-    # Direct PDF: only save if the name (URL or Content-Disposition) matches specifications.
+    # PDF direto: um único ficheiro — classifica-o como CE ou programa pelo nome.
     if _looks_pdf(resp):
         name = _response_filename(resp)
-        return _save_bytes(name, content) if is_specifications(name) else ""
+        if is_specifications(name):
+            return {"specifications": _save_bytes(name, content), "program": ""}
+        if is_program(name):
+            return {"specifications": "", "program": _save_bytes(name, content, PROGRAM_SUBDIR)}
+        return empty
 
-    # Static HTML.
-    path = _find_in_html(content, resp.url)
-    if path:
-        return path
+    # HTML estático: procura os dois na MESMA página (sem re-obter). O programa vai para a
+    # subpasta PROGRAM_SUBDIR; o caderno de encargos fica na raiz de pdf_Anuncios/.
+    docs = {
+        "specifications": _find_in_html(content, resp.url, matcher=is_specifications),
+        "program": _find_in_html(content, resp.url, matcher=is_program, subdir=PROGRAM_SUBDIR),
+    }
+    if docs["specifications"] or docs["program"]:
+        return docs
 
-    # Fallback: JS-rendered page (SPA). Render and search the final DOM, using the
-    # browser session cookies for the download. Reuses the shared Chrome when given.
+    # Fallback SPA: renderiza UMA vez e procura os dois no DOM final (com os cookies da sessão).
     driver = driver_factory() if driver_factory else None
     rendered, cookies = _render_html(resp.url, driver=driver)
     if rendered:
-        return _find_in_html(rendered, resp.url, cookies=cookies)
-    return ""
+        return {
+            "specifications": _find_in_html(rendered, resp.url, cookies=cookies,
+                                            matcher=is_specifications),
+            "program": _find_in_html(rendered, resp.url, cookies=cookies,
+                                     matcher=is_program, subdir=PROGRAM_SUBDIR),
+        }
+    return empty
+
+
+def fetch_specifications(url: str, driver_factory=None) -> str:
+    """Retrocompatível: só o caderno de encargos. Ver `fetch_documents` (que obtém ambos)."""
+    return fetch_documents(url, driver_factory=driver_factory)["specifications"]

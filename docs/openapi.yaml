@@ -1,0 +1,1170 @@
+openapi: 3.0.3
+info:
+  title: MatchGrants API
+  description: >
+    Plataforma de scraping/extração de avisos de financiamento (Portugal2030, Compete2030, PRR),
+    anúncios de contratação pública (base.gov.pt) e matching de empresas por NIF.
+
+    As rotas de `avisos` e `contratações públicas` seguem a mesma forma (mesmo conjunto de ações sobre um
+    único recurso): listar, detalhe, editar, servir documento(s), disparar ingestão.
+  version: "1.0.0"
+servers:
+  - url: /
+    description: Relativo ao host onde a app está a correr (dev/produção).
+tags:
+  - name: avisos
+    description: Avisos de financiamento (Grant) — scrape, extração IA, listagem, edição.
+  - name: contratações públicas
+    description: Anúncios de contratação pública (Notice) — importação, listagem, edição.
+  - name: match
+    description: Motor de matching por NIF.
+  - name: users
+    description: Autenticação e gestão de utilizadores/perfis.
+  - name: planned-grants
+    description: Plano Anual de Avisos (Portugal 2030) — previsões, não avisos publicados.
+  - name: newsletter
+    description: Agregação semanal de novidades (avisos + anúncios + previstos).
+
+components:
+  securitySchemes:
+    sessionAuth:
+      type: apiKey
+      in: cookie
+      name: sessionid
+      description: >
+        Sessão Django (cookie `sessionid`), obtida em POST /users/login/. Algumas rotas são
+        públicas (sem sessão); as que exigem papel específico estão marcadas em cada operação.
+
+  parameters:
+    page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    page_size:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      description: Máximo 200.
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+    ValidationError:
+      type: object
+      properties:
+        error: { type: string }
+        details:
+          type: object
+          description: "{campo: [mensagens de erro]}"
+          additionalProperties:
+            type: array
+            items: { type: string }
+
+    PaginationEnvelope:
+      type: object
+      properties:
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+        num_pages: { type: integer }
+      required: [total, page, page_size, num_pages]
+
+    # --- avisos ---------------------------------------------------------
+    GrantSummary:
+      type: object
+      description: Forma ENXUTA usada na listagem (GET /avisos/list/).
+      properties:
+        id: { type: integer }
+        grant_code: { type: string, nullable: true }
+        title: { type: string, nullable: true }
+        closing_date: { type: string, nullable: true, description: "Texto livre (não necessariamente ISO)." }
+        total_allocation: { type: number, nullable: true }
+        financing_rate: { type: number, nullable: true, description: "Override manual ou calculado das linhas-filhas." }
+        next_phase_date: { type: string, format: date, nullable: true }
+        active: { type: boolean }
+
+    GrantDetail:
+      type: object
+      description: >
+        Detalhe COMPLETO de um aviso (GET /avisos/{id}/) — todos os ~80 campos extraídos pela
+        pipeline P1–P7 (título, datas, CAE incluído/excluído, elegibilidade, financeiro,
+        indicadores, documentos…) mais as relações (phases, covered_areas, phase_areas,
+        financing_rates, expense_limits, non_compliance_penalties, evaluation_methodologies,
+        beneficiaries_by_action, documents). Só os campos mais consultados estão tipados aqui;
+        os restantes seguem o mesmo padrão simples (string/number/list) — ver o modelo `Grant`
+        em avisos/models.py para a lista exaustiva.
+      allOf:
+        - $ref: "#/components/schemas/GrantSummary"
+      properties:
+        objective: { type: string, nullable: true }
+        financing_program: { type: string, nullable: true }
+        managing_entity: { type: string, nullable: true }
+        publication_date: { type: string, nullable: true }
+        opening_date: { type: string, nullable: true }
+        included_caes:
+          type: array
+          items: { type: string }
+          description: "Padrões wildcard de 5 chars, ex: '651**'."
+        excluded_caes:
+          type: array
+          items: { type: string }
+        eligible_regions:
+          type: array
+          items: { type: string }
+        maximum_self_financing: { type: number, nullable: true }
+        minimum_investment: { type: number, nullable: true }
+        maximum_investment: { type: number, nullable: true }
+        financing_rate_manual: { type: boolean, description: "True se financing_rate foi fixado à mão." }
+        document_url: { type: string, nullable: true, description: "Link para GET /avisos/{id}/document/, se o PDF existir." }
+        phases:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              name: { type: string, nullable: true }
+              start_date: { type: string, nullable: true }
+              end_date: { type: string, nullable: true }
+              access_condition: { type: string }
+        covered_areas:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              geographic_area: { type: string, nullable: true }
+        phase_areas:
+          type: array
+          items:
+            type: object
+            properties:
+              phase_id: { type: integer, nullable: true }
+              area_id: { type: integer, nullable: true }
+              fund_name: { type: string, nullable: true }
+              budget_allocation: { type: number, nullable: true }
+              max_financing_rate: { type: number, nullable: true }
+              distribution: { type: array, items: { type: object } }
+        financing_rates:
+          type: array
+          items:
+            type: object
+            properties:
+              company_size: { type: string, nullable: true }
+              aid_regime: { type: string, nullable: true }
+              base_rate: { type: string, nullable: true }
+              regional_bonus: { type: string, nullable: true }
+              max_global_rate: { type: string, nullable: true }
+        documents:
+          type: array
+          items:
+            type: object
+            properties:
+              doc_type: { type: string }
+              name: { type: string, nullable: true }
+              url: { type: string, nullable: true }
+              is_canonical: { type: boolean }
+        last_update_source: { type: string, enum: [scrape, manual] }
+        last_updated_by: { type: string, nullable: true, description: "Username de quem editou, ou null se veio do scrape/IA." }
+      additionalProperties: true
+
+    GrantEditRequest:
+      type: object
+      description: >
+        {campo: valor, ...} — qualquer campo próprio do aviso (exceto id, annex_documents,
+        applicable_legislation, last_update_source, last_updated_by). Duas chaves especiais
+        substituem a coleção inteira: `financing_rates` e `phase_areas`.
+      additionalProperties: true
+
+    GrantEditResponse:
+      type: object
+      properties:
+        id: { type: integer }
+        grant_code: { type: string, nullable: true }
+        updated: { type: array, items: { type: string } }
+        ignored: { type: array, items: { type: string } }
+        collections_updated: { type: array, items: { type: string } }
+        financing_rate: { type: number, nullable: true }
+
+    ScrapeSummary:
+      type: object
+      description: Resumo do scrape disparado (varia por fonte).
+      additionalProperties: true
+
+    # --- contratações públicas ---------------------------------------------------------
+    NoticeSummary:
+      type: object
+      description: Forma ENXUTA usada na listagem (GET /anuncios/list/).
+      properties:
+        id: { type: integer }
+        notice_number: { type: string }
+        description: { type: string }
+        entity_name: { type: string }
+        act_type: { type: string }
+        contract_types: { type: array, items: { type: string } }
+        base_price: { type: number, nullable: true }
+        proposal_deadline: { type: string, format: date, nullable: true }
+        status: { type: string, enum: [active, inactive, to_fix] }
+
+    NoticeDetail:
+      type: object
+      description: Detalhe COMPLETO de um anúncio (GET /anuncios/{id}/).
+      allOf:
+        - $ref: "#/components/schemas/NoticeSummary"
+      properties:
+        incm_id: { type: string }
+        publication_date: { type: string, format: date, nullable: true }
+        entity_nif: { type: string }
+        url: { type: string }
+        dr_number: { type: string }
+        series: { type: string }
+        cpvs: { type: array, items: { type: string } }
+        lots: { type: array, items: { type: string } }
+        procedure_type: { type: string }
+        year: { type: integer, nullable: true }
+        environmental_criteria: { type: boolean }
+        proposal_period_days: { type: integer, nullable: true }
+        procedure_documents_url: { type: string }
+        specifications_path: { type: string, description: "Caminho local do caderno de encargos (pdf_Anuncios/)." }
+        specifications_url: { type: string, nullable: true, description: "GET /anuncios/{id}/document/cadernoEncargos/, se o ficheiro existir." }
+        program_path: { type: string, description: "Caminho local do programa de concurso (pdf_Anuncios/programa_Concurso/)." }
+        program_url: { type: string, nullable: true, description: "GET /anuncios/{id}/document/programaConcurso/, se o ficheiro existir." }
+        last_update_source: { type: string, enum: [scrape, manual] }
+        last_updated_by: { type: string, nullable: true }
+
+    NoticeEditRequest:
+      type: object
+      description: "{campo: valor, ...} — qualquer campo próprio do anúncio, exceto id, last_update_source, last_updated_by."
+      additionalProperties: true
+
+    NoticeEditResponse:
+      type: object
+      properties:
+        id: { type: integer }
+        notice_number: { type: string }
+        updated: { type: array, items: { type: string } }
+        ignored: { type: array, items: { type: string } }
+
+    NoticeFilters:
+      type: object
+      properties:
+        act_types: { type: array, items: { type: string } }
+        contract_types: { type: array, items: { type: string } }
+        statuses:
+          type: array
+          items:
+            type: object
+            properties:
+              value: { type: string }
+              label: { type: string }
+
+    ImportSummary:
+      type: object
+      properties:
+        num_days: { type: integer }
+        total_received: { type: integer }
+        with_keywords: { type: integer }
+        created: { type: integer }
+        updated: { type: integer }
+        unchanged: { type: integer }
+        deactivated_expired: { type: integer }
+        specifications: { type: string }
+
+    # --- match --------------------------------------------------------
+    MatchRequest:
+      type: object
+      required: [nif]
+      properties:
+        nif: { type: string }
+        cae: { description: "Lista ou string separada por vírgulas — override quando o nif.pt não traz CAE." }
+        region: { type: string }
+        dimension: { type: string, enum: [micro, pequena, media, grande] }
+        entity_type: { type: string }
+
+    MatchResult:
+      type: object
+      properties:
+        company:
+          type: object
+          description: Dados ricos do contribuinte (nif.pt + enriquecimento), incluindo 'activity'.
+          additionalProperties: true
+        nif: { type: string }
+        viewer_user_id: { type: integer, nullable: true, description: "null se o pedido veio autenticado." }
+        matches:
+          type: array
+          items:
+            type: object
+            properties:
+              opportunity_id: { type: integer }
+              grant_code: { type: string }
+              title: { type: string }
+              score: { type: integer }
+              max_score: { type: integer }
+              activity_relevance: { type: number, nullable: true }
+              sector_similarity: { type: number, nullable: true }
+              general_similarity: { type: number, nullable: true }
+              effective_financing_rate: { type: number, nullable: true }
+              effective_budget_allocation: { type: number, nullable: true }
+              eligibility:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    criterion: { type: string }
+                    label: { type: string }
+                    eligible: { type: boolean }
+              breakdown:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    criterion: { type: string }
+                    label: { type: string }
+                    matched: { type: boolean }
+                    points: { type: integer }
+              llm_adequate: { type: boolean, nullable: true, description: "null = não avaliado (fora do top-10 ou LLM indisponível)." }
+              llm_reason:
+                type: string
+                nullable: true
+                description: >
+                  Se llm_adequate=false: porque não serve. Se llm_adequate=true: que tipo de
+                  investimento/projeto a empresa pode desenvolver no âmbito deste aviso (não é
+                  só uma confirmação genérica).
+
+    MissingFieldsError:
+      type: object
+      properties:
+        error: { type: string }
+        needs_more_info: { type: boolean }
+        missing_fields:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              label: { type: string }
+
+    PromoteResponse:
+      type: object
+      properties:
+        user_id: { type: integer }
+        nif: { type: string }
+        role: { type: string }
+        is_active: { type: boolean }
+        has_login: { type: boolean }
+
+    # --- users --------------------------------------------------------
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string }
+
+    UserDetail:
+      type: object
+      description: Perfil do utilizador (auth.User + users.UserProfile fundidos).
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        email: { type: string }
+        role: { type: string, enum: [admin, commercial_grants, commercial_public, client, viewer] }
+        is_active: { type: boolean }
+        nif: { type: string, nullable: true }
+        entity_type: { type: string, nullable: true }
+        entity_size: { type: string, nullable: true }
+        main_cae: { type: string, nullable: true }
+        secondary_cae: { type: array, items: { type: string } }
+        region: { type: string, nullable: true }
+        city: { type: string, nullable: true }
+        county: { type: string, nullable: true }
+      additionalProperties: true
+
+    UserListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PaginationEnvelope"
+        - type: object
+          properties:
+            users:
+              type: array
+              items: { $ref: "#/components/schemas/UserDetail" }
+
+    # --- planned-grants / newsletter -----------------------------------
+    PlannedGrant:
+      type: object
+      properties:
+        id: { type: integer }
+        plan_id: { type: integer }
+        designation: { type: string }
+        programme: { type: string }
+        expected_start: { type: string, format: date, nullable: true }
+        expected_end: { type: string, format: date, nullable: true }
+        fund: { type: string }
+        budget: { type: number, nullable: true }
+        nuts: { type: string }
+
+    PlannedGrantListEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/PaginationEnvelope"
+        - type: object
+          properties:
+            planned_grants:
+              type: array
+              items: { $ref: "#/components/schemas/PlannedGrant" }
+
+    WeeklyNewsletter:
+      type: object
+      properties:
+        generated_at: { type: string, format: date-time }
+        new_grants: { type: array, items: { $ref: "#/components/schemas/GrantDetail" } }
+        updated_grants: { type: array, items: { $ref: "#/components/schemas/GrantDetail" } }
+        new_notices: { type: array, items: { $ref: "#/components/schemas/NoticeDetail" } }
+        updated_notices: { type: array, items: { $ref: "#/components/schemas/NoticeDetail" } }
+        coming_next_30_days: { type: array, items: { $ref: "#/components/schemas/PlannedGrant" } }
+
+paths:
+  # ============================= AVISOS =============================
+  /avisos/list/:
+    get:
+      tags: [avisos]
+      summary: Listagem paginada de avisos
+      description: >
+        Pesquisa, filtros e ordenação aplicados a TODO o conjunto antes de paginar (não só à
+        página devolvida). CAE/região/dimensão reutilizam as mesmas regras de elegibilidade do
+        motor de match — um aviso sem restrição no critério casa com qualquer valor pesquisado.
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Pesquisa em código do aviso + título.
+        - name: cae
+          in: query
+          schema: { type: string }
+          description: "CAE elegível, regra do prefixo mais específico (ex: aviso com '55***' casa com '55849')."
+        - name: region
+          in: query
+          schema: { type: string }
+          description: Região elegível OU área abrangida (contains bidirecional).
+        - name: dimension
+          in: query
+          schema: { type: array, items: { type: string, enum: [micro, pequena, media, grande] } }
+          style: form
+          explode: true
+          description: "Repetível (?dimension=micro&dimension=media) ou CSV (?dimension=micro,media)."
+        - name: active
+          in: query
+          schema: { type: string, enum: [true, false, all], default: "true" }
+        - name: publication_from
+          in: query
+          schema: { type: string, format: date }
+        - name: publication_to
+          in: query
+          schema: { type: string, format: date }
+        - name: closing_from
+          in: query
+          schema: { type: string, format: date }
+        - name: closing_to
+          in: query
+          schema: { type: string, format: date }
+        - name: allocation_min
+          in: query
+          schema: { type: number }
+        - name: allocation_max
+          in: query
+          schema: { type: number }
+        - name: rate_min
+          in: query
+          schema: { type: number }
+        - name: rate_max
+          in: query
+          schema: { type: number }
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [publication_recent, publication_oldest, closing_earliest, closing_latest,
+                   allocation_highest, allocation_lowest, rate_highest, rate_lowest]
+            default: publication_recent
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/page_size"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PaginationEnvelope"
+                  - type: object
+                    properties:
+                      grants:
+                        type: array
+                        items: { $ref: "#/components/schemas/GrantSummary" }
+
+  /avisos/{id}/:
+    get:
+      tags: [avisos]
+      summary: Detalhe completo de um aviso
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GrantDetail" }
+        "404":
+          description: Aviso não encontrado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /avisos/{id}/edit/:
+    put:
+      tags: [avisos]
+      summary: Edita um aviso
+      security: [{ sessionAuth: [] }]
+      description: "Papel exigido: admin, commercial_grants ou commercial_public. Atómico — tudo grava ou nada grava."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GrantEditRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GrantEditResponse" }
+        "400":
+          description: Valores inválidos ou corpo malformado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidationError" }
+        "401":
+          description: Sem sessão
+        "403":
+          description: Sem permissão (papel fora de admin/commercial_grants/commercial_public)
+        "404":
+          description: Aviso não encontrado
+
+  /avisos/{id}/document/:
+    get:
+      tags: [avisos]
+      summary: Abre o pdf do aviso
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: PDF
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        "404":
+          description: Aviso ou documento não disponível
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /avisos/:
+    post:
+      tags: [avisos]
+      summary: Dispara o scrape de todas as fontes (Compete2030 + Portugal2030 + PRR)
+      description: Automação diária
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScrapeSummary" }
+
+  /avisos/compete/:
+    post:
+      tags: [avisos]
+      summary: Dispara o scrape só do Compete2030
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScrapeSummary" }
+
+  /avisos/portugal/:
+    post:
+      tags: [avisos]
+      summary: Dispara o scrape só do Portugal2030
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScrapeSummary" }
+
+  /avisos/prr/:
+    post:
+      tags: [avisos]
+      summary: Dispara o scrape só do PRR
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScrapeSummary" }
+
+  # ============================= ANUNCIOS =============================
+  /anuncios/list/:
+    get:
+      tags: [contratações públicas]
+      summary: Listagem paginada de anúncios
+      description: >
+        Por omissão mostra ativos + por corrigir (esconde inativos); `status` sobrepõe isto e
+        devolve exatamente esse estado. `q` pesquisa em TODO o conjunto antes de paginar.
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Pesquisa em descrição/entidade/número — só entre anúncios ATIVOS.
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, inactive, to_fix] }
+        - name: act_type
+          in: query
+          schema: { type: string }
+        - name: procedure_type
+          in: query
+          schema: { type: string }
+        - name: contract_type
+          in: query
+          schema: { type: string }
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [publication_recent, publication_oldest, deadline_latest, deadline_earliest,
+                   price_highest, price_lowest]
+            default: publication_recent
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/page_size"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/PaginationEnvelope"
+                  - type: object
+                    properties:
+                      notices:
+                        type: array
+                        items: { $ref: "#/components/schemas/NoticeSummary" }
+
+  /anuncios/filters/:
+    get:
+      tags: [contratações públicas]
+      summary: Filtro do tipo de ação, tipos de contrato, datas, dotações
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NoticeFilters" }
+
+  /anuncios/{id}/:
+    get:
+      tags: [contratações públicas]
+      summary: Detalhe completo de um anúncio
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NoticeDetail" }
+        "404":
+          description: Anúncio não encontrado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /anuncios/{id}/edit/:
+    put:
+      tags: [contratações públicas]
+      summary: Edita um anúncio
+      security: [{ sessionAuth: [] }]
+      description: "Papel exigido: admin ou commercial_public (commercial_grants não tem acesso a anúncios)."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NoticeEditRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NoticeEditResponse" }
+        "400":
+          description: Valores inválidos, notice_number duplicado, ou corpo malformado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidationError" }
+        "401":
+          description: Sem sessão
+        "403":
+          description: Sem permissão
+        "404":
+          description: Anúncio não encontrado
+
+  /anuncios/{id}/document/cadernoEncargos/:
+    get:
+      tags: [contratações públicas]
+      summary: Abre o caderno de encargos
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: PDF
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        "404":
+          description: Anúncio ou documento não disponível
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /anuncios/{id}/document/programaConcurso/:
+    get:
+      tags: [contratações públicas]
+      summary: Abre o programa de concurso
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: PDF
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        "404":
+          description: Anúncio ou documento não disponível
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /anuncios/:
+    post:
+      tags: [contratações públicas]
+      summary: Automatiza a importação do base.gov.pt dos últimos 15 dias
+      description: >
+        Aberto (sem autenticação). Regista os anúncios rapidamente (sem descarregar
+        documentos) e relança a extração de documentos num processo separado.
+      parameters:
+        - name: num_days
+          in: query
+          schema: { type: integer, default: 15 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportSummary" }
+        "400":
+          description: "'num_days' não é um inteiro"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: Falha de configuração/comunicação com a API base.gov.pt
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ============================= MATCH =============================
+  /match/evaluate-nif/:
+    post:
+      tags: [match]
+      summary: Cruza um nif com os avisos ativos elegíveis, ordenados por relevância
+      description: >
+        Sem autenticação, regista o nif como viewer (lead). Autenticado, só consulta —
+        `viewer_user_id` vem null e nada é escrito.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MatchRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MatchResult" }
+        "400":
+          description: NIF em falta, inválido, inexistente ou contribuinte inativo
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: Faltam dados obrigatórios (CAE/localização) — reenviar com overrides
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MissingFieldsError" }
+        "502":
+          description: Falha de configuração/comunicação com a API nif.pt
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /match/promote/{nif}/:
+    post:
+      tags: [match]
+      summary: Promove um viewer a client
+      security: [{ sessionAuth: [] }]
+      description: "Papel exigido: admin, commercial_grants ou commercial_public."
+      parameters:
+        - name: nif
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PromoteResponse" }
+        "401":
+          description: Sem sessão
+        "403":
+          description: Sem permissão
+        "404":
+          description: Não existe nenhum viewer/registo com esse NIF
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ============================= USERS =============================
+  /users/login/:
+    post:
+      tags: [users]
+      summary: Inicio de sessão
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserDetail" }
+        "401":
+          description: Credenciais inválidas
+        "429":
+          description: Demasiadas tentativas falhadas (throttle de 5 min)
+
+  /users/logout/:
+    post:
+      tags: [users]
+      summary: Termina a sessão atual
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+
+  /users/:
+    get:
+      tags: [users]
+      summary: Lista utilizadores paginado e filtrável
+      security: [{ sessionAuth: [] }]
+      description: >
+        Papel exigido: admin, commercial_grants ou commercial_public. Comercial só vê viewer/
+        client (nunca superuser, sem filtro de estado); admin filtra por role/active e todos os
+        campos, e é o único que vê superusers e outros admins/comerciais.
+      parameters:
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/page_size"
+        - name: role
+          in: query
+          schema: { type: string }
+          description: Só admin.
+        - name: active
+          in: query
+          schema: { type: string, enum: [true, false, all] }
+          description: Só admin.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserListEnvelope" }
+        "401":
+          description: Sem sessão
+        "403":
+          description: Sem permissão
+
+  /users/me/:
+    get:
+      tags: [users]
+      summary: Perfil do utilizador autenticado
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserDetail" }
+        "401":
+          description: Sem sessão
+
+  /users/create/:
+    post:
+      tags: [users]
+      summary: Cria um utilizador
+      description: >
+        Client: 403. commercial_grants/commercial_public só podem criar 'client'. Admin escolhe
+        qualquer papel. Sem sessão: cria sempre 'client' (role pedido é ignorado).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "201":
+          description: Criado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserDetail" }
+        "400":
+          description: Dados inválidos
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: Sem permissão para o papel pedido
+
+  /users/{id}/:
+    get:
+      tags: [users]
+      summary: Detalhes de um utilizador
+      security: [{ sessionAuth: [] }]
+      description: "Admin: qualquer um (só ele vê superusers). Comercial: viewer/client (nunca superuser), mais o próprio. Client: só a si próprio."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserDetail" }
+        "403":
+          description: Sem permissão
+        "404":
+          description: Utilizador não encontrado
+    delete:
+      tags: [users]
+      summary: Desativar Utilizador
+      security: [{ sessionAuth: [] }]
+      description: "Papel exigido: admin."
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "204":
+          description: Apagado (sem corpo)
+        "403":
+          description: Sem permissão
+        "404":
+          description: Utilizador não encontrado
+
+  /users/{id}/update/:
+    put:
+      tags: [users]
+      summary: Edita um utilizador
+      security: [{ sessionAuth: [] }]
+      description: >
+        O próprio, admin (qualquer um), ou commercial_grants/commercial_public (só alvo
+        viewer/client, nunca superuser). Só admin pode alterar o papel.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserDetail" }
+        "400":
+          description: Dados inválidos
+        "403":
+          description: Sem permissão
+        "404":
+          description: Utilizador não encontrado
+
+  /users/{id}/password/:
+    post:
+      tags: [users]
+      summary: Altera a password
+      security: [{ sessionAuth: [] }]
+      description: >
+        Cada utilizador altera a própria (valida a atual); admin repõe qualquer uma;
+        commercial_grants/commercial_public repõe a de um viewer/client (sem validar a atual).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password: { type: string }
+                current_password: { type: string, description: "Obrigatória exceto para admin." }
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Password atual incorreta ou nova password inválida
+        "403":
+          description: Sem permissão
+        "404":
+          description: Utilizador não encontrado
+
+  /users/{id}/activate/:
+    post:
+      tags: [users]
+      summary: Reativar um utilizador
+      security: [{ sessionAuth: [] }]
+      description: >
+        Admin: qualquer um. commercial_grants/commercial_public: só um alvo viewer/client
+        (nunca admin/comercial/superuser).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserDetail" }
+        "403":
+          description: Sem permissão
+        "404":
+          description: Utilizador não encontrado
+
+  # ============================= PLANNED GRANTS =============================
+  /planned-grants/:
+    get:
+      tags: [planned-grants]
+      summary: Avisos previstos com abertura a partir do dia atual
+      security: [{ sessionAuth: [] }]
+      description: "Papel exigido: admin, commercial_grants ou commercial_public."
+      parameters:
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum: [start_earliest, start_latest, end_earliest, end_latest,
+                   allocation_highest, allocation_lowest]
+            default: start_earliest
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/page_size"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PlannedGrantListEnvelope" }
+
+  /planned-grants/sync/:
+    get:
+      tags: [planned-grants]
+      summary: Sincroniza o Plano Anual a partir do Excel oficial através de Scrape
+      description: >
+        Aberto (sem sessão) — pensado para automação diária. Encontra automaticamente o .xlsx
+        na página do plano anual, descarrega e faz upsert por plan_id (só grava o que mudou).
+        Convites são excluídos.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+        "502":
+          description: Falha ao aceder à página ou não encontrar o Excel
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  error: { type: string }
+
+  # ============================= NEWSLETTER =============================
+  /news/weekly/:
+    get:
+      tags: [newsletter]
+      summary: Novidades da última semana + próximos avisos previstos
+      security: [{ sessionAuth: [] }]
+      description: >
+        Papel exigido: admin, commercial_grants ou commercial_public. Listas completas (sem
+        paginação) — a ordenação/pesquisa/filtros dos novos avisos e anúncios ficam a cargo do
+        front-end sobre este conjunto pequeno e limitado.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WeeklyNewsletter" }

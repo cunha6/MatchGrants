@@ -34,6 +34,9 @@ from .models import Grant
 from .service import deactivate_expired_grants
 from . import scrape_compete, scrape_portugal, scrape_prr
 
+# Password dos utilizadores de teste — lida do ambiente (.env), nunca hardcoded.
+TEST_PASSWORD = os.environ.get("TEST_USER_PASSWORD", "test-only-password")
+
 
 class NormalizeTests(SimpleTestCase):
     """common.text.normalize — fonte única de normalização de texto."""
@@ -445,7 +448,7 @@ class GrantCollectionEditTests(TestCase):
         )
         self.commercial = User.objects.create_user(
             "com_coll", email="c@x.pt", password="Xk93!vTq21mZ")
-        self.commercial.profile.role = UserProfile.COMMERCIAL
+        self.commercial.profile.role = UserProfile.COMMERCIAL_GRANTS
         self.commercial.profile.save()
         self.client_user = User.objects.create_user("cli_coll", password="Xk93!vTq21mZ")
 
@@ -623,6 +626,40 @@ class GrantCollectionEditTests(TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class SaveGrantMarksSourceAsScrapeTests(TestCase):
+    """save_scraped_grant/save_ai_grant (o pipeline) marcam a origem da última escrita como
+    'scrape' e limpam `last_updated_by` — mesmo sobre um aviso que já tinha sido editado à mão,
+    porque a origem reflete SEMPRE a escrita mais recente."""
+
+    def _manually_edited_grant(self, code, **kw):
+        editor = User.objects.create_user(f"editor_{code}", password="Xk93!vTq21mZ")
+        defaults = dict(
+            source="portugal", scraping_url=f"https://x/{code}/", grant_code=code,
+            last_update_source=Grant.SOURCE_MANUAL, last_updated_by=editor,
+        )
+        defaults.update(kw)
+        return Grant.objects.create(**defaults), editor
+
+    def test_save_scraped_grant_marks_scrape(self):
+        from .db_service import save_scraped_grant
+        grant, editor = self._manually_edited_grant("SCR-SRC")
+        save_scraped_grant(
+            {"url": grant.scraping_url, "grant_code": "SCR-SRC", "closing_date": "31/12/2026"},
+            source="portugal",
+        )
+        grant.refresh_from_db()
+        self.assertEqual(grant.last_update_source, Grant.SOURCE_SCRAPE)
+        self.assertIsNone(grant.last_updated_by)
+
+    def test_save_ai_grant_marks_scrape(self):
+        from .db_service import save_ai_grant
+        grant, editor = self._manually_edited_grant("AI-SRC")
+        save_ai_grant({"Grant": {"grant_code": "AI-SRC"}}, scraping_url=grant.scraping_url)
+        grant.refresh_from_db()
+        self.assertEqual(grant.last_update_source, Grant.SOURCE_SCRAPE)
+        self.assertIsNone(grant.last_updated_by)
+
+
 class GrantsEditViewTests(TestCase):
     """Permissões, validação e auditoria da edição de avisos (/avisos/<pk>/edit/)."""
 
@@ -633,7 +670,7 @@ class GrantsEditViewTests(TestCase):
         )
         self.commercial = User.objects.create_user(
             "comercial1", email="comercial1@x.pt", password="Xk93!vTq21mZ")
-        self.commercial.profile.role = UserProfile.COMMERCIAL
+        self.commercial.profile.role = UserProfile.COMMERCIAL_GRANTS
         self.commercial.profile.save()
         self.client_user = User.objects.create_user("cliente1", password="Xk93!vTq21mZ")
         # o signal já cria o perfil com role=client
@@ -667,6 +704,16 @@ class GrantsEditViewTests(TestCase):
         self.assertIn("'Original'", logs.output[0])
         self.assertIn("'Novo título'", logs.output[0])
 
+    def test_commercial_public_also_edits_avisos(self):
+        # commercial_public acumula avisos+anúncios (commercial_grants é o especialista, mas
+        # não o único com acesso).
+        commercial_public = User.objects.create_user(
+            "comercial_pub1", email="cp1@x.pt", password="Xk93!vTq21mZ")
+        commercial_public.profile.role = UserProfile.COMMERCIAL_PUBLIC
+        commercial_public.profile.save()
+        self.client.force_login(commercial_public)
+        self.assertEqual(self._edit({"title": "X"}).status_code, 200)
+
     def test_invalid_value_returns_400_not_500(self):
         self.client.force_login(self.commercial)
         resp = self._edit({"max_duration_months": "não é um número"})
@@ -698,6 +745,43 @@ class GrantsEditViewTests(TestCase):
         self.assertEqual(self.grant.annex_documents, [])        # não foi tocado
         self.assertEqual(self.grant.applicable_legislation, [])  # não foi tocado
 
+    def test_manual_edit_marks_source_and_user(self):
+        self.client.force_login(self.commercial)
+        self._edit({"title": "Editado à mão"})
+        self.grant.refresh_from_db()
+        self.assertEqual(self.grant.last_update_source, Grant.SOURCE_MANUAL)
+        self.assertEqual(self.grant.last_updated_by, self.commercial)
+
+    def test_collection_only_edit_also_marks_manual(self):
+        # Só coleções (sem campos escalares) — o grant.save() só acontecia antes quando havia
+        # campos escalares; tem de gravar a origem/utilizador mesmo assim.
+        self.client.force_login(self.commercial)
+        self._edit({"financing_rates": [{"max_global_rate": "50.0"}]})
+        self.grant.refresh_from_db()
+        self.assertEqual(self.grant.last_update_source, Grant.SOURCE_MANUAL)
+        self.assertEqual(self.grant.last_updated_by, self.commercial)
+
+    def test_last_update_source_and_user_are_not_client_editable(self):
+        self.client.force_login(self.commercial)
+        other = User.objects.create_user("outro_admin", password="Xk93!vTq21mZ")
+        resp = self._edit({
+            "title": "X", "last_update_source": Grant.SOURCE_SCRAPE, "last_updated_by": other.pk,
+        })
+        body = resp.json()
+        self.assertEqual(set(body["ignored"]), {"last_update_source", "last_updated_by"})
+        self.grant.refresh_from_db()
+        # A origem/utilizador refletem QUEM FEZ ESTA EDIÇÃO (o commercial autenticado), não o
+        # que veio no payload — o cliente não consegue forjar a origem nem atribuí-la a outrem.
+        self.assertEqual(self.grant.last_update_source, Grant.SOURCE_MANUAL)
+        self.assertEqual(self.grant.last_updated_by, self.commercial)
+
+    def test_detail_exposes_last_updated_by_as_username(self):
+        self.client.force_login(self.commercial)
+        self._edit({"title": "X"})
+        resp = self.client.get(f"/avisos/{self.grant.pk}/")
+        self.assertEqual(resp.json()["last_updated_by"], "comercial1")
+        self.assertEqual(resp.json()["last_update_source"], Grant.SOURCE_MANUAL)
+
     def test_post_method_not_allowed(self):
         # A edição já não aceita POST — só PUT/PATCH.
         self.client.force_login(self.commercial)
@@ -723,13 +807,43 @@ class GrantsEditViewTests(TestCase):
         self._edit({"title": "Original"})  # valor igual ao atual
         self.assertEqual(len(mail.outbox), 0)
 
-    def test_list_is_public(self):
+
+class GrantsListAccessTests(TestCase):
+    """Sem sessão só se acede ao detalhe de UM aviso (via match); a listagem exige login."""
+
+    def setUp(self):
+        self.grant = Grant.objects.create(
+            source="portugal", scraping_url="https://x/access-test/",
+            grant_code="ACCESS-1", ai_processed=True, active=True,
+        )
+        self.client_user = User.objects.create_user("cliente_acesso", password=TEST_PASSWORD)
+
+    def test_list_requires_authentication(self):
+        resp = self.client.get("/avisos/list/")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_list_works_when_authenticated(self):
+        self.client.force_login(self.client_user)
         resp = self.client.get("/avisos/list/")
         self.assertEqual(resp.status_code, 200)
 
+    def test_detail_is_public_without_login(self):
+        # Clicar num aviso a partir de um resultado de match (sem sessão) tem de funcionar —
+        # é o único aviso a que o utilizador não autenticado pode aceder.
+        resp = self.client.get(f"/avisos/{self.grant.pk}/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["grant_code"], "ACCESS-1")
+
 
 class GrantsListAndDetailTests(TestCase):
-    """Listagem enxuta com filtros/ordenação e detalhe completo dos avisos."""
+    """Listagem enxuta com filtros/ordenação (exige sessão) e detalhe completo (público)."""
+
+    def setUp(self):
+        # A listagem exige sessão (qualquer papel) — autentica por omissão nesta classe,
+        # que testa sobretudo filtros/ordenação da listagem, não permissões em si (essas
+        # estão em GrantsListRequiresAuthTests).
+        client_user = User.objects.create_user("cliente_lista", password=TEST_PASSWORD)
+        self.client.force_login(client_user)
 
     def _grant(self, code, **kw):
         defaults = dict(source="portugal", scraping_url=f"https://x/{code}/",
@@ -801,12 +915,81 @@ class GrantsListAndDetailTests(TestCase):
         codes = [g["grant_code"] for g in resp.json()["grants"]]
         self.assertEqual(codes, ["HASRATE", "NORATE"])  # sem taxa vai para o fim, não para o topo
 
+    def test_search_matches_grant_code_and_title(self):
+        self._grant("MPR-2026-6", title="Modernização e Capacitação")
+        self._grant("OUTRO-2026", title="Reindustrialização Verde")
+        self.assertEqual(
+            [g["grant_code"] for g in self.client.get("/avisos/list/?q=MPR-2026").json()["grants"]],
+            ["MPR-2026-6"],
+        )
+        self.assertEqual(
+            [g["grant_code"] for g in self.client.get("/avisos/list/?q=Verde").json()["grants"]],
+            ["OUTRO-2026"],
+        )
+        self.assertEqual(self.client.get("/avisos/list/?q=inexistente").json()["total"], 0)
+
+    def test_search_is_global_not_per_page(self):
+        # O aviso que bate na pesquisa é o ÚLTIMO a ser criado (id mais alto) — se a pesquisa só
+        # visse a página atual, um page_size pequeno cortava-o fora antes de chegar à pesquisa.
+        for i in range(5):
+            self._grant(f"N{i}", title="outro assunto")
+        self._grant("ALVO", title="requalificação urbana")
+        resp = self.client.get("/avisos/list/?q=requalificação&page_size=2")
+        body = resp.json()
+        self.assertEqual(body["total"], 1)
+        self.assertEqual([g["grant_code"] for g in body["grants"]], ["ALVO"])
+
     def test_unknown_order_by_falls_back_to_publication_recent(self):
         self._grant("OLD", publication_date="01/01/2026")
         self._grant("NEW", publication_date="01/06/2026")
         resp = self.client.get("/avisos/list/?order_by=nonsense")
         codes = [g["grant_code"] for g in resp.json()["grants"]]
         self.assertEqual(codes, ["NEW", "OLD"])
+
+    # --- Filtro CAE (regra do prefixo) -------------------------------------
+    def _codes(self, url):
+        return {g["grant_code"] for g in self.client.get(url).json()["grants"]}
+
+    def test_filter_cae_prefix_rule(self):
+        self._grant("WILDCARD", included_caes=["55***"])   # divisão 55 → casa 55849
+        self._grant("EXACT", included_caes=["55847"])      # classe exata → não casa 55848
+        self._grant("OPEN")                                # sem restrição → casa qualquer CAE
+        self._grant("OTHER", included_caes=["62***"])      # outra divisão → não casa
+        self.assertEqual(self._codes("/avisos/list/?cae=55849"), {"WILDCARD", "OPEN"})
+        self.assertEqual(self._codes("/avisos/list/?cae=55847"), {"WILDCARD", "EXACT", "OPEN"})
+
+    def test_filter_cae_respects_exclusions(self):
+        self._grant("INCL_EXCL", included_caes=["55***"], excluded_caes=["5584*"])
+        # 55849 está incluído por '55***' mas excluído por '5584*' (mais específico) → não casa.
+        self.assertEqual(self._codes("/avisos/list/?cae=55849"), set())
+        # 55100 está incluído e não bate na exclusão → casa.
+        self.assertEqual(self._codes("/avisos/list/?cae=55100"), {"INCL_EXCL"})
+
+    # --- Filtro dimensão ---------------------------------------------------
+    def test_filter_dimension_matches_admitted(self):
+        self._grant("PME", beneficiary_eligibility_criteria=["Destina-se a PME"])
+        self._grant("GRANDE", beneficiary_eligibility_criteria=["Apenas grandes empresas"])
+        self._grant("OPEN")   # sem restrição de dimensão → admite todas
+        self.assertEqual(self._codes("/avisos/list/?dimension=micro"), {"PME", "OPEN"})
+        self.assertEqual(self._codes("/avisos/list/?dimension=grande"), {"GRANDE", "OPEN"})
+        # Multi (repetido e CSV) — união: micro (PME) ou grande.
+        self.assertEqual(
+            self._codes("/avisos/list/?dimension=micro&dimension=grande"),
+            {"PME", "GRANDE", "OPEN"})
+        self.assertEqual(self._codes("/avisos/list/?dimension=micro,grande"),
+                         {"PME", "GRANDE", "OPEN"})
+
+    # --- Filtro região / áreas abrangidas ----------------------------------
+    def test_filter_region_matches_eligible_regions_and_covered_areas(self):
+        from .models import CoveredArea
+        self._grant("REGIAO", eligible_regions=["Norte", "Centro"])
+        g_area = self._grant("AREA")
+        CoveredArea.objects.create(grant=g_area, geographic_area="Área Metropolitana do Porto (AMP)")
+        self._grant("ALGARVE", eligible_regions=["Algarve"])
+        self._grant("OPEN")   # sem regiões nem áreas → âmbito não restrito, casa qualquer região
+        self.assertEqual(self._codes("/avisos/list/?region=Norte"), {"REGIAO", "OPEN"})
+        self.assertEqual(self._codes("/avisos/list/?region=Porto"), {"AREA", "OPEN"})
+        self.assertEqual(self._codes("/avisos/list/?region=Algarve"), {"ALGARVE", "OPEN"})
 
     def test_allocation_filter(self):
         self._grant("SMALL", total_allocation=100000.0)

@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 from django.db.models import Q
 from pgvector.django import HnswIndex, VectorField
@@ -105,6 +106,22 @@ class Grant(models.Model):
     # Ativo = ainda a decorrer. Fica False quando a closing_date já passou (avisos terminados
     # são escondidos do match, mas os ficheiros PDF/markdown/JSON são MANTIDOS).
     active = models.BooleanField(default=True, db_index=True)
+
+    # Origem da ÚLTIMA escrita neste aviso: 'scrape' (pipeline de scrape/IA, save_scraped_grant/
+    # save_ai_grant) ou 'manual' (PUT/PATCH em /avisos/<id>/edit/). Distingue um aviso tal como o
+    # scrape o deixou de um que um admin/commercial já corrigiu à mão — útil para saber que avisos
+    # NÃO reverter/sobrescrever sem verificar, e para auditoria (quem editou fica em `last_updated_by`).
+    SOURCE_SCRAPE = "scrape"
+    SOURCE_MANUAL = "manual"
+    LAST_UPDATE_SOURCE_CHOICES = [(SOURCE_SCRAPE, "Scrape/IA"), (SOURCE_MANUAL, "Manual")]
+    last_update_source = models.CharField(
+        max_length=10, choices=LAST_UPDATE_SOURCE_CHOICES, default=SOURCE_SCRAPE, db_index=True,
+    )
+    # Utilizador que fez a última edição MANUAL; None quando a última escrita foi do scrape/IA.
+    last_updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="+",
+    )
     # DEPRECADO — substituído pelos embeddings especializados em `GrantEmbedding` (um por
     # tipo: GENERAL, SECTOR, …). Mantidos por retrocompatibilidade/rollback; já não são
     # escritos nem lidos. Podem ser removidos numa migração futura de limpeza.
