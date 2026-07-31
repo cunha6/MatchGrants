@@ -41,6 +41,8 @@ consegue **ver** superusers na listagem/detalhe de utilizadores (os comerciais n
 |-------------------------|---------|-------------------------------------|-----------------------------------------------------------|
 | `/users/login/`         | POST    | **Público**                         | Inicia sessão.                                          |
 | `/users/logout/`        | POST    | Público                             | Termina a sessão atual.                                 |
+| `/users/password-reset/`| POST    | Público                             | Pede o email de redefinição (resposta sempre igual, nunca revela se a conta existe). |
+| `/users/password-reset/confirm/` | POST | Público                     | Define a nova password (uid+token do link recebido).   |
 | `/users/me/`            | GET     | Autenticado (qualquer role)         | Perfil do utilizador autenticado.                       |
 | `/users/`               | GET     | **admin, commercial_grants, commercial_public** | Lista. Admin filtra por `?role=` e `?active=true\|false\|all`; comerciais veem só `viewer`/`client`. |
 | `/users/<id>/activate/` | POST    | **admin, commercial_grants, commercial_public** | Reativa o utilizador (`is_active=True`) — comerciais só um `viewer`/`client`. |

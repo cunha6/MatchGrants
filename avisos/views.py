@@ -1,6 +1,7 @@
-"""Endpoints da app avisos: listagem (exige sessão), detalhe (público — um aviso de cada vez,
-usado a partir do match sem login), edição (admin+commercial_grants+commercial_public) e
-scrape (aberto, para automação diária). As views são magras — a lógica vive em service/db."""
+"""Endpoints da app avisos: listagem (exige sessão), detalhe (autenticados: qualquer aviso;
+sem sessão: só os avisos que o match dessa sessão devolveu — ver common/session_access.py),
+edição (admin+commercial_grants+commercial_public) e scrape (aberto, para automação diária).
+As views são magras — a lógica vive em service/db."""
 
 import json
 import logging
@@ -18,6 +19,7 @@ from django.views.decorators.http import require_http_methods, require_POST
 from common.dates import parse_date
 from common.files import safe_media_path
 from common.pagination import paginate
+from common.session_access import can_view_grant
 from common.text import normalize as _normalize
 from users.models import UserProfile
 from users.permissions import require_role
@@ -398,7 +400,15 @@ def grants_list(request):
 
 
 def grants_detail(request, pk):
-    """Detalhe COMPLETO de um aviso (público) — todos os campos + relações."""
+    """Detalhe COMPLETO de um aviso — todos os campos + relações.
+
+    Autenticados veem qualquer aviso (público entre sessões válidas). Sem sessão, só o(s)
+    aviso(s) que o match desta MESMA sessão devolveu (ver common/session_access.py) — impede
+    ver avisos arbitrários só por trocar o id na URL. Devolve 404 em ambos os casos de recusa
+    (aviso inexistente ou sem acesso) para não revelar se o id existe.
+    """
+    if not request.user.is_authenticated and not can_view_grant(request, pk):
+        return JsonResponse({"error": "Aviso não encontrado."}, status=404)
     grant = Grant.objects.filter(pk=pk).prefetch_related(
         "phases", "covered_areas", "phase_areas", "financing_rates", "expense_limits",
         "non_compliance_penalties", "evaluation_methodologies", "beneficiaries_by_action",
@@ -568,7 +578,8 @@ def _log_and_notify_edit(request, grant, changes, collection_keys) -> None:
         grant.grant_code or "?", grant.pk, request.user.username, " | ".join(parts),
     )
     # Comerciais recebem email das alterações (best-effort — não bloqueia a resposta).
-    notify_grants([grant], action="alterado")
+    # Uma edição manual é sempre uma ATUALIZAÇÃO (o aviso já existia).
+    notify_grants([], [grant])
 
 
 # --- Scrape (ingestão de avisos) — ABERTO (sem autenticação), POST (tem efeitos) -----

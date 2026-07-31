@@ -282,6 +282,9 @@ components:
         region: { type: string }
         dimension: { type: string, enum: [micro, pequena, media, grande] }
         entity_type: { type: string }
+        email: { type: string, description: "Contacto — exigido sem sessão para revelar os matches." }
+        name: { type: string, description: "Contacto — exigido sem sessão para revelar os matches." }
+        job_title: { type: string, description: "Função na empresa — exigido sem sessão para revelar os matches." }
 
     MatchResult:
       type: object
@@ -340,6 +343,11 @@ components:
         needs_more_info: { type: boolean }
         missing_fields:
           type: array
+          description: >-
+            Além de campos em branco, `field: "email"` também aparece quando o email foi
+            preenchido mas o domínio é webmail genérico/gratuito (gmail, outlook, hotmail...)
+            ou de um serviço de email temporário/descartável conhecido — o gate exige um email
+            de empresa. Nesse caso `label` vem "Email inválido" em vez de "Email".
           items:
             type: object
             properties:
@@ -370,8 +378,10 @@ components:
         id: { type: integer }
         username: { type: string }
         email: { type: string }
+        first_name: { type: string }
         role: { type: string, enum: [admin, commercial_grants, commercial_public, client, viewer] }
         is_active: { type: boolean }
+        job_title: { type: string, nullable: true, description: "Função na empresa — preenchida pelo pop-up de contacto do match sem login." }
         nif: { type: string, nullable: true }
         entity_type: { type: string, nullable: true }
         entity_size: { type: string, nullable: true }
@@ -814,8 +824,12 @@ paths:
       tags: [match]
       summary: Cruza um nif com os avisos ativos elegíveis, ordenados por relevância
       description: >
-        Sem autenticação, regista o nif como viewer (lead). Autenticado, só consulta —
-        `viewer_user_id` vem null e nada é escrito.
+        Sem autenticação, regista o nif como viewer (lead) e exige contacto (email/name/
+        job_title) antes de devolver `matches`: a procura corre sempre já nesta chamada, mas
+        sem os 3 campos de contacto a resposta é 422 (mesmo mecanismo do CAE/localização em
+        falta) — reenviar o mesmo NIF com email/name/job_title preenchidos devolve os
+        resultados (calculados só uma vez, servidos de cache). Autenticado, só consulta —
+        `viewer_user_id` vem null, contacto é ignorado e nunca há retenção.
       requestBody:
         required: true
         content:
@@ -833,7 +847,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "422":
-          description: Faltam dados obrigatórios (CAE/localização) — reenviar com overrides
+          description: >
+            Faltam dados obrigatórios — CAE/localização (reenviar com overrides) OU, sem
+            sessão, contacto (email/name/job_title) para revelar os resultados já calculados.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/MissingFieldsError" }
@@ -899,6 +915,68 @@ paths:
       responses:
         "200":
           description: OK
+
+  /users/password-reset/:
+    post:
+      tags: [users]
+      summary: Pede o email de redefinição/definição de password
+      description: >
+        Público. Resposta SEMPRE 200 com a mesma mensagem, exista ou não uma conta com esse
+        email — nunca revela se a conta existe. Funciona mesmo para contas que nunca tiveram
+        password (viewers), servindo também para definir a primeira. Throttle de 3 pedidos /
+        15 min por email (silencioso — mesma resposta).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string }
+      responses:
+        "200":
+          description: OK (sempre, independentemente do resultado real)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+
+  /users/password-reset/confirm/:
+    post:
+      tags: [users]
+      summary: Confirma a redefinição de password (uid + token do link recebido por email)
+      description: >
+        Público. O token (django.contrib.auth.tokens) está ligado ao hash da password atual
+        do utilizador — invalida-se sozinho assim que a password muda, e expira ao fim de
+        PASSWORD_RESET_TIMEOUT (Django, 3 dias por omissão).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [uid, token, password]
+              properties:
+                uid: { type: string, description: "uidb64 vindo do link do email." }
+                token: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+        "400":
+          description: Link inválido/expirado OU password que não cumpre a política (mesma forma de erro para os dois — não distingue, para não dar pistas)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /users/:
     get:

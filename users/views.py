@@ -114,6 +114,47 @@ def logout_view(request):
     return JsonResponse({"message": "Logged out"})
 
 
+# Throttle do pedido de reset (por email) — evita encher a caixa de correio de alguém.
+_RESET_MAX_ATTEMPTS = 3
+_RESET_LOCK_SECONDS = 900  # 15 min
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def password_reset_request_view(request):
+    """POST {email} -> pede o email de reset/definição de password. Resposta SEMPRE igual
+    (200, mesma mensagem) quer o email exista ou não — nunca revela se uma conta existe.
+    Funciona mesmo para quem nunca teve password (viewers). Ver service.request_password_reset."""
+    data = _payload(request)
+    email = (data.get("email") or "").strip()
+    message = "Se existir uma conta com esse email, foi enviado um link de redefinição."
+
+    cache_key = f"password_reset_attempts:{email.lower()}"
+    if email and cache.get(cache_key, 0) >= _RESET_MAX_ATTEMPTS:
+        return JsonResponse({"message": message})  # mesma resposta — não denuncia o throttle
+
+    if email:
+        cache.set(cache_key, cache.get(cache_key, 0) + 1, _RESET_LOCK_SECONDS)
+        service.request_password_reset(email)
+    return JsonResponse({"message": message})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def password_reset_confirm_view(request):
+    """POST {uid, token, password} -> define a nova password se o link for válido.
+    200 em sucesso; 400 se o link for inválido/expirado ou a password não cumprir a
+    política (mesma mensagem para os dois — ver service.reset_password_with_token)."""
+    data = _payload(request)
+    try:
+        service.reset_password_with_token(
+            data.get("uid") or "", data.get("token") or "", data.get("password"),
+        )
+    except ValueError as e:
+        return JsonResponse({"error": str(e)}, status=400)
+    return JsonResponse({"message": "Password redefinida com sucesso."})
+
+
 @require_role(UserProfile.ADMIN, *_COMMERCIAL_ROLES)
 @require_http_methods(["GET"])
 def users_all(request):

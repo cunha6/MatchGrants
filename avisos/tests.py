@@ -19,6 +19,7 @@ from django.contrib.auth.models import User
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from common.dates import parse_date, parse_datetime
+from common.session_access import SESSION_KEY
 from common.text import normalize
 from users.models import UserProfile
 
@@ -827,12 +828,38 @@ class GrantsListAccessTests(TestCase):
         resp = self.client.get("/avisos/list/")
         self.assertEqual(resp.status_code, 200)
 
-    def test_detail_is_public_without_login(self):
+    def test_detail_requires_prior_match_without_login(self):
+        # Sem sessão e sem ter feito match nenhum -> não pode adivinhar o id na URL.
+        resp = self.client.get(f"/avisos/{self.grant.pk}/")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_detail_accessible_after_match_grants_it(self):
         # Clicar num aviso a partir de um resultado de match (sem sessão) tem de funcionar —
-        # é o único aviso a que o utilizador não autenticado pode aceder.
+        # simula o que match.views.evaluate_nif faz via common.session_access.allow_grants.
+        session = self.client.session
+        session[SESSION_KEY] = [self.grant.pk]
+        session.save()
         resp = self.client.get(f"/avisos/{self.grant.pk}/")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["grant_code"], "ACCESS-1")
+
+    def test_detail_blocked_for_other_grant_not_in_match(self):
+        # Ter acesso a UM aviso (via match) não desbloqueia OUTROS avisos por troca de id.
+        other = Grant.objects.create(
+            source="portugal", scraping_url="https://x/access-other/",
+            grant_code="ACCESS-2", ai_processed=True, active=True,
+        )
+        session = self.client.session
+        session[SESSION_KEY] = [self.grant.pk]
+        session.save()
+        resp = self.client.get(f"/avisos/{other.pk}/")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_detail_is_public_when_authenticated(self):
+        # Autenticado vê qualquer aviso, mesmo sem ter feito nenhum match nesta sessão.
+        self.client.force_login(self.client_user)
+        resp = self.client.get(f"/avisos/{self.grant.pk}/")
+        self.assertEqual(resp.status_code, 200)
 
 
 class GrantsListAndDetailTests(TestCase):
@@ -1049,6 +1076,9 @@ class GrantDocumentServeTests(TestCase):
             source="portugal", scraping_url="https://x/doc/", grant_code="DOC-1",
             ai_processed=True, pdf_path=self.rel,
         )
+        # O detalhe do aviso agora exige sessão OU um match prévio (ver GrantsListAccessTests)
+        # — esta classe testa a serialização de documentos, não a política de acesso.
+        self.client.force_login(User.objects.create_user("cliente_doc", password=TEST_PASSWORD))
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1091,3 +1121,75 @@ class GrantDocumentServeTests(TestCase):
         with override_settings(BASE_DIR=self.tmp):
             body = self.client.get(f"/avisos/{g.pk}/").json()
         self.assertIsNone(body["document_url"])
+
+
+class ScrapeNotifiesCommercialsTests(TestCase):
+    """Cobertura em falta: só havia testes de parsing de HTML isolados, nunca do pipeline
+    completo do scrape (_process_grant -> notify_grants -> email real). Confirma que a rota
+    de scrape distingue avisos NOVOS de ATUALIZADOS e envia um único email HTML aos
+    commercial_grants/commercial_public com as duas listas."""
+
+    def setUp(self):
+        self.commercial = User.objects.create_user("com_scrape", email="com_scrape@x.pt")
+        self.commercial.profile.role = UserProfile.COMMERCIAL_GRANTS
+        self.commercial.profile.save()
+        # Já existe na BD (grant_code conhecido, mas com o URL antigo) — é o caso "atualizado",
+        # incluindo republicação (o canonical_url muda, o grant_code é que liga os dois).
+        self.existing = Grant.objects.create(
+            source="portugal", scraping_url="https://x/OLD-URL/", grant_code="EXISTING-1",
+            title="Antigo", ai_processed=True,
+        )
+
+    @patch("match.grant_embeddings.save_grant_embeddings")  # sem chamadas reais à OpenAI
+    @patch("avisos.service.run_pipeline")
+    @patch("avisos.service.text_is_invitation", return_value=False)
+    @patch("avisos.service.pdf_to_markdown")
+    @patch("avisos.service.download_pdf")
+    @patch("avisos.service.find_existing_document", return_value=None)
+    @patch("avisos.service.scrape_portugal2030_web")
+    def test_scrape_sends_email_with_new_and_updated(
+        self, mock_scraper, mock_find_doc, mock_download, mock_md, mock_invite, mock_pipeline,
+        mock_embeddings,
+    ):
+        from django.core import mail
+        from . import service
+
+        raw_new = {
+            "grant_code": "NEW-1",
+            "latest_notice": {"url": "https://x/NEW-1.pdf", "nome": "Aviso NEW-1"},
+            "documentos": [],
+        }
+        raw_updated = {
+            "grant_code": "EXISTING-1",
+            "latest_notice": {"url": "https://x/EXISTING-1.pdf", "nome": "Aviso EXISTING-1"},
+            "documentos": [],
+        }
+        mock_scraper.return_value = [raw_new, raw_updated]
+        mock_download.side_effect = lambda url, download_dir, **kw: f"/tmp/{url.rsplit('/', 1)[-1]}"
+        mock_md.side_effect = lambda path, download_dir: (f"markdown de {path}", f"{path}.md")
+
+        def fake_pipeline(final_md, source_name, extra=None):
+            if source_name == "NEW-1":
+                return {"Grant": {"grant_code": "NEW-1", "title": "Aviso Novo",
+                                  "total_allocation": 2000000.0}}
+            return {"Grant": {"grant_code": "EXISTING-1", "title": "Antigo Atualizado",
+                              "total_allocation": 500000.0}}
+        mock_pipeline.side_effect = fake_pipeline
+
+        service.scrape_portugal()
+
+        # Um novo Grant criado; o existente foi ATUALIZADO, não duplicado.
+        self.assertTrue(Grant.objects.filter(grant_code="NEW-1").exists())
+        self.assertEqual(Grant.objects.filter(grant_code="EXISTING-1").count(), 1)
+        self.existing.refresh_from_db()
+        self.assertEqual(self.existing.title, "Antigo Atualizado")
+
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox[0]
+        self.assertIn("com_scrape@x.pt", email.to)
+        html = email.alternatives[0][0]
+        self.assertIn("Aviso Novo", html)
+        self.assertIn("Antigo Atualizado", html)
+        # As duas secções do template aparecem, uma para cada lista.
+        self.assertIn("Novos avisos", html)
+        self.assertIn("Avisos atualizados", html)

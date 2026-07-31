@@ -1,0 +1,16 @@
+{
+  "name": "matchgrants-emails",
+  "private": true,
+  "description": "Templates React Email (.tsx) — renderizados para HTML estático via 'npm run render' (chamado pelo management command 'python manage.py render_emails'). Nunca corre em runtime no Django.",
+  "type": "module",
+  "scripts": {
+    "render": "node render.mjs"
+  },
+  "devDependencies": {
+    "@react-email/components": "^0.0.31",
+    "@react-email/render": "^1.0.1",
+    "esbuild": "^0.24.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

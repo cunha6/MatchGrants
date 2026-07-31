@@ -87,5 +87,8 @@ class UserProfile(models.Model):
     parish = models.CharField(max_length=100, blank=True, null=True)      # freguesia
     postal_code = models.CharField(max_length=20, blank=True, null=True)
 
+    # --- Contacto (preenchido pelo pop-up do match sem login, não vem do nif.pt) ---
+    job_title = models.CharField(max_length=150, blank=True, null=True)   # função na empresa
+
     def __str__(self):
         return f"{self.user.username} ({self.role})"

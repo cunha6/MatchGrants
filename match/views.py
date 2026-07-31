@@ -6,6 +6,7 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
+from common.session_access import allow_grants
 from users.models import UserProfile
 from users.permissions import require_role
 from .services import (
@@ -27,16 +28,23 @@ def _payload(request) -> dict:
 @csrf_exempt
 @require_http_methods(["POST"])
 def evaluate_nif(request):
-    """POST {"nif": "...", "cae"?, "region"?, "dimension"?, "entity_type"?} -> matches ordenados.
+    """POST {"nif": "...", "cae"?, "region"?, "dimension"?, "entity_type"?,
+    "email"?, "name"?, "job_title"?} -> matches ordenados.
 
-    Os campos opcionais (cae/region/dimension) servem para responder a um pedido de
-    mais informações: quando o nif.pt não traz CAE ou localização, a resposta 422 diz
+    Os campos opcionais cae/region/dimension/entity_type servem para responder a um pedido
+    de mais informações: quando o nif.pt não traz CAE ou localização, a resposta 422 diz
     o que falta; o cliente reenvia o mesmo pedido já com esses campos preenchidos.
+
+    email/name/job_title: GATE de contacto, só para quem NÃO tem sessão. A procura corre
+    sempre já na 1ª chamada (nunca espera pelo contacto), mas sem estes 3 campos os
+    `matches` ficam retidos — a resposta é o mesmo 422 `needs_more_info` de cima, com
+    missing_fields=[email, name, job_title]. O cliente mostra o pop-up e reenvia o mesmo
+    NIF já com email/name/job_title preenchidos para receber os `matches`.
 
     O viewer (lead) só é registado quando o pedido vem SEM autenticação — é aí que faz
     sentido guardar quem consultou os apoios. Um utilizador autenticado (admin, client…)
-    está a consultar, não a gerar lead: nesse caso `viewer_user_id` vem a None e nada é
-    escrito na BD.
+    está a consultar, não a gerar lead: nesse caso `viewer_user_id` vem a None, email/
+    name/job_title são ignorados, e os `matches` nunca ficam retidos.
 
     - 200: {company, nif, viewer_user_id (None se autenticado), matches[]}
     - 400: NIF em falta, inválido, inexistente ou contribuinte inativo
@@ -54,10 +62,15 @@ def evaluate_nif(request):
         "dimension": data.get("dimension"),
         "entity_type": data.get("entity_type"),
     }
+    contact = {
+        "email": data.get("email"),
+        "name": data.get("name"),
+        "job_title": data.get("job_title"),
+    }
     try:
         result = NifMatchingService().evaluate(
-            nif, overrides=overrides,
-            # Só quem NÃO está autenticado gera um viewer (lead).
+            nif, overrides=overrides, contact=contact,
+            # Só quem NÃO está autenticado gera um viewer (lead) e passa pelo gate de contacto.
             create_viewer=not request.user.is_authenticated,
         )
     except NifValidationError as exc:
@@ -69,6 +82,12 @@ def evaluate_nif(request):
         )
     except NifServiceError as exc:
         return JsonResponse({"error": str(exc)}, status=502)
+
+    if not request.user.is_authenticated:
+        # Sem sessão: desbloqueia o detalhe SÓ dos avisos que este match devolveu (ver
+        # common/session_access.py e avisos/views.grants_detail) — impede ver outros avisos
+        # trocando o id na URL.
+        allow_grants(request, (m.get("opportunity_id") for m in result.get("matches", [])))
 
     return JsonResponse(result, json_dumps_params={"ensure_ascii": False, "indent": 2})
 

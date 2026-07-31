@@ -1,10 +1,15 @@
 """User service layer — operates on django.contrib.auth User."""
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth.tokens import default_token_generator
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from common.pagination import paginate_queryset
+from . import notifications
 from .models import UserProfile
 
 _VALID_ROLES = {
@@ -171,6 +176,50 @@ def change_password(user_id: int, new_password, current_password=None, by_admin:
     return True
 
 
+def request_password_reset(email: str) -> None:
+    """Envia (best-effort) um email de reset/definição de password a quem tiver `email`.
+    NUNCA revela se a conta existe — a view responde sempre a mesma mensagem genérica; esta
+    função não devolve nada que distinga os casos.
+
+    Funciona mesmo para quem NUNCA teve password (viewers — set_unusable_password() no
+    create_or_update_viewer): serve também como forma de DEFINIR a primeira password, não só
+    de repor uma esquecida. Isto é seguro mesmo para um viewer ainda não promovido — o
+    is_active=False continua a impedir o login (ver Django ModelBackend), definir a password
+    sozinha não dá acesso; só depois da promoção (promote_viewer) é que a conta consegue
+    entrar com a password já definida aqui.
+    """
+    email = (email or "").strip()
+    if not email:
+        return
+    user = User.objects.filter(email__iexact=email).first()
+    if user is None:
+        return
+    uidb64 = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    reset_url = f"{settings.FRONTEND_URL}/reset-password?uid={uidb64}&token={token}"
+    notifications.send_password_reset_email(user.email, reset_url)
+
+
+def reset_password_with_token(uidb64: str, token: str, new_password: str) -> bool:
+    """Valida uid+token (django.contrib.auth.tokens — assinado, ligado ao hash da password
+    atual, expira em PASSWORD_RESET_TIMEOUT) e, se válido, aplica `new_password`.
+
+    Devolve True em sucesso. Levanta ValueError (→ 400 na view) em qualquer falha — link
+    inválido/expirado ou password que não cumpre a política — sem distinguir qual, para não
+    dar pistas sobre contas existentes a quem só tenha um uid adivinhado.
+    """
+    try:
+        user = User.objects.get(pk=force_str(urlsafe_base64_decode(uidb64)))
+    except (User.DoesNotExist, ValueError, TypeError, OverflowError):
+        raise ValueError("Link de redefinição inválido ou expirado.")
+    if not default_token_generator.check_token(user, token):
+        raise ValueError("Link de redefinição inválido ou expirado.")
+    _validate_password(new_password)
+    user.set_password(new_password)
+    user.save()
+    return True
+
+
 def _validate_password(password) -> None:
     """Password policy: mais de 8 caracteres + AUTH_PASSWORD_VALIDATORS do Django
     (rejeita passwords demasiado comuns, só numéricas, etc.)."""
@@ -269,6 +318,7 @@ def _serialize(user: User) -> dict:
         "id": user.id,
         "username": user.username,
         "email": user.email,
+        "first_name": user.first_name,
         "role": profile.role if profile else None,
         "is_active": user.is_active,
         "is_staff": user.is_staff,
@@ -291,6 +341,7 @@ def _serialize(user: User) -> dict:
             "region": profile.region,
             "nuts_ii": profile.nuts_ii,
             "nuts_iii": profile.nuts_iii,
+            "job_title": profile.job_title,
         })
     return data
 

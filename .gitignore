@@ -31,3 +31,8 @@ venv/
 .env/
 .venv/
 
+# Toolchain Node dos templates de email (emails/) — só usado em dev, via
+# `python manage.py render_emails` (ver match/management/commands/render_emails.py).
+emails/node_modules/
+emails/.render-tmp-*.mjs
+

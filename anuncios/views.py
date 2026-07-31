@@ -13,7 +13,7 @@ from common.files import safe_media_path
 from common.pagination import paginate
 from users.models import UserProfile
 from users.permissions import require_role
-from . import services
+from . import notifications, services
 from .models import Notice
 
 # Pasta (relativa ao BASE_DIR) onde ficam os cadernos de encargos descarregados.
@@ -176,6 +176,9 @@ def notice_edit(request, pk):
                     for f, (old, new) in changes.items()
                 ),
             )
+            # Comerciais recebem email das alterações (best-effort — não bloqueia a resposta).
+            # Uma edição manual é sempre uma ATUALIZAÇÃO (o anúncio já existia).
+            notifications.notify_notices([], [notice])
         else:
             audit_logger.info(
                 "EDIÇÃO anúncio %s (id=%s) por %s: sem alterações efetivas (valores iguais).",

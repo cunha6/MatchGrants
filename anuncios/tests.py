@@ -49,10 +49,12 @@ class NormalizationTests(SimpleTestCase):
         self.assertEqual(specifications.normalize(""), "")
 
     def test_matched_keywords_accent_insensitive(self):
+        # "Serviços" foi removida das KEYWORDS de propósito (demasiado genérica — aparece em
+        # quase todos os anúncios de contratação pública e anulava o filtro).
         got = services.matched_keywords("Aquisição de serviços de CONSULTADORIA e avaliação")
         self.assertIn("Consultadoria", got)
         self.assertIn("Avaliação", got)
-        self.assertIn("Serviços", got)
+        self.assertNotIn("Serviços", got)
 
     def test_matched_keywords_none(self):
         self.assertEqual(services.matched_keywords("Fornecimento de material de limpeza"), [])
@@ -190,26 +192,26 @@ class PairDocumentsInZipTests(SimpleTestCase):
             return specifications._pair_documents_in_zip(self._zip(files))
 
     def test_both_named(self):
-        # O caderno de encargos fica na raiz; o programa vai para a subpasta programa_Concurso/.
+        # Caderno de encargos e programa vão cada um para a sua subpasta própria.
         out = self._pair({"Caderno de Encargos.pdf": b"%PDF a",
                           "Programa de Concurso.pdf": b"%PDF b"})
-        self.assertEqual(out, {"specifications": "Caderno de Encargos.pdf",
-                               "program": "programa_Concurso/Programa de Concurso.pdf"})
+        self.assertEqual(out, {"specifications": "caderno_encargos/Caderno de Encargos.pdf",
+                               "program": "programa_concurso/Programa de Concurso.pdf"})
 
     def test_program_falls_back_to_other_pdf_next_to_ce(self):
         # Programa sem nome identificável -> o outro PDF junto do caderno de encargos.
         out = self._pair({"Caderno de Encargos.pdf": b"%PDF a", "Documento.pdf": b"%PDF b"})
-        self.assertEqual(out["specifications"], "Caderno de Encargos.pdf")
-        self.assertEqual(out["program"], "programa_Concurso/Documento.pdf")
+        self.assertEqual(out["specifications"], "caderno_encargos/Caderno de Encargos.pdf")
+        self.assertEqual(out["program"], "programa_concurso/Documento.pdf")
 
     def test_only_ce_no_program(self):
         out = self._pair({"Caderno de Encargos.pdf": b"%PDF a"})
-        self.assertEqual(out, {"specifications": "Caderno de Encargos.pdf", "program": ""})
+        self.assertEqual(out, {"specifications": "caderno_encargos/Caderno de Encargos.pdf", "program": ""})
 
     def test_only_program_named(self):
         out = self._pair({"Programa de Concurso.pdf": b"%PDF a"})
         self.assertEqual(out, {"specifications": "",
-                               "program": "programa_Concurso/Programa de Concurso.pdf"})
+                               "program": "programa_concurso/Programa de Concurso.pdf"})
 
     def test_no_pdf(self):
         self.assertEqual(self._pair({"notas.txt": b"x"}),
@@ -224,7 +226,7 @@ class FetchDocumentsTests(SimpleTestCase):
              mock.patch("anuncios.specifications._save_bytes",
                         side_effect=lambda name, content, subdir="": f"pdf_Anuncios/{subdir + chr(47) if subdir else ''}{name}"):
             out = specifications.fetch_documents("http://x/ce.pdf")
-        self.assertEqual(out, {"specifications": "pdf_Anuncios/Caderno de Encargos.pdf", "program": ""})
+        self.assertEqual(out, {"specifications": "pdf_Anuncios/caderno_encargos/Caderno de Encargos.pdf", "program": ""})
 
     def test_direct_pdf_program(self):
         resp = FakeResp(b"%PDF-1.7", ctype="application/pdf", url="http://x/pc.pdf",
@@ -234,7 +236,7 @@ class FetchDocumentsTests(SimpleTestCase):
                         side_effect=lambda name, content, subdir="": f"pdf_Anuncios/{subdir + chr(47) if subdir else ''}{name}"):
             out = specifications.fetch_documents("http://x/pc.pdf")
         self.assertEqual(out, {"specifications": "",
-                               "program": "pdf_Anuncios/programa_Concurso/Programa de Concurso.pdf"})
+                               "program": "pdf_Anuncios/programa_concurso/Programa de Concurso.pdf"})
 
     def test_empty_url_and_get_failure(self):
         self.assertEqual(specifications.fetch_documents(""), {"specifications": "", "program": ""})
@@ -307,7 +309,7 @@ class FetchSpecificationsTests(SimpleTestCase):
              mock.patch("anuncios.specifications._save_bytes",
                         side_effect=lambda name, content, subdir="": f"pdf_Anuncios/{subdir + chr(47) if subdir else ''}{name}"):
             self.assertEqual(specifications.fetch_specifications("http://x/ce.pdf"),
-                             "pdf_Anuncios/Caderno de Encargos.pdf")
+                             "pdf_Anuncios/caderno_encargos/Caderno de Encargos.pdf")
 
     def test_direct_pdf_non_ce_name_skipped(self):
         resp = FakeResp(b"%PDF-1.7", ctype="application/pdf", url="http://x/prog.pdf",
@@ -336,18 +338,23 @@ def _notice_data(**over):
 
 class UpsertNoticeTests(TestCase):
     def test_create_then_unchanged(self):
-        self.assertEqual(services._upsert_notice(_notice_data()), "created")
-        self.assertEqual(services._upsert_notice(_notice_data()), "unchanged")
+        status, obj = services._upsert_notice(_notice_data())
+        self.assertEqual(status, "created")
+        self.assertEqual(obj.notice_number, "1/2026")
+        status, _ = services._upsert_notice(_notice_data())
+        self.assertEqual(status, "unchanged")
         self.assertEqual(Notice.objects.count(), 1)
 
     def test_update_changed_field(self):
         services._upsert_notice(_notice_data(entity_name="Old"))
-        self.assertEqual(services._upsert_notice(_notice_data(entity_name="New")), "updated")
+        status, obj = services._upsert_notice(_notice_data(entity_name="New"))
+        self.assertEqual(status, "updated")
+        self.assertEqual(obj.entity_name, "New")
         self.assertEqual(Notice.objects.get(notice_number="1/2026").entity_name, "New")
 
     def test_empty_does_not_overwrite(self):
         services._upsert_notice(_notice_data(entity_name="Original"))
-        status = services._upsert_notice(_notice_data(entity_name=""))
+        status, _ = services._upsert_notice(_notice_data(entity_name=""))
         self.assertEqual(status, "unchanged")
         self.assertEqual(Notice.objects.get(notice_number="1/2026").entity_name, "Original")
 
@@ -883,8 +890,8 @@ class SpecificationsServeTests(TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        (self.tmp / "pdf_Anuncios").mkdir(parents=True)
-        self.rel = "pdf_Anuncios/20260101_ce.pdf"
+        (self.tmp / "pdf_Anuncios" / "caderno_encargos").mkdir(parents=True)
+        self.rel = "pdf_Anuncios/caderno_encargos/20260101_ce.pdf"
         (self.tmp / self.rel).write_bytes(b"%PDF-1.4\ncaderno\n%%EOF")
         self.notice = Notice.objects.create(
             notice_number="CE-1", specifications_path=self.rel,
@@ -926,13 +933,13 @@ class SpecificationsServeTests(TestCase):
 
 
 class ProgramServeTests(TestCase):
-    """Servir o programa de concurso local (pdf_Anuncios/programa_Concurso/) e o link no
+    """Servir o programa de concurso local (pdf_Anuncios/programa_concurso/) e o link no
     detalhe. BASE_DIR temporário para não escrever no repositório."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        (self.tmp / "pdf_Anuncios" / "programa_Concurso").mkdir(parents=True)
-        self.rel = "pdf_Anuncios/programa_Concurso/20260101_pc.pdf"
+        (self.tmp / "pdf_Anuncios" / "programa_concurso").mkdir(parents=True)
+        self.rel = "pdf_Anuncios/programa_concurso/20260101_pc.pdf"
         (self.tmp / self.rel).write_bytes(b"%PDF-1.4\nprograma\n%%EOF")
         self.notice = Notice.objects.create(
             notice_number="PC-1", program_path=self.rel,

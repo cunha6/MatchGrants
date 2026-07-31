@@ -664,7 +664,7 @@ REGRAS (CRÍTICO):
    `state_aid_regime` NÃO pode ser "Não Aplicável". Os dois campos são logicamente acoplados.
    C
    
-3. AUTOFINANCIAMENTO: Verifica se é exigida percentagem mínima de capitais próprios.
+3. AUTOFINANCIAMENTO: Verifica se é exigida percentagem máxima de capitais próprios.
 
 4. FORMAS DE PAGAMENTO vs FORMAS DE APOIO — DISTINÇÃO OBRIGATÓRIA (CRÍTICO):
    O documento tem DUAS secções distintas que NÃO devem ser confundidas:

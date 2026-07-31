@@ -45,9 +45,10 @@ USER_AGENT = (
 
 # Destination folder (relative to project root) and accepted document extensions.
 SPECS_DIR = "pdf_Anuncios"
-# Subpasta (dentro de SPECS_DIR) onde fica o programa de concurso, separado do caderno de
-# encargos (que fica na raiz de pdf_Anuncios/).
-PROGRAM_SUBDIR = "programa_Concurso"
+# Subpastas (dentro de SPECS_DIR) onde ficam, separados, o caderno de encargos e o programa
+# de concurso.
+SPECS_SUBDIR = "caderno_encargos"
+PROGRAM_SUBDIR = "programa_concurso"
 DOC_EXTENSIONS = (".pdf", ".docx")
 
 # Specifications-name match (over the normalized name: lowercase, no accents,
@@ -133,7 +134,7 @@ def _save_bytes(name: str, content: bytes, subdir: str = "") -> str:
     """Save to pdf_Anuncios/[subdir/] with the original name prefixed by a timestamp.
 
     Format: '{YYYYMMDD_HHMMSS}_{original name}'. Returns the path relative to the root.
-    `subdir` separa o programa de concurso (PROGRAM_SUBDIR) do caderno de encargos (raiz).
+    `subdir` separa o caderno de encargos (SPECS_SUBDIR) do programa de concurso (PROGRAM_SUBDIR).
     """
     original = os.path.basename(name) or "documento.pdf"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -221,7 +222,8 @@ def _pair_documents_in_zip(zip_bytes: bytes) -> dict:
             if program is None and specs is not None:
                 program = next((i for i in pdfs if i is not specs), None)
             return {
-                "specifications": _save_bytes(specs.filename, zf.read(specs)) if specs else "",
+                "specifications": (_save_bytes(specs.filename, zf.read(specs), SPECS_SUBDIR)
+                                   if specs else ""),
                 "program": (_save_bytes(program.filename, zf.read(program), PROGRAM_SUBDIR)
                             if program and program is not specs else ""),
             }
@@ -361,15 +363,15 @@ def fetch_documents(url: str, driver_factory=None) -> dict:
     if _looks_pdf(resp):
         name = _response_filename(resp)
         if is_specifications(name):
-            return {"specifications": _save_bytes(name, content), "program": ""}
+            return {"specifications": _save_bytes(name, content, SPECS_SUBDIR), "program": ""}
         if is_program(name):
             return {"specifications": "", "program": _save_bytes(name, content, PROGRAM_SUBDIR)}
         return empty
 
-    # HTML estático: procura os dois na MESMA página (sem re-obter). O programa vai para a
-    # subpasta PROGRAM_SUBDIR; o caderno de encargos fica na raiz de pdf_Anuncios/.
+    # HTML estático: procura os dois na MESMA página (sem re-obter). O caderno de encargos vai
+    # para a subpasta SPECS_SUBDIR; o programa de concurso vai para a subpasta PROGRAM_SUBDIR.
     docs = {
-        "specifications": _find_in_html(content, resp.url, matcher=is_specifications),
+        "specifications": _find_in_html(content, resp.url, matcher=is_specifications, subdir=SPECS_SUBDIR),
         "program": _find_in_html(content, resp.url, matcher=is_program, subdir=PROGRAM_SUBDIR),
     }
     if docs["specifications"] or docs["program"]:
@@ -381,7 +383,7 @@ def fetch_documents(url: str, driver_factory=None) -> dict:
     if rendered:
         return {
             "specifications": _find_in_html(rendered, resp.url, cookies=cookies,
-                                            matcher=is_specifications),
+                                            matcher=is_specifications, subdir=SPECS_SUBDIR),
             "program": _find_in_html(rendered, resp.url, cookies=cookies,
                                      matcher=is_program, subdir=PROGRAM_SUBDIR),
         }

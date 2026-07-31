@@ -21,6 +21,7 @@ from django.db.models import Q
 
 from common.dates import parse_date as _parse_date
 from common.files import safe_media_path
+from . import notifications
 from .models import Notice
 from .specifications import SPECS_DIR, build_chrome, fetch_documents, normalize
 
@@ -182,8 +183,9 @@ def fetch_notices(num_days: int = 15) -> list[dict]:
 
 # --- Persistence -----------------------------------------------------------
 
-def _upsert_notice(data: dict) -> str:
-    """Create/update the notice. Returns 'created', 'updated' or 'unchanged'.
+def _upsert_notice(data: dict) -> tuple[str, Notice]:
+    """Create/update the notice. Returns (status, notice) — status é 'created', 'updated' ou
+    'unchanged'. O objeto devolvido alimenta a notificação aos comerciais (ver import_notices).
 
     Since notice_number is unique, a rectification/amendment arrives with the SAME
     notice_number and must update the existing row. Rules:
@@ -192,8 +194,8 @@ def _upsert_notice(data: dict) -> str:
     """
     obj = Notice.objects.filter(notice_number=data["notice_number"]).first()
     if obj is None:
-        Notice.objects.create(**data)
-        return "created"
+        obj = Notice.objects.create(**data)
+        return "created", obj
 
     changed = []
     for field, value in data.items():
@@ -204,7 +206,7 @@ def _upsert_notice(data: dict) -> str:
             changed.append(field)
 
     if not changed:
-        return "unchanged"
+        return "unchanged", obj
 
     # A última escrita foi a importação — mesmo que o anúncio já tivesse sido editado à mão
     # antes, a origem passa a refletir esta escrita mais recente (ver Notice.last_update_source).
@@ -213,7 +215,7 @@ def _upsert_notice(data: dict) -> str:
     obj.save(update_fields=changed + [
         "updated_at", "last_update_source", "last_updated_by",
     ])
-    return "updated"
+    return "updated", obj
 
 
 def _existing_doc_path(notice_number: str, field: str) -> str:
@@ -255,6 +257,7 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
     today = date.today()
     with_keywords = 0
     created = updated = unchanged = 0
+    created_records, updated_records = [], []
 
     # Chrome shared across the whole import: starts lazily on the first notice that needs
     # rendering (SPA), is reused by the rest, and is closed at the end.
@@ -323,11 +326,13 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
                     data["program_path"] = ""
                     logger.info(f"  [{number}] Sem link para as peças do procedimento.")
 
-            status = _upsert_notice(data)
+            status, obj = _upsert_notice(data)
             if status == "created":
                 created += 1
+                created_records.append(obj)
             elif status == "updated":
                 updated += 1
+                updated_records.append(obj)
             else:
                 unchanged += 1
     finally:
@@ -337,6 +342,11 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
 
     # Sincroniza o estado: qualquer anúncio cujo prazo de proposta já passou fica status=inactive.
     deactivated = deactivate_expired()
+
+    # Comerciais (commercial_public) recebem email-resumo dos anúncios criados/atualizados
+    # nesta importação — best-effort, nunca bloqueia a resposta (ver notifications.notify_notices).
+    if created_records or updated_records:
+        notifications.notify_notices(created_records, updated_records)
 
     return {
         "num_days": num_days,
@@ -645,7 +655,7 @@ def serialize_notice(n: Notice) -> dict:
             f"/anuncios/{n.id}/document/cadernoEncargos/"
             if safe_media_path(n.specifications_path, SPECS_DIR) else None
         ),
-        # Caminho local + link do programa de concurso (sob pdf_Anuncios/programa_Concurso/).
+        # Caminho local + link do programa de concurso (sob pdf_Anuncios/programa_concurso/).
         # O front-end abre-o com target="_blank", tal como o caderno de encargos.
         "program_path": n.program_path,
         "program_url": (

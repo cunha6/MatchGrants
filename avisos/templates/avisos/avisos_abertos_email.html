@@ -1,0 +1,103 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+{% comment %}
+Design copiado à mão de emails/avisosAbertos.tsx (via emails/html/avisosAbertos_email.html) —
+este template é o único dos quatro que é genuinamente dinâmico por envio (lista real de
+avisos criados/atualizados), por isso usa o motor de templates do Django ({% for %}) em vez
+do pipeline React Email/render_emails (esse só sabe gerar HTML estático, sem props reais).
+Se o design do .tsx mudar, replica a mudança aqui à mão — não há regeneração automática.
+{% endcomment %}
+<html dir="ltr" lang="pt">
+  <head>
+    <meta content="text/html; charset=UTF-8" http-equiv="Content-Type" />
+    <meta name="x-apple-disable-message-reformatting" />
+  </head>
+  <body style="margin:0;padding:0;background-color:#f4f4f4;font-family:'Gellix',Arial,sans-serif">
+    <table align="center" width="100%" border="0" cellpadding="0" cellspacing="0" role="presentation" style="background-color:#f4f4f4">
+      <tbody>
+        <tr>
+          <td align="center">
+            <table align="center" width="100%" border="0" cellpadding="0" cellspacing="0" role="presentation" style="max-width:600px;background-color:#ffffff">
+              <tbody>
+
+                <!-- HERO -->
+                <tr>
+                  <td style="background-color:#5cd9ba;padding:40px 40px 48px">
+                    <img alt="Aliados" height="57"
+                         src="https://aliados.consulting/wp-content/uploads/2025/04/logo-aliados-consulting-1.png"
+                         style="display:block;outline:none;border:none;text-decoration:none" />
+                    <h1 style="font-family:'Gellix',Arial,sans-serif;font-size:36px;line-height:1.15;letter-spacing:-1px;font-weight:700;color:#0312c2;margin:28px 0 16px">
+                      {% if new_grants and updated_grants %}Avisos novos e atualizados
+                      {% elif new_grants %}{{ new_grants|length|yesno:",Novo aviso aberto,Novos avisos abertos" }}
+                      {% else %}{{ updated_grants|length|yesno:",Aviso atualizado,Avisos atualizados" }}
+                      {% endif %}
+                    </h1>
+                    <p style="font-family:'Gellix',Arial,sans-serif;font-size:16px;line-height:1.6;color:rgba(3,18,194,0.85);margin:0">
+                      Consulte abaixo a dotação e a taxa de financiamento de cada aviso.
+                    </p>
+                  </td>
+                </tr>
+
+                <!-- TABELAS -->
+                <tr>
+                  <td style="background-color:#ffffff;padding:40px;border-top:4px solid #ebf5fc">
+                    {% if new_grants %}
+                    <h2 style="font-family:'Gellix',Arial,sans-serif;font-size:18px;font-weight:700;color:#0312c2;margin:0 0 8px">Novos avisos</h2>
+                    {% include "avisos/_avisos_table.html" with avisos=new_grants %}
+                    {% endif %}
+
+                    {% if updated_grants %}
+                    <h2 style="font-family:'Gellix',Arial,sans-serif;font-size:18px;font-weight:700;color:#0312c2;margin:{% if new_grants %}32px{% else %}0{% endif %} 0 8px">Avisos atualizados</h2>
+                    {% include "avisos/_avisos_table.html" with avisos=updated_grants %}
+                    {% endif %}
+
+                    <p style="font-family:'Gellix',Arial,sans-serif;font-size:12px;line-height:1.6;color:#666666;margin:32px 0 0;max-width:400px">
+                      Os prazos de candidatura são limitados. Se pretender avaliar o
+                      enquadramento de um projeto, contacte a nossa equipa.
+                    </p>
+                  </td>
+                </tr>
+
+                <!-- FOOTER -->
+                <tr>
+                  <td style="background-color:#ebf5fc;padding:40px;text-align:center">
+                    <p style="font-family:'Gellix',Arial,sans-serif;font-size:22px;line-height:1.4;font-style:italic;font-weight:700;color:#0312c2;margin:0 0 20px">
+                      &quot;Impacting the future <br />Together.&quot;
+                    </p>
+                    <table align="center" width="100%" border="0" cellpadding="0" cellspacing="0" role="presentation">
+                      <tbody>
+                        <tr>
+                          <td style="width:50%;vertical-align:top;text-align:left;padding-right:12px">
+                            <p style="font-family:'Gellix',Arial,sans-serif;font-size:12px;line-height:1.6;color:#333333;margin:0 0 12px">
+                              Fábrica Santo Thyrso · Av. da Fábrica de Santo Tirso Nº 88, Sala B1 <br />4780-257 Santo Tirso, Portugal
+                            </p>
+                            <p style="font-family:'Gellix',Arial,sans-serif;font-size:12px;line-height:1.6;color:#333333;margin:0">
+                              <a href="mailto:hello@aliados.consulting" style="font-family:'Gellix',Arial,sans-serif;color:#0312c2;text-decoration:none">hello@aliados.consulting</a>
+                            </p>
+                            <p style="font-family:'Gellix',Arial,sans-serif;font-size:12px;line-height:1.6;color:#333333;margin:4px 0 0">
+                              <a href="https://www.linkedin.com/company/aliadosconsulting" style="font-family:'Gellix',Arial,sans-serif;color:#0312c2;text-decoration:none">LinkedIn</a>
+                              &nbsp;·&nbsp;
+                              <a href="https://www.aliados.consulting" style="font-family:'Gellix',Arial,sans-serif;color:#0312c2;text-decoration:none">Website</a>
+                            </p>
+                          </td>
+                          <td style="width:50%;vertical-align:top;text-align:right;padding-left:12px">
+                            <p style="font-family:'Gellix',Arial,sans-serif;font-size:11px;line-height:1.6;color:#666666;margin:0 0 8px">
+                              &copy; {% now "Y" %} Aliados Consulting. Todos os direitos reservados.
+                            </p>
+                            <p style="font-family:'Gellix',Arial,sans-serif;font-size:11px;color:#666666;margin:0">
+                              <a href="#" style="font-family:'Gellix',Arial,sans-serif;color:#0312c2;text-decoration:underline">Unsubscribe</a> from marketing emails.
+                            </p>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </td>
+                </tr>
+
+              </tbody>
+            </table>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </body>
+</html>

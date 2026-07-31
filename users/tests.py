@@ -1,6 +1,12 @@
 import json
+from django.contrib.auth.tokens import default_token_generator
+from django.core import mail
+from django.core.cache import cache
 from django.test import TestCase, Client
 from django.contrib.auth.models import User
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
+from . import service
 from .models import UserProfile
 
 
@@ -855,3 +861,127 @@ class UserFieldValidationTests(TestCase):
                 response.status_code, 400,
                 f"O campo obrigatório '{field}' aceitou uma string vazia."
             )
+
+
+class PasswordResetTests(TestCase):
+    """Pedido + confirmação de reset de password por email (nunca revela se a conta existe)."""
+
+    def setUp(self):
+        self.client = Client()
+        cache.clear()  # isola o throttle entre testes
+        self.user = User.objects.create_user(
+            "com_reset", email="reset@x.pt", password="Xk93!vTq21mZ")
+
+        # Viewer — sem password utilizável e inativo, como create_or_update_viewer.
+        self.viewer = User.objects.create_user(
+            "999888777", email="lead@x.pt", is_active=False)
+        self.viewer.set_unusable_password()
+        self.viewer.save()
+
+    def _token_for(self, user):
+        uidb64 = urlsafe_base64_encode(force_bytes(user.pk))
+        token = default_token_generator.make_token(user)
+        return uidb64, token
+
+    # --- service layer ---
+    def test_request_reset_sends_email_for_valid_user(self):
+        service.request_password_reset("reset@x.pt")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["reset@x.pt"])
+        body = mail.outbox[0].alternatives[0][0]  # versão HTML
+        self.assertNotIn("https://example.com", body)  # placeholder substituído
+        self.assertIn("uid=", body)
+        self.assertIn("token=", body)
+
+    def test_request_reset_silent_for_unknown_email(self):
+        service.request_password_reset("ninguem@x.pt")
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_request_reset_works_for_viewer_without_usable_password(self):
+        # Serve também para DEFINIR a 1ª password (não só repor uma esquecida) — o viewer
+        # nunca teve password nenhuma, mas continua inativo (is_active=False) até promovido,
+        # por isso não há risco em deixá-lo passar por aqui.
+        service.request_password_reset("lead@x.pt")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["lead@x.pt"])
+
+    def test_reset_confirm_sets_first_password_for_viewer(self):
+        uidb64, token = self._token_for(self.viewer)
+        service.reset_password_with_token(uidb64, token, "primeiraPasswordForte123")
+        self.viewer.refresh_from_db()
+        self.assertTrue(self.viewer.check_password("primeiraPasswordForte123"))
+        # Continua inativo — ter password não é o mesmo que poder entrar.
+        self.assertFalse(self.viewer.is_active)
+
+    def test_reset_confirm_with_valid_token_changes_password(self):
+        uidb64, token = self._token_for(self.user)
+        service.reset_password_with_token(uidb64, token, "novaPasswordForte123")
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("novaPasswordForte123"))
+
+    def test_reset_confirm_with_invalid_token_raises(self):
+        uidb64, _ = self._token_for(self.user)
+        with self.assertRaises(ValueError):
+            service.reset_password_with_token(uidb64, "token-invalido", "novaPasswordForte123")
+
+    def test_reset_confirm_with_garbage_uid_raises(self):
+        with self.assertRaises(ValueError):
+            service.reset_password_with_token("lixo-nao-base64", "qualquer", "novaPasswordForte123")
+
+    def test_reset_confirm_with_weak_password_raises(self):
+        uidb64, token = self._token_for(self.user)
+        with self.assertRaises(ValueError):
+            service.reset_password_with_token(uidb64, token, "123")
+
+    def test_token_invalidated_after_password_already_changed(self):
+        # O token está ligado ao hash da password atual — usar depois de já ter mudado falha.
+        uidb64, token = self._token_for(self.user)
+        self.user.set_password("outraPasswordForte456")
+        self.user.save()
+        with self.assertRaises(ValueError):
+            service.reset_password_with_token(uidb64, token, "maisUmaPasswordForte789")
+
+    # --- view layer ---
+    def test_reset_request_view_same_response_known_and_unknown_email(self):
+        r1 = self.client.post("/users/password-reset/",
+                              data=json.dumps({"email": "reset@x.pt"}), content_type="application/json")
+        cache.clear()  # não deixar o throttle do 1º pedido interferir na comparação
+        r2 = self.client.post("/users/password-reset/",
+                              data=json.dumps({"email": "ninguem@x.pt"}), content_type="application/json")
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r1.json(), r2.json())
+
+    def test_reset_request_view_is_throttled(self):
+        for _ in range(3):
+            self.client.post("/users/password-reset/",
+                             data=json.dumps({"email": "reset@x.pt"}), content_type="application/json")
+        self.assertEqual(len(mail.outbox), 3)
+        # 4º pedido dentro da janela: mesma resposta, mas não dispara mais um email.
+        resp = self.client.post("/users/password-reset/",
+                                data=json.dumps({"email": "reset@x.pt"}), content_type="application/json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(mail.outbox), 3)  # continua 3 — não enviou o 4º
+
+    def test_reset_confirm_view_success_and_can_login_with_new_password(self):
+        uidb64, token = self._token_for(self.user)
+        resp = self.client.post(
+            "/users/password-reset/confirm/",
+            data=json.dumps({"uid": uidb64, "token": token, "password": "novaPasswordForte123"}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(
+            self.client.login(username="com_reset", password="novaPasswordForte123"))
+
+    def test_reset_confirm_view_invalid_token_returns_400(self):
+        uidb64, _ = self._token_for(self.user)
+        resp = self.client.post(
+            "/users/password-reset/confirm/",
+            data=json.dumps({"uid": uidb64, "token": "lixo", "password": "novaPasswordForte123"}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_reset_request_view_rejects_get(self):
+        self.assertEqual(self.client.get("/users/password-reset/").status_code, 405)

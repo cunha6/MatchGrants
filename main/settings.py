@@ -26,6 +26,10 @@ if not DEBUG:
     SESSION_COOKIE_SECURE = os.getenv('DJANGO_COOKIES_SECURE', 'true').lower() == 'true'
     CSRF_COOKIE_SECURE = SESSION_COOKIE_SECURE
 
+# Base do site do front-end (SPA à parte, não servido pelo Django) — usada para montar links
+# absolutos em emails (ex: reset de password). Sem barra final.
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -58,9 +62,9 @@ BASE_KEY = os.getenv('BASE_KEY')
 CTT_KEY = os.getenv('CTT_KEY')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 
-# --- Email (notificação aos comerciais quando um aviso é adicionado/alterado) ---
+# --- Email (Brevo — SMTP relay, evita os bloqueios de basic auth do Microsoft 365) ---
 # Em dev (DEBUG) o backend por defeito é a consola: os emails são impressos no log em vez
-# de enviados. Em produção usa SMTP com as credenciais do .env (EMAIL_HOST/USER/PASSWORD…).
+# de enviados. Em produção usa SMTP com as credenciais do .env (EMAIL_HOST + Brevo).
 EMAIL_BACKEND = os.getenv(
     'DJANGO_EMAIL_BACKEND',
     'django.core.mail.backends.console.EmailBackend' if DEBUG
@@ -68,10 +72,13 @@ EMAIL_BACKEND = os.getenv(
 )
 EMAIL_HOST = os.getenv('EMAIL_HOST', '')
 EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
-EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
-EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+# BREVO_SMTP_LOGIN/KEY são as credenciais da SMTP key do Brevo (Settings -> SMTP & API no
+# painel Brevo) — não são a password da conta. EMAIL_HOST_USER/PASSWORD ficam como fallback
+# genérico, para o caso de se voltar a trocar de fornecedor SMTP no futuro.
+EMAIL_HOST_USER = os.getenv('BREVO_SMTP_LOGIN') or os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('BREVO_SMTP_KEY') or os.getenv('EMAIL_HOST_PASSWORD', '')
 EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'true').lower() == 'true'
-DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', '')
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',

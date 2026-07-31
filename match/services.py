@@ -15,12 +15,14 @@ import threading
 import requests
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Exists, OuterRef, Q
 
 from avisos.models import Grant, GrantCae, GrantEmbedding
 from common.cae import cae_all_prefixes
 from users.models import UserProfile
+from .disposable_email import is_disposable_email
 from .models import NifCompany
 from .nuts import nuts_for
 from .ctt import ctt_lookup
@@ -31,6 +33,7 @@ from .scoring_rules import (
 from . import embeddings
 from . import grant_embeddings
 from . import llm_validation
+from . import notifications
 from .ranking import (
     active_phase_id, company_area_id, effective_budget_rate,
     max_financing_rate_from_rates,
@@ -192,14 +195,44 @@ class NifServiceError(Exception):
 
 
 class MissingClientDataError(Exception):
-    """Faltam dados obrigatórios do cliente (CAE/localização) para decidir a
-    elegibilidade. Em vez de excluir avisos em silêncio, o fluxo pede esses dados
-    (→ HTTP 422). `fields` é a lista [{field,label}, ...] do que falta."""
+    """Faltam dados obrigatórios para devolver o match (→ HTTP 422 `needs_more_info`).
+    `fields` é a lista [{field,label}, ...] do que falta. Duas origens possíveis:
+    CAE/localização em falta (não dá para decidir elegibilidade — ver
+    `missing_required_fields`), ou contacto (email/nome/função) em falta em quem não tem
+    sessão (retém os `matches` já calculados até o pop-up ser preenchido — ver
+    `_missing_contact_fields`/`evaluate`)."""
 
     def __init__(self, fields: list[dict]):
         self.fields = fields
         labels = ", ".join(f["label"] for f in fields) or "dados em falta"
         super().__init__(f"São necessárias mais informações para fazer o match: {labels}.")
+
+
+# Contacto pedido a quem não tem sessão antes de revelar os resultados (ver
+# NifMatchingService.evaluate). Não vem do nif.pt — vem do pop-up preenchido pelo utilizador.
+_CONTACT_FIELDS = [
+    ("email", "Email"),
+    ("name", "Nome"),
+    ("job_title", "Função"),
+]
+
+
+def _missing_contact_fields(contact: dict) -> list[dict]:
+    """Campos de contacto em falta ([{field,label}, ...]); vazia se completo.
+
+    O email também é tratado como "em falta" se o domínio for webmail genérico/gratuito
+    (gmail, outlook, hotmail...) ou de um serviço de email temporário/descartável (ver
+    match.disposable_email) — mesmo preenchido, não serve para captar um lead de EMPRESA.
+    Label distinta ("Email inválido") para o front-end conseguir mostrar por que é que o
+    pop-up voltou a pedir o email."""
+    missing = []
+    for field, label in _CONTACT_FIELDS:
+        value = contact.get(field)
+        if not value:
+            missing.append({"field": field, "label": label})
+        elif field == "email" and is_disposable_email(value):
+            missing.append({"field": field, "label": "Email inválido"})
+    return missing
 
 
 class NifMatchingService:
@@ -491,7 +524,7 @@ class NifMatchingService:
         return final
 
     @transaction.atomic
-    def create_or_update_viewer(self, metadata: dict) -> User:
+    def create_or_update_viewer(self, metadata: dict, contact: dict | None = None) -> User:
         """Cria/atualiza um utilizador role=viewer com os dados MÍNIMOS do lead.
 
         Idempotente pelo NIF: se já existir um perfil com o mesmo NIF, atualiza-o em
@@ -501,9 +534,12 @@ class NifMatchingService:
         Só grava dados DIRETOS do nif.pt (público) — NIF, CAE, natureza jurídica, atividade,
         morada, NUTS, dimensão. Deliberadamente NÃO grava: tipo de entidade (é INFERIDO por
         nós a partir do nome+natureza, não um campo do nif.pt), capital social, faturação/nº
-        empregados, nem contactos (email/telefone/site/fax) — quem faz o match sem login não
-        deixa esses dados na BD. (Um utilizador AUTENTICADO nunca chega a chamar este método —
-        ver `evaluate`.)
+        empregados, nem telefone/site/fax — quem faz o match sem login não deixa esses dados
+        na BD. (Um utilizador AUTENTICADO nunca chega a chamar este método — ver `evaluate`.)
+
+        `contact` (email/nome/função): NÃO vem do nif.pt — vem do pop-up de contacto que o
+        `evaluate` pede antes de revelar os resultados a quem não tem sessão. Só entra quando
+        preenchido (`evaluate` só chama isto com contacto completo ou vazio, nunca parcial).
         """
         nif = metadata["nif"]
 
@@ -560,11 +596,37 @@ class NifMatchingService:
                 user.is_active = False
                 user.save(update_fields=["is_active"])
 
+        # Contacto (email/nome/função) — só o que vier preenchido, nunca apaga um valor já
+        # guardado com um campo vazio de um pedido anterior.
+        contact = contact or {}
+        had_email = bool(user.email)
+        user_fields = []
+        if contact.get("email"):
+            user.email = str(contact["email"]).strip()
+            user_fields.append("email")
+        if contact.get("name"):
+            user.first_name = str(contact["name"]).strip()
+            user_fields.append("first_name")
+        if user_fields:
+            user.save(update_fields=user_fields)
+        if contact.get("job_title"):
+            profile.job_title = str(contact["job_title"]).strip()
+
         profile.save()
+
+        # Boas-vindas: só na 1ª vez que este viewer preenche o email (não reenviar em cada
+        # match seguinte do mesmo NIF). Nunca rebenta o fluxo — ver notifications.
+        if not had_email and user.email:
+            notifications.send_welcome_email(user.email)
+
         return user
 
+    # TTL do cache que guarda o match já calculado à espera do contacto (ver `evaluate`).
+    CONTACT_CACHE_TTL = 900  # 15 min — tempo de sobra para preencher o pop-up
+    _CONTACT_CACHE_PREFIX = "match_pending_contact:"
+
     def evaluate(self, nif: str, overrides: dict | None = None,
-                 create_viewer: bool = True) -> dict:
+                 create_viewer: bool = True, contact: dict | None = None) -> dict:
         """Orquestra o fluxo completo e devolve o payload pronto para a resposta.
 
         `overrides` permite preencher dados que o nif.pt/enriquecimento não trazem
@@ -574,15 +636,37 @@ class NifMatchingService:
 
         `create_viewer`: só se regista a empresa como viewer quando o match vem de alguém
         NÃO autenticado (é aí que o viewer serve — guardar o lead que consultou os apoios).
-        Um utilizador autenticado (admin, composer…) que faça um match está a consultar,
-        não a gerar lead: nesse caso não se cria nem se toca no perfil, e `viewer_user_id`
-        vem a None.
+        Um utilizador autenticado (admin, commercial…) que faça um match está a consultar,
+        não a gerar lead: nesse caso não se cria nem se toca no perfil, `contact` é ignorado,
+        e `viewer_user_id` vem a None.
+
+        `contact` (email/nome/função) — GATE de captação de lead, só para quem não tem
+        sessão: o match é sempre CALCULADO já nesta chamada (a procura nunca espera pelo
+        contacto), mas se `contact` vier incompleto, os `matches` ficam retidos — levanta
+        MissingClientDataError (mesmo 422/`needs_more_info` do CAE/localização em falta) em
+        vez de os devolver. O cálculo fica em cache (`CONTACT_CACHE_TTL`) para o pedido
+        seguinte, já com o contacto preenchido, não repetir nif.pt/embeddings/LLM. O lead
+        (dados da empresa) é sempre registado, com ou sem contacto ainda.
         """
+        contact = contact or {}
+        cache_key = f"{self._CONTACT_CACHE_PREFIX}{nif}"
+
+        if create_viewer and not _missing_contact_fields(contact):
+            cached = cache.get(cache_key)
+            if cached:
+                cache.delete(cache_key)
+                metadata, matches = cached["metadata"], cached["matches"]
+                user = self.create_or_update_viewer(metadata, contact)
+                return {
+                    "company": dict(metadata), "nif": metadata["nif"],
+                    "viewer_user_id": user.id, "matches": matches,
+                }
+            # sem cache (expirou, ou é a 1ª chamada já com o contacto preenchido de raiz) —
+            # recalcula tudo abaixo, como de costume.
+
         record = self.fetch_company(nif)
         metadata = self.extract_metadata(record)
         metadata = self._apply_overrides(metadata, overrides)
-        # Regista/atualiza a empresa como viewer (já com os dados fornecidos, se houver).
-        user = self.create_or_update_viewer(metadata) if create_viewer else None
 
         missing = missing_required_fields(metadata)
         if missing:
@@ -591,14 +675,30 @@ class NifMatchingService:
         # Embeddings do cliente, gerados DINAMICAMENTE (nunca guardados na BD), um por
         # dimensão — a base da procura semântica que ordena os avisos mais enquadrados no topo.
         company_vectors = self._company_vectors(metadata)
+        matches = self.process_matches(metadata, company_vectors)
 
-        # `company` expõe os dados ricos do contribuinte (incluindo a `activity`); `matches` ordenado.
-        company = dict(metadata)
+        user = None
+        if create_viewer:
+            missing_contact = _missing_contact_fields(contact)
+            # Um email de domínio descartável NUNCA é gravado no perfil nem dispara o email de
+            # boas-vindas — é tratado como se não tivesse vindo (create_or_update_viewer não
+            # sabe distinguir "descartável" de "válido", por isso sanitiza-se aqui antes).
+            safe_contact = contact
+            if contact.get("email") and any(f["field"] == "email" for f in missing_contact):
+                safe_contact = {**contact, "email": None}
+            # Regista/atualiza sempre o lead (dados da empresa) — o contacto entra se vier.
+            user = self.create_or_update_viewer(metadata, safe_contact)
+            if missing_contact:
+                cache.set(cache_key, {"metadata": metadata, "matches": matches},
+                          self.CONTACT_CACHE_TTL)
+                raise MissingClientDataError(missing_contact)
+
+        # `company` expõe os dados ricos do contribuinte (incluindo a `activity`).
         return {
-            "company": company,
+            "company": dict(metadata),
             "nif": metadata["nif"],
             "viewer_user_id": user.id if user else None,
-            "matches": self.process_matches(metadata, company_vectors),
+            "matches": matches,
         }
 
     @staticmethod

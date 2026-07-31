@@ -42,7 +42,7 @@ def _process_grant_safe(grant: dict, download_dir: str, source_label: str):
             "Erro ao processar o aviso %r (%s) — a continuar com os seguintes.",
             grant.get("grant_code") or grant.get("title"), source_label,
         )
-        return None
+        return None, False
 
 
 def _candidate_documents(grant: dict) -> list[dict]:
@@ -107,25 +107,36 @@ def _discard_files(*paths: str | None) -> None:
 
 
 def _process_grant(grant: dict, download_dir: str, source_label: str):
-    """Processa um aviso: usa o aviso escolhido pelo scraper, consolida, extrai e persiste."""
+    """Processa um aviso: usa o aviso escolhido pelo scraper, consolida, extrai e persiste.
+
+    Devolve (grant_rec, was_new) — was_new é sempre False nos ramos que devolvem
+    grant_rec=None (nada foi criado/notificado)."""
     # Canónico = aviso que o scraper escolheu (bottom-up + código + words_search/reject).
     # NÃO reclassificamos por nome aqui — isso evita apanhar "Correspondência…Aviso…" e afins.
     canonical_url, canonical_name = _latest_notice(grant)
     if not canonical_url:
-        return None
+        return None, False
 
     # A EXTRAÇÃO é decidida pela PRESENÇA DO PDF na pasta:
     #  • PDF já na pasta  → NÃO descarrega, NÃO extrai, NÃO cria registo. Se o aviso já
     #    existir na BD, atualiza só os campos autoritativos do HTML (ex: prorrogação que muda
     #    a closing_date); se NÃO existir na BD, não faz nada (não o "coloca na BD").
     #  • PDF não na pasta → (re)descarrega, converte, verifica convite e extrai (a seguir).
+    code = grant.get("grant_code")
     if find_existing_document(canonical_url, download_dir):
-        code = grant.get("grant_code")
         in_db = (Grant.objects.filter(scraping_url=canonical_url).exists()
                  or (bool(code) and Grant.objects.filter(grant_code=code).exists()))
         if in_db:
             save_scraped_grant({**grant, "url": canonical_url}, source_label)
-        return None
+        return None, False
+
+    # was_new lê-se ANTES de qualquer escrita nesta função — é a única forma fiável de saber
+    # se o save_ai_grant abaixo vai CRIAR um registo ou ATUALIZAR um já existente (republicação/
+    # alteração de um grant_code conhecido, ou canonical_url novo de um aviso já na BD).
+    was_new = not (
+        Grant.objects.filter(scraping_url=canonical_url).exists()
+        or (bool(code) and Grant.objects.filter(grant_code=code).exists())
+    )
 
     # PDF NÃO está na pasta (aviso novo, PDF apagado, ou canónico novo/republicação):
     # descarrega + converte + verifica convite + extrai. O save_ai_grant faz match por
@@ -140,12 +151,12 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     # não-PDF / erro / convite → return sem criar qualquer registo.
     path = download_pdf(canonical_url, download_dir, reject_invitations=True)
     if not path:
-        return None
+        return None, False
     source_name = os.path.splitext(os.path.basename(path))[0]
 
     converted = pdf_to_markdown(path, download_dir)
     if not converted:
-        return None
+        return None, False
     canonical_md, md_path = converted
 
     # Rede de segurança: PDFs onde o texto cru saiu pobre (ex: capa mal extraída) e a Natureza
@@ -153,7 +164,7 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     if text_is_invitation(canonical_md):
         logger.info("[Convite] %s: Natureza=convite — ignorado", source_name)
         _discard_files(path, md_path)
-        return None
+        return None, False
 
     # É concurso → grava os dados do HTML correspondente (cria o registo).
     save_scraped_grant({**grant, "url": canonical_url}, source_label)
@@ -204,7 +215,7 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
             canonical_type = BASE
         canonical_rec = {"name": canonical_name, "url": canonical_url, "type": canonical_type}
         _store_documents(grant_rec, [canonical_rec] + ordered + annexes, canonical_url)
-    return grant_rec
+    return grant_rec, (was_new if grant_rec else False)
 
 
 def deactivate_expired_grants(today: date | None = None) -> int:
@@ -228,18 +239,19 @@ def deactivate_expired_grants(today: date | None = None) -> int:
 
 def _scrape(scraper, download_dir: str, source_label: str) -> list[dict]:
     """Corre um scraper de fonte, processa cada aviso (isolado por erros), desativa os
-    terminados e envia UM email-resumo aos comerciais dos avisos processados (novos/atualizados).
+    terminados e envia UM email-resumo aos comerciais dos avisos processados — separado em
+    criados vs. atualizados (ver _process_grant/notify_grants).
     Devolve os dicts de origem dos avisos processados (o que a rota expõe)."""
     all_data = scraper()
-    new_grants, records = [], []
+    new_grants, created_records, updated_records = [], [], []
     for g in all_data:
-        rec = _process_grant_safe(g, download_dir, source_label)
+        rec, was_new = _process_grant_safe(g, download_dir, source_label)
         if rec:
             new_grants.append(g)
-            records.append(rec)
+            (created_records if was_new else updated_records).append(rec)
     deactivate_expired_grants()
-    if records:
-        notify_grants(records, action="adicionados ou atualizados")
+    if created_records or updated_records:
+        notify_grants(created_records, updated_records)
     return new_grants
 
 

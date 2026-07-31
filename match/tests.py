@@ -8,6 +8,8 @@ import json
 from unittest import mock
 
 from django.contrib.auth.models import User
+from django.core import mail
+from django.core.cache import cache
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from match.scoring_rules import (
@@ -26,8 +28,10 @@ from match.scoring_rules import (
 from datetime import datetime
 
 from match.services import (
-    NifMatchingService, _next_nif_key, _company_sector_text, _company_general_text,
+    NifMatchingService, MissingClientDataError, _next_nif_key,
+    _company_sector_text, _company_general_text,
 )
+from match.disposable_email import is_disposable_email
 from match.models import NifCompany
 from match import grant_embeddings
 from match.grant_embeddings import build_general_embedding_text, build_sector_embedding_text
@@ -469,6 +473,30 @@ class RelevanceTests(SimpleTestCase):
                          (None, None, None))
 
 
+class DisposableEmailTests(SimpleTestCase):
+    def test_known_disposable_domain(self):
+        self.assertTrue(is_disposable_email("qualquer.coisa@mailinator.com"))
+
+    def test_known_disposable_domain_is_case_insensitive(self):
+        self.assertTrue(is_disposable_email("Ana@MAILINATOR.COM"))
+
+    def test_generic_free_webmail_is_also_rejected(self):
+        # Intencional: o gate quer um email de EMPRESA, não pessoal — gmail/outlook/hotmail
+        # ficam no mesmo ficheiro que os descartáveis (ver disposable_email_domains.json).
+        for domain in ("gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com"):
+            self.assertTrue(is_disposable_email(f"ana@{domain}"), domain)
+
+    def test_real_company_domain_is_not_disposable(self):
+        self.assertFalse(is_disposable_email("ana@aliados.consulting"))
+
+    def test_no_at_sign(self):
+        self.assertFalse(is_disposable_email("nao-e-um-email"))
+
+    def test_empty(self):
+        self.assertFalse(is_disposable_email(""))
+        self.assertFalse(is_disposable_email(None))
+
+
 class ViewerCreationTests(TestCase):
     """O viewer (lead) só nasce de um match NÃO autenticado. Um utilizador autenticado
     (admin, composer…) está a consultar — não polui a BD com viewers."""
@@ -481,16 +509,20 @@ class ViewerCreationTests(TestCase):
         "structure": {"nature": "LDA"}, "contacts": {},
     }
 
+    CONTACT = {"email": "ana@xpto.pt", "name": "Ana Silva", "job_title": "Sócia-Gerente"}
+
     def setUp(self):
         # fetch_company (nif.pt) e os embeddings (OpenAI) mockados — testes offline.
         self.fetch = mock.patch.object(
             NifMatchingService, "fetch_company", return_value=self.NIF_RECORD)
         self.vectors = mock.patch.object(
             NifMatchingService, "_company_vectors", return_value={})
+        cache.clear()  # isola o cache do gate de contacto entre testes (mesmo NIF em vários)
 
     def test_anonymous_match_creates_viewer(self):
         with self.fetch, self.vectors:
-            result = NifMatchingService().evaluate("500829993", create_viewer=True)
+            result = NifMatchingService().evaluate(
+                "500829993", create_viewer=True, contact=self.CONTACT)
         self.assertIsNotNone(result["viewer_user_id"])
         profile = UserProfile.objects.filter(nif="500829993").first()
         self.assertIsNotNone(profile)
@@ -505,10 +537,12 @@ class ViewerCreationTests(TestCase):
 
     def test_anonymous_match_saves_only_minimal_fields(self):
         # Sem login: só dados DIRETOS do nif.pt (NIF, CAE, natureza, atividade, morada) +
-        # NUTS (resolvida) + dimensão. NADA de tipo de entidade (é INFERIDO por nós, não um
-        # campo do nif.pt), capital social, faturação/nº empregados, ou contactos.
+        # NUTS (resolvida) + dimensão, MAIS o contacto (email/nome/função) do pop-up. NADA de
+        # tipo de entidade (é INFERIDO por nós, não um campo do nif.pt), capital social,
+        # faturação/nº empregados, ou telefone/site/fax.
         with self.fetch, self.vectors:
-            NifMatchingService().evaluate("500829993", create_viewer=True)
+            NifMatchingService().evaluate(
+                "500829993", create_viewer=True, contact=self.CONTACT)
         profile = UserProfile.objects.get(nif="500829993")
 
         # Guardados — campos DIRETOS do nif.pt.
@@ -520,16 +554,19 @@ class ViewerCreationTests(TestCase):
         # NUTS: a região resolvida (nuts.json a partir da cidade/concelho), não o texto bruto
         # do nif.pt ("Norte" vindo de geo.region coincide aqui, mas a fonte é a NUTS resolvida).
         self.assertEqual(profile.region, "Norte")
+        # Contacto — vem do pop-up, não do nif.pt, mas é guardado.
+        self.assertEqual(profile.job_title, "Sócia-Gerente")
 
-        # NÃO guardados — entity_type é INFERIDO (não um campo do nif.pt); capital/contactos
-        # ficam fora por decisão de minimização, mesmo vindo do nif.pt.
+        # NÃO guardados — entity_type é INFERIDO (não um campo do nif.pt); capital/telefone/
+        # site/fax ficam fora por decisão de minimização, mesmo vindo do nif.pt.
         self.assertIsNone(profile.entity_type)
         self.assertIsNone(profile.capital)
         self.assertIsNone(profile.phone)
         self.assertIsNone(profile.website)
         self.assertIsNone(profile.fax)
         user = User.objects.get(username="500829993")
-        self.assertEqual(user.email, "")
+        self.assertEqual(user.email, "ana@xpto.pt")
+        self.assertEqual(user.first_name, "Ana Silva")
 
     def test_authenticated_match_does_not_touch_existing_profile(self):
         # Um perfil já existente não pode ser alterado por um match de um admin.
@@ -543,6 +580,92 @@ class ViewerCreationTests(TestCase):
         user.profile.refresh_from_db()
         self.assertEqual(user.profile.role, UserProfile.CLIENT)
         self.assertEqual(user.profile.address, "Morada original")  # intacto
+
+    # --- Gate de contacto (email/nome/função) — só quem não tem sessão ---------------
+
+    def test_anonymous_match_without_contact_is_gated(self):
+        # A procura corre sempre (o mock de fetch_company é chamado), mas sem contacto os
+        # matches ficam retidos e o lead (dados da empresa) já fica gravado mesmo assim.
+        with self.fetch, self.vectors:
+            with self.assertRaises(MissingClientDataError) as ctx:
+                NifMatchingService().evaluate("500829993", create_viewer=True)
+        fields = {f["field"] for f in ctx.exception.fields}
+        self.assertEqual(fields, {"email", "name", "job_title"})
+        profile = UserProfile.objects.get(nif="500829993")  # o lead foi criado na mesma
+        self.assertEqual(profile.role, UserProfile.VIEWER)
+        self.assertIsNone(profile.job_title)
+        self.assertEqual(profile.user.email, "")
+
+    def test_partial_contact_is_still_gated(self):
+        with self.fetch, self.vectors:
+            with self.assertRaises(MissingClientDataError) as ctx:
+                NifMatchingService().evaluate(
+                    "500829993", create_viewer=True,
+                    contact={"email": "ana@xpto.pt"})  # falta nome e função
+        fields = {f["field"] for f in ctx.exception.fields}
+        self.assertEqual(fields, {"name", "job_title"})
+
+    def test_disposable_email_domain_is_gated_as_invalid(self):
+        # Domínio de email descartável conhecido (ver match/disposable_email_domains.json) —
+        # tratado como "em falta", com label distinta para o front-end saber porquê.
+        with self.fetch, self.vectors:
+            with self.assertRaises(MissingClientDataError) as ctx:
+                NifMatchingService().evaluate(
+                    "500829993", create_viewer=True,
+                    contact={"email": "ana@mailinator.com", "name": "Ana Silva",
+                            "job_title": "Sócia-Gerente"})
+        fields = {(f["field"], f["label"]) for f in ctx.exception.fields}
+        self.assertEqual(fields, {("email", "Email inválido")})
+
+        # O email descartável não pode ficar gravado no perfil nem disparar o email de
+        # boas-vindas — é tratado como se não tivesse vindo (ver evaluate/safe_contact).
+        user = User.objects.get(username="500829993")
+        self.assertEqual(user.email, "")
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_authenticated_match_ignores_missing_contact(self):
+        # Um admin/comercial nunca é gated — o gate só existe para captar leads.
+        with self.fetch, self.vectors:
+            result = NifMatchingService().evaluate("500829993", create_viewer=False)
+        self.assertEqual(result["matches"], [])  # não rebenta, devolve normalmente
+
+    def test_contact_reveals_cached_matches_without_recomputing(self):
+        with self.fetch as fetch_mock, self.vectors:
+            with self.assertRaises(MissingClientDataError):
+                NifMatchingService().evaluate("500829993", create_viewer=True)
+            self.assertEqual(fetch_mock.call_count, 1)
+
+            # 2ª chamada, agora com contacto — vem do cache, NÃO volta a chamar fetch_company.
+            result = NifMatchingService().evaluate(
+                "500829993", create_viewer=True, contact=self.CONTACT)
+            self.assertEqual(fetch_mock.call_count, 1)  # continua 1 — não recalculou
+
+        self.assertIsNotNone(result["viewer_user_id"])
+        profile = UserProfile.objects.get(nif="500829993")
+        self.assertEqual(profile.job_title, "Sócia-Gerente")
+        self.assertEqual(profile.user.email, "ana@xpto.pt")
+
+        # O cache é consumido — uma 3ª chamada sem contacto volta a ficar gated (não a
+        # "reaproveitar" um resultado já entregue).
+        with self.fetch as fetch_mock2, self.vectors:
+            with self.assertRaises(MissingClientDataError):
+                NifMatchingService().evaluate("500829993", create_viewer=True)
+            self.assertEqual(fetch_mock2.call_count, 1)  # recalculou de raiz
+
+    def test_contact_reveal_sends_welcome_email_once(self):
+        with self.fetch, self.vectors:
+            NifMatchingService().evaluate(
+                "500829993", create_viewer=True, contact=self.CONTACT)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["ana@xpto.pt"])
+        self.assertIn("Bem-vindo", mail.outbox[0].subject)
+        self.assertTrue(mail.outbox[0].alternatives)  # versão HTML anexada
+
+        # Um 2º match do MESMO NIF (email já em ficha) não reenvia o email de boas-vindas.
+        with self.fetch, self.vectors:
+            NifMatchingService().evaluate(
+                "500829993", create_viewer=True, contact=self.CONTACT)
+        self.assertEqual(len(mail.outbox), 1)  # continua 1 — não duplicou
 
     def test_view_passes_create_viewer_false_when_authenticated(self):
         admin = User.objects.create_user("admin_m", password="Xk93!vTq21mZ")
@@ -565,6 +688,39 @@ class ViewerCreationTests(TestCase):
                              data=json.dumps({"nif": "500829993"}),
                              content_type="application/json")
         self.assertTrue(ev.call_args.kwargs["create_viewer"])
+
+    def test_view_passes_contact_fields_to_evaluate(self):
+        with mock.patch.object(NifMatchingService, "evaluate",
+                               return_value={"company": {}, "nif": "1", "viewer_user_id": 1,
+                                             "matches": []}) as ev:
+            self.client.post(
+                "/match/evaluate-nif/",
+                data=json.dumps({
+                    "nif": "500829993", "email": "ana@xpto.pt",
+                    "name": "Ana Silva", "job_title": "Sócia-Gerente",
+                }),
+                content_type="application/json",
+            )
+        self.assertEqual(ev.call_args.kwargs["contact"], {
+            "email": "ana@xpto.pt", "name": "Ana Silva", "job_title": "Sócia-Gerente",
+        })
+
+    def test_view_returns_422_with_missing_contact_fields(self):
+        with mock.patch.object(
+            NifMatchingService, "evaluate",
+            side_effect=MissingClientDataError(
+                [{"field": "email", "label": "Email"}, {"field": "name", "label": "Nome"},
+                 {"field": "job_title", "label": "Função"}]),
+        ):
+            resp = self.client.post(
+                "/match/evaluate-nif/",
+                data=json.dumps({"nif": "500829993"}), content_type="application/json",
+            )
+        self.assertEqual(resp.status_code, 422)
+        body = resp.json()
+        self.assertTrue(body["needs_more_info"])
+        self.assertEqual(
+            {f["field"] for f in body["missing_fields"]}, {"email", "name", "job_title"})
 
 
 class CaePrefilterTests(TestCase):

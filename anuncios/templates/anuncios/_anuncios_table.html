@@ -1,0 +1,32 @@
+<table align="center" width="100%" border="0" cellpadding="0" cellspacing="0" role="presentation">
+  <tbody style="width:100%">
+    <tr style="width:100%">
+      <td style="border-bottom:2px solid #0312c2;padding-bottom:8px;vertical-align:bottom;width:60%">
+        <p style="font-family:'Gellix',Arial,sans-serif;font-size:11px;line-height:24px;margin:0;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;color:#0312c2">Descrição</p>
+      </td>
+      <td style="border-bottom:2px solid #0312c2;padding-bottom:8px;vertical-align:bottom;width:25%">
+        <p style="font-family:'Gellix',Arial,sans-serif;font-size:11px;line-height:24px;margin:0;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;color:#0312c2">Preço base</p>
+      </td>
+      <td style="border-bottom:2px solid #0312c2;padding-bottom:8px;vertical-align:bottom;width:15%">
+        <p style="font-family:'Gellix',Arial,sans-serif;font-size:11px;line-height:24px;margin:0;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;color:#0312c2">Prazo</p>
+      </td>
+    </tr>
+  </tbody>
+</table>
+{% for anuncio in anuncios %}
+<table align="center" width="100%" border="0" cellpadding="0" cellspacing="0" role="presentation">
+  <tbody style="width:100%">
+    <tr style="width:100%">
+      <td style="border-bottom:1px solid #ebf5fc;padding-top:14px;padding-bottom:14px;vertical-align:top;width:60%">
+        <a href="{{ anuncio.url }}" style="font-family:'Gellix',Arial,sans-serif;color:#0312c2;text-decoration-line:none;font-size:14px;line-height:1.4;font-weight:600;text-decoration:underline" target="_blank">{{ anuncio.titulo }}</a>
+      </td>
+      <td style="border-bottom:1px solid #ebf5fc;padding-top:14px;padding-bottom:14px;vertical-align:top;width:25%">
+        <p style="font-family:'Gellix',Arial,sans-serif;font-size:14px;line-height:1.4;margin:0;color:#333333">{{ anuncio.preco }}</p>
+      </td>
+      <td style="border-bottom:1px solid #ebf5fc;padding-top:14px;padding-bottom:14px;vertical-align:top;width:15%">
+        <p style="font-family:'Gellix',Arial,sans-serif;font-size:14px;line-height:1.4;margin:0;color:#333333">{{ anuncio.prazo }}</p>
+      </td>
+    </tr>
+  </tbody>
+</table>
+{% endfor %}
