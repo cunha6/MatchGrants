@@ -31,33 +31,33 @@ HEADERS = {
 DATE_REGEX = re.compile(r"\d{2}/\d{2}/\d{4}")
 REPUB_REGEX = re.compile(r"Republicação", re.IGNORECASE)
 NUMBER_REPUB_REGEX = re.compile(r"(?:\d+[ªº.]*\s*)?Republicação", re.IGNORECASE)
-CODIGO_AVISO_REGEX = re.compile(r"\b(\d+/[\w-]+/\d{4})\b")
-FIM_KEYWORDS = ("encerramento", "fim de", "submissão", "até", "prazo")
+GRANT_CODE_REGEX = re.compile(r"\b(\d+/[\w-]+/\d{4})\b")
+CLOSING_KEYWORDS = ("encerramento", "fim de", "submissão", "até", "prazo")
 DOCS_STOP_REGEX = re.compile(r"data de ", re.IGNORECASE)
 
-_MESES = {
+_MONTH_NUMBER_BY_NAME = {
     "janeiro": "01", "fevereiro": "02", "março": "03", "abril": "04",
     "maio": "05", "junho": "06", "julho": "07", "agosto": "08",
     "setembro": "09", "outubro": "10", "novembro": "11", "dezembro": "12",
 }
 
 
-def _normalize_date(text: str) -> str:
-    hora = ""
-    t = re.search(r"(\d{1,2})[h:](\d{2})", text)
-    if t:
-        hora = f" {t.group(1).zfill(2)}:{t.group(2)}h"
+def _normalize_date(paragraph_text: str) -> str:
+    hour_suffix = ""
+    hour_match = re.search(r"(\d{1,2})[h:](\d{2})", paragraph_text)
+    if hour_match:
+        hour_suffix = f" {hour_match.group(1).zfill(2)}:{hour_match.group(2)}h"
 
-    m = re.search(r"(\d{2}/\d{2}/\d{4})", text)
-    if m:
-        return m.group(1) + hora
+    match = re.search(r"(\d{2}/\d{2}/\d{4})", paragraph_text)
+    if match:
+        return match.group(1) + hour_suffix
 
-    m = re.search(r"(\d{1,2})\s+de\s+(\w+)(?:\s+de)?\s+(\d{4})", text, re.IGNORECASE)
-    if m:
-        dia, mes_str, ano = m.group(1), m.group(2).lower(), m.group(3)
-        mes = _MESES.get(mes_str)
-        if mes:
-            return f"{dia.zfill(2)}/{mes}/{ano}" + hora
+    match = re.search(r"(\d{1,2})\s+de\s+(\w+)(?:\s+de)?\s+(\d{4})", paragraph_text, re.IGNORECASE)
+    if match:
+        day, month_name, year = match.group(1), match.group(2).lower(), match.group(3)
+        month_number = _MONTH_NUMBER_BY_NAME.get(month_name)
+        if month_number:
+            return f"{day.zfill(2)}/{month_number}/{year}" + hour_suffix
 
     return ""
 
@@ -87,16 +87,16 @@ def _get_driver() -> WebDriver:
 
 
 def scrape_prr_web() -> list[dict]:
-    all_data: list[dict] = []
+    scraped_grants: list[dict] = []
     logger.info("A iniciar scraping do PRR...")
 
     driver = _open_grants()
     try:
-        _parse_grants(driver, all_data)
+        _parse_grants(driver, scraped_grants)
     finally:
         driver.quit()
 
-    return all_data
+    return scraped_grants
 
 
 def _open_grants() -> WebDriver:
@@ -117,104 +117,140 @@ def _open_grants() -> WebDriver:
     return driver
 
 
-def _parse_grants(driver: WebDriver, all_data: list[dict]) -> None:
-    soup = BeautifulSoup(driver.page_source, "lxml")
-    panels = soup.find_all("div", class_="vc_tta-panel", attrs={"data-vc-content": ".vc_tta-panel-body"})
+def _collect_documents(paragraph, seen_document_urls: set[str], documents: list) -> None:
+    """Acrescenta os links de um parágrafo à lista de documentos, sem repetir.
 
-    for type_panel in panels:
+    O nome sai do `?filename=` do URL; sem ele, do último segmento do caminho; e em último
+    caso do texto da própria ligação. `mailto:` não é documento.
+    """
+    for document_link in paragraph.find_all("a", href=True):
+        document_url = document_link["href"]
+        if document_url in seen_document_urls or document_url.startswith("mailto:"):
+            continue
+        seen_document_urls.add(document_url)
+        parsed_url = urllib.parse.urlparse(document_url)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        document_name = (query_params.get("filename", [None])[0] or parsed_url.path.split("/")[-1]
+                or document_link.get_text(strip=True))
+        documents.append({"nome": document_name, "url": document_url})
+
+
+def _closing_date_from(paragraph_text: str) -> str | None:
+    """Data-limite de um parágrafo que fala de fim de candidaturas.
+
+    Havendo datas, vale a ÚLTIMA (o texto costuma referir primeiro a abertura), com a hora
+    junta quando existe. Sem datas reconhecíveis, tenta normalizar o texto por extenso.
+    """
+    found_dates = DATE_REGEX.findall(paragraph_text)
+    if not found_dates:
+        return _normalize_date(paragraph_text) or None
+    hour_suffix = ""
+    hour_match = re.search(r"(\d{1,2})[h:](\d{2})", paragraph_text)
+    if hour_match:
+        hour_suffix = f" {hour_match.group(1).zfill(2)}:{hour_match.group(2)}h"
+    return found_dates[-1] + hour_suffix
+
+
+def _parse_card_paragraphs(card_paragraphs, title_href: str) -> dict:
+    """Percorre os parágrafos do cartão, do fim para o início, recolhendo os detalhes.
+
+    Ao contrário (`reversed`) porque o conteúdo mais RECENTE — a última republicação, o
+    contacto e a documentação atuais — está no fim do cartão; o primeiro que casar ganha, e
+    os `is None` abaixo garantem que um valor já encontrado não é substituído por um mais
+    antigo. Os documentos deixam de ser recolhidos assim que se atinge o marcador de fim da
+    secção (DOCS_STOP_REGEX).
+    """
+    found_details = {"last_republication": None, "last_republication_date": None,
+             "latest_notice": None, "contact": None, "closing_date": None}
+    seen_document_urls = {title_href}
+    documents = []
+    documents_section_ended = False
+
+    for paragraph in reversed(card_paragraphs):
+        paragraph_text = paragraph.get_text(strip=True)
+        lowered_text = paragraph_text.lower()
+
+        if not documents_section_ended:
+            if DOCS_STOP_REGEX.search(paragraph_text):
+                documents_section_ended = True
+            else:
+                _collect_documents(paragraph, seen_document_urls, documents)
+
+        if found_details["last_republication_date"] is None and REPUB_REGEX.search(paragraph_text):
+            republication_label_match = NUMBER_REPUB_REGEX.search(paragraph_text)
+            republication_date_match = DATE_REGEX.search(paragraph_text)
+            found_details["last_republication"] = republication_label_match.group(0) if republication_label_match else None
+            found_details["last_republication_date"] = republication_date_match.group(0) if republication_date_match else None
+
+        if found_details["latest_notice"] is None and "ver documentação" in lowered_text:
+            anchor = paragraph.find("a")
+            found_details["latest_notice"] = anchor.get("href") if anchor else None
+
+        if found_details["contact"] is None and "contacto para informações" in lowered_text:
+            anchor = paragraph.find("a")
+            found_details["contact"] = anchor.get_text(strip=True) if anchor else None
+
+        if found_details["closing_date"] is None and any(k in lowered_text for k in CLOSING_KEYWORDS):
+            found_details["closing_date"] = _closing_date_from(paragraph_text)
+
+    found_details["documentos"] = documents
+    return found_details
+
+
+def _parse_grant_card(grant_card, grant_type: str, grant_section: str) -> dict | None:
+    """Um cartão de aviso → registo. None se o cartão não tiver título (nada a aproveitar)."""
+    title_link = grant_card.find("a", class_="title-link")
+    if not title_link:
+        return None
+
+    grant_title = title_link.get_text(strip=True)
+    grant_code_match = GRANT_CODE_REGEX.search(grant_title)
+    card_paragraphs = grant_card.find_all("p")
+
+    # Abertura: a 1ª data que apareça no cartão (os parágrafos vêm por ordem cronológica).
+    opening_date = next(
+        (DATE_REGEX.search(p.get_text(strip=True)).group(0)
+         for p in card_paragraphs
+         if DATE_REGEX.search(p.get_text(strip=True))),
+        None,
+    )
+
+    found_details = _parse_card_paragraphs(card_paragraphs, title_link.get("href", ""))
+    return {
+        "source": "PRR",
+        "tipo": grant_type,
+        "subtitulo": grant_section,
+        "title": grant_title,
+        "grant_code": grant_code_match.group(1) if grant_code_match else None,
+        "opening_date": opening_date,
+        "closing_date": found_details["closing_date"],
+        "last_republication": found_details["last_republication"],
+        "last_republication_date": found_details["last_republication_date"],
+        "contact": found_details["contact"],
+        "documentos": found_details["documentos"],
+        "latest_notice": found_details["latest_notice"],
+    }
+
+
+def _parse_grants(driver: WebDriver, scraped_grants: list[dict]) -> None:
+    """Percorre a página do PRR (painéis por tipo → secções → cartões) e acumula os avisos."""
+    parsed_page = BeautifulSoup(driver.page_source, "lxml")
+    type_panels = parsed_page.find_all("div", class_="vc_tta-panel", attrs={"data-vc-content": ".vc_tta-panel-body"})
+
+    for type_panel in type_panels:
         # Guard: sem o span do título (HTML mudou), segue com tipo vazio em vez de rebentar.
-        title_span = type_panel.find("span", class_="vc_tta-title-text")
-        grants_type = title_span.get_text(strip=True) if title_span else ""
+        type_title_span = type_panel.find("span", class_="vc_tta-title-text")
+        grant_type = type_title_span.get_text(strip=True) if type_title_span else ""
 
-        for grant_subdiv in type_panel.find_all("div", class_=["entidadespublicas", "empresaspublicas", "ben", "accordion"]):
-            chev = grant_subdiv.find("div", id="prr-arrow-chev", class_="arrow-chev")
-            grants_subtitle = chev.get_text(strip=True) if chev else ""
+        for section_block in type_panel.find_all("div", class_=["entidadespublicas", "empresaspublicas", "ben", "accordion"]):
+            section_title_element = section_block.find("div", id="prr-arrow-chev", class_="arrow-chev")
+            grant_section = section_title_element.get_text(strip=True) if section_title_element else ""
 
-            panel = grant_subdiv.find("div", class_="panel")
-            if not panel:
+            section_panel = section_block.find("div", class_="panel")
+            if not section_panel:
                 continue
 
-            for grant_card in panel.find_all("div", class_=["search-card-top", "search-card"]):
-                title_tag = grant_card.find("a", class_="title-link")
-                if not title_tag:
-                    continue
-
-                title = title_tag.get_text(strip=True)
-                codigo_match = CODIGO_AVISO_REGEX.search(title)
-                codigo_aviso = codigo_match.group(1) if codigo_match else None
-                last_repub_number = None
-                last_repub_date = None
-                last_doc_link = None
-                last_contact = None
-                data_fim = None
-
-                paragraphs = grant_card.find_all("p")
-
-                data_inicio = next(
-                    (DATE_REGEX.search(p.get_text(strip=True)).group(0)
-                     for p in paragraphs
-                     if DATE_REGEX.search(p.get_text(strip=True))),
-                    None,
-                )
-
-                seen_hrefs: set[str] = set()
-                seen_hrefs.add(title_tag.get("href", ""))
-                documentos = []
-                docs_done = False
-
-                for detail in reversed(paragraphs):
-                    text = detail.get_text(strip=True)
-                    date_match = DATE_REGEX.search(text)
-
-                    if not docs_done:
-                        if DOCS_STOP_REGEX.search(text):
-                            docs_done = True
-                        else:
-                            for a in detail.find_all("a", href=True):
-                                href = a["href"]
-                                if href in seen_hrefs or href.startswith("mailto:"):
-                                    continue
-                                seen_hrefs.add(href)
-                                parsed = urllib.parse.urlparse(href)
-                                params = urllib.parse.parse_qs(parsed.query)
-                                nome = params.get("filename", [None])[0] or parsed.path.split("/")[-1] or a.get_text(strip=True)
-                                documentos.append({"nome": nome, "url": href})
-
-                    if last_repub_date is None and REPUB_REGEX.search(text):
-                        label_match = NUMBER_REPUB_REGEX.search(text)
-                        last_repub_number = label_match.group(0) if label_match else None
-                        last_repub_date = date_match.group(0) if date_match else None
-
-                    if last_doc_link is None and "ver documentação" in text.lower():
-                        link = detail.find("a")
-                        last_doc_link = link.get("href") if link else None
-
-                    if last_contact is None and "contacto para informações" in text.lower():
-                        link = detail.find("a")
-                        last_contact = link.get_text(strip=True) if link else None
-
-                    if data_fim is None and any(k in text.lower() for k in FIM_KEYWORDS):
-                        all_dates = DATE_REGEX.findall(text)
-                        if all_dates:
-                            hora = ""
-                            t = re.search(r"(\d{1,2})[h:](\d{2})", text)
-                            if t:
-                                hora = f" {t.group(1).zfill(2)}:{t.group(2)}h"
-                            data_fim = all_dates[-1] + hora
-                        else:
-                            data_fim = _normalize_date(text) or None
-
-                all_data.append({
-                    "source": "PRR",
-                    "tipo": grants_type,
-                    "subtitulo": grants_subtitle,
-                    "title": title,
-                    "grant_code": codigo_aviso,
-                    "opening_date": data_inicio,
-                    "closing_date": data_fim,
-                    "last_republication": last_repub_number,
-                    "last_republication_date": last_repub_date,
-                    "contact": last_contact,
-                    "documentos": documentos,
-                    "latest_notice": last_doc_link,
-                })
+            for grant_card in section_panel.find_all("div", class_=["search-card-top", "search-card"]):
+                grant_record = _parse_grant_card(grant_card, grant_type, grant_section)
+                if grant_record is not None:
+                    scraped_grants.append(grant_record)

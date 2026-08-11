@@ -18,7 +18,7 @@ from django.utils import timezone
 from anuncios.models import Notice
 from anuncios.services import serialize_notice
 from avisos.models import Grant
-from avisos.views import _grant_detail
+from avisos.serializers import grant_detail
 from planned_grants.services import serialize_planned_grant, upcoming_planned_grants
 
 _RECENT_DAYS = 7      # "novo/atualizado" = mexido nos últimos 7 dias
@@ -47,9 +47,9 @@ def weekly_newsletter() -> dict:
 
     return {
         "generated_at": now.isoformat(),
-        "new_grants": [_grant_detail(g) for g in new_grants],
-        "updated_grants": [_grant_detail(g) for g in updated_grants],
-        "new_notices": [serialize_notice(n) for n in new_notices],
-        "updated_notices": [serialize_notice(n) for n in updated_notices],
+        "new_grants": [grant_detail(grant) for grant in new_grants],
+        "updated_grants": [grant_detail(grant) for grant in updated_grants],
+        "new_notices": [serialize_notice(notice) for notice in new_notices],
+        "updated_notices": [serialize_notice(notice) for notice in updated_notices],
         "coming_next_30_days": [serialize_planned_grant(pg) for pg in coming],
     }

@@ -10,18 +10,18 @@ import logging
 import time
 from pathlib import Path
 
+from common.openai_client import call_openai_text, create_client
+
 from .chunker import chunk_by_markdown, FIELD_PT_TERMS, CATS_P1, CATS_P2, CATS_P3, CATS_P4, CATS_P5, CATS_P6
 from .merge import merge
 from .normalizers import extract_grant_code, inject_anchor, normalize_grant_code, normalize_grant_codes_json, normalize_pp_to_percent
-from .openai_client import classify_ambiguous_chunks, call_openai, call_openai_text, create_client
+from .openai_client import classify_ambiguous_chunks, call_openai
 from .prompts import SYSTEM_PROMPT_1, SYSTEM_PROMPT_2, SYSTEM_PROMPT_3, SYSTEM_PROMPT_4, SYSTEM_PROMPT_5, SYSTEM_PROMPT_6, SYSTEM_PROMPT_7, SYSTEM_PROMPT_CONSOLIDATE
 
 logger = logging.getLogger(__name__)
 
 # Modelo usado em cada prompt
 P1_MODEL = "gpt-5-mini-2025-08-07"
-# P2 faz a tabela de Dotação (fundo/programa/taxas) — estrutura difícil; o gpt-4o-mini
-# inventava labels de fundo e taxas (ex: 100% numa Dotação Global sem taxa). gpt-5-mini é fiável.
 P2_MODEL = "gpt-5-mini-2025-08-07"
 P3_MODEL = "gpt-5.4-mini-2026-03-17"
 P4_MODEL = "gpt-5.4"
@@ -43,11 +43,11 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
     logger.info("\n[1/2] Chunking semântico")
     chunks = chunk_by_markdown(markdown, grant_code=source, source=source)
 
-    cats: dict[str, int] = {}
-    for c in chunks:
-        cats[c["category"]] = cats.get(c["category"], 0) + 1
-    for cat, n in sorted(cats.items()):
-        logger.info(f"  [{cat}] {n} secção(ões)")
+    chunk_counts_by_category: dict[str, int] = {}
+    for chunk in chunks:
+        chunk_counts_by_category[chunk["category"]] = chunk_counts_by_category.get(chunk["category"], 0) + 1
+    for category, chunk_count in sorted(chunk_counts_by_category.items()):
+        logger.info(f"  [{category}] {chunk_count} secção(ões)")
     logger.info(f"  Total: {len(chunks)} chunks")
 
     # Routing multi-label: o LLM classifica TODOS os chunks. A categoria por keyword
@@ -57,26 +57,26 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
     routed = await classify_ambiguous_chunks(client, chunks)
     for chunk in chunks:
         labels: set[str] = set()
-        kw = chunk.get("category")
-        if kw and kw not in ("outros", "ignorar"):
-            labels.add(kw)
-        for lc in routed.get(str(chunk.get("chunk_index", "")), []):
-            if lc not in ("outros", "ignorar"):
-                labels.add(lc)
+        keyword_category = chunk.get("category")
+        if keyword_category and keyword_category not in ("outros", "ignorar"):
+            labels.add(keyword_category)
+        for llm_category in routed.get(str(chunk.get("chunk_index", "")), []):
+            if llm_category not in ("outros", "ignorar"):
+                labels.add(llm_category)
         chunk["categories"] = labels
 
     # Chunks sem qualquer categoria → fallback para P1 (rede de segurança)
-    fallback = [c for c in chunks if not c["categories"]]
-    n_multi = sum(1 for c in chunks if len(c["categories"]) > 1)
-    logger.info(f"  [Router] {n_multi} chunks multi-categoria, {len(fallback)} sem categoria (→P1)")
+    fallback = [chunk for chunk in chunks if not chunk["categories"]]
+    multi_category_count = sum(1 for chunk in chunks if len(chunk["categories"]) > 1)
+    logger.info(f"  [Router] {multi_category_count} chunks multi-categoria, {len(fallback)} sem categoria (→P1)")
 
     # Distribui os chunks pelos 6 prompts por interseção de categorias
-    p1_chunks = [c for c in chunks if c["categories"] & CATS_P1] + fallback
-    p2_chunks = [c for c in chunks if c["categories"] & CATS_P2]
-    p3_chunks = [c for c in chunks if c["categories"] & CATS_P3]
-    p4_chunks = [c for c in chunks if c["categories"] & CATS_P4]
-    p5_chunks = [c for c in chunks if c["categories"] & CATS_P5]
-    p6_chunks = [c for c in chunks if c["categories"] & CATS_P6]
+    p1_chunks = [chunk for chunk in chunks if chunk["categories"] & CATS_P1] + fallback
+    p2_chunks = [chunk for chunk in chunks if chunk["categories"] & CATS_P2]
+    p3_chunks = [chunk for chunk in chunks if chunk["categories"] & CATS_P3]
+    p4_chunks = [chunk for chunk in chunks if chunk["categories"] & CATS_P4]
+    p5_chunks = [chunk for chunk in chunks if chunk["categories"] & CATS_P5]
+    p6_chunks = [chunk for chunk in chunks if chunk["categories"] & CATS_P6]
 
     # Rede de segurança final: garante que anexos temáticos chegam SEMPRE ao prompt certo,
     # mesmo que keyword e LLM tenham falhado. Cada anexo é encaminhado por conteúdo.
@@ -90,13 +90,13 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
         (("despesa", "custos elegíveis", "ocs", "indicador"), p5_chunks),
         (("metas de execução", "execução financeira", "taxa de execução", "anexo 6"), p2_chunks),
     )
-    for c in chunks:
-        if not c.get("is_annex"):
+    for chunk in chunks:
+        if not chunk.get("is_annex"):
             continue
-        txt = (c.get("title", "") + " " + c.get("text", "")[:300]).lower()
+        txt = (chunk.get("title", "") + " " + chunk.get("text", "")[:300]).lower()
         for keywords, target in _ANNEX_GUARANTEE:
-            if id(c) not in {id(x) for x in target} and any(kw in txt for kw in keywords):
-                target.append(c)
+            if id(chunk) not in {id(x) for x in target} and any(keyword_category in txt for keyword_category in keywords):
+                target.append(chunk)
 
     # Garantia de conteúdo (não-anexo): o piso/teto de elegibilidade ("mínimo de despesa
     # elegível total de X ... inferior a Y") costuma estar numa secção de DESPESAS (P5), mas
@@ -105,11 +105,11 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
     _MINMAX_MARKERS = ("despesa elegível total", "investimento mínimo", "investimento máximo",
                        "custo mínimo", "custo total superior", "não pode exceder")
     p3_ids = {id(x) for x in p3_chunks}
-    for c in chunks:
-        txt = (c.get("text") or "").lower()
-        if id(c) not in p3_ids and any(m in txt for m in _MINMAX_MARKERS):
-            p3_chunks.append(c)
-            p3_ids.add(id(c))
+    for chunk in chunks:
+        txt = (chunk.get("text") or "").lower()
+        if id(chunk) not in p3_ids and any(m in txt for m in _MINMAX_MARKERS):
+            p3_chunks.append(chunk)
+            p3_ids.add(id(chunk))
 
     # 2. OpenAI — P1 primeiro para obter o notice_code, depois P2–P6 em paralelo
     logger.info("\n[2/2] OpenAI")
@@ -124,7 +124,7 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
         logger.warning("grant_code not found in P1")
 
     logger.info("\n  P2–P6 em paralelo ...")
-    t = time.time()
+    chunk_text = time.time()
     r2, r3, r4, r5, r6 = await asyncio.gather(
         call_openai(client, inject_anchor(SYSTEM_PROMPT_2, notice_code), p2_chunks, "P2 Território+Fases",     P2_MODEL),
         call_openai(client, inject_anchor(SYSTEM_PROMPT_3, notice_code), p3_chunks, "P3 Taxas+Pagamentos",     P3_MODEL),
@@ -132,7 +132,7 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
         call_openai(client, inject_anchor(SYSTEM_PROMPT_5, notice_code), p5_chunks, "P5 Despesas+Indicadores", P5_MODEL),
         call_openai(client, inject_anchor(SYSTEM_PROMPT_6, notice_code), p6_chunks, "P6 Documentos",           P6_MODEL),
     )
-    logger.info(f"\n  Concluído em {time.time()-t:.1f}s")
+    logger.info(f"\n  Concluído em {time.time()-chunk_text:.1f}s")
 
     # Merge e normalização final
     logger.info("\n  Merge:")
@@ -141,8 +141,8 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
 
     # P7 — enriquecer com Anexos + preencher campos vazios do corpo
     annex_chunks = [
-        c for c in chunks
-        if c.get("is_annex") and c.get("category") != "ignorar"
+        chunk for chunk in chunks
+        if chunk.get("is_annex") and chunk.get("category") != "ignorar"
     ]
 
     empty_fields = [k for k, v in result["Grant"].items() if v in (None, [], "")]
@@ -154,7 +154,7 @@ async def _run(markdown: str, source: str, output_dir: Path, extra: dict | None 
         fields_before = _count_empty_fields(result)
         logger.info(f"\n  [P7] {len(annex_chunks)} Anexos + {len(body_chunks)} corpo | {fields_before} campos vazios")
         json_completo = json.dumps(result, ensure_ascii=False, indent=2)
-        empty_fields_str = ", ".join(f"`{c}`" for c in empty_fields) if empty_fields else "nenhum"
+        empty_fields_str = ", ".join(f"`{chunk}`" for chunk in empty_fields) if empty_fields else "nenhum"
         system_p7 = (
             SYSTEM_PROMPT_7
             + f'\n\nCAMPOS VAZIOS A TENTAR PREENCHER: {empty_fields_str}'
@@ -227,31 +227,31 @@ def _chunks_for_empty_fields(chunks: list[dict], empty_fields: list[str]) -> lis
     if not empty_fields:
         return []
 
-    terms = {t for field in empty_fields for t in _field_search_terms(field)}
+    terms = {chunk_text for field in empty_fields for chunk_text in _field_search_terms(field)}
 
     scored: list[tuple[int, dict]] = []
-    for c in chunks:
-        if c.get("is_annex") or c.get("category") == "ignorar":
+    for chunk in chunks:
+        if chunk.get("is_annex") or chunk.get("category") == "ignorar":
             continue
         data = (
-            (c.get("section") or c.get("titulo") or "")
+            (chunk.get("section") or chunk.get("titulo") or "")
             + " "
-            + (c.get("category") or "")
+            + (chunk.get("category") or "")
             + " "
-            + (c.get("text") or "")[:200]
+            + (chunk.get("text") or "")[:200]
         ).lower()
-        score = sum(1 for t in terms if t in data)
+        score = sum(1 for chunk_text in terms if chunk_text in data)
         if score > 0:
-            scored.append((score, c))
+            scored.append((score, chunk))
 
     scored.sort(key=lambda x: -x[0])
     seen: set[int] = set()
     result: list[dict] = []
-    for _, c in scored:
-        cid = id(c)
+    for _, chunk in scored:
+        cid = id(chunk)
         if cid not in seen:
             seen.add(cid)
-            result.append(c)
+            result.append(chunk)
     return result
 
 

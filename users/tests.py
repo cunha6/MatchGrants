@@ -1,4 +1,6 @@
 import json
+from unittest import mock
+
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
 from django.core.cache import cache
@@ -6,8 +8,39 @@ from django.test import TestCase, Client
 from django.contrib.auth.models import User
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
+from email_validator import validate_email as _real_validate_email
+
 from . import service
 from .models import UserProfile
+
+_email_syntax_only_patch = None
+_ctt_lookup_patch = None
+
+
+def setUpModule():
+    # A verificação de DOMÍNIO (consulta DNS real) fica sempre mockada nesta suite — só a
+    # sintaxe é verificada de facto. Mesma técnica de match/tests.py:ViewerCreationTests —
+    # os domínios de teste ("mail.com", "client.com"…) não têm de ter DNS real para os
+    # testes de permissões/validação passarem offline.
+    global _email_syntax_only_patch, _ctt_lookup_patch
+    _email_syntax_only_patch = mock.patch(
+        "common.email_validation.validate_email",
+        side_effect=lambda email, check_deliverability=True, dns_resolver=None: _real_validate_email(
+            email, check_deliverability=False),
+    )
+    _email_syntax_only_patch.start()
+
+    # CTT_KEY está configurada a sério neste projeto (usada pelo match) — sem mock, o
+    # registo com postal_code faria uma chamada de REDE real em cada teste. Devolve
+    # (None, None, None) por omissão (degradação graciosa, igual a sem CTT_KEY nenhuma);
+    # a derivação em si é testada à parte em PostalCodeLocationTests, com o seu próprio mock.
+    _ctt_lookup_patch = mock.patch("users.service.ctt_lookup", return_value=(None, None, None))
+    _ctt_lookup_patch.start()
+
+
+def tearDownModule():
+    _email_syntax_only_patch.stop()
+    _ctt_lookup_patch.stop()
 
 
 class UserCreateSecurityTests(TestCase):
@@ -16,7 +49,7 @@ class UserCreateSecurityTests(TestCase):
         self.base_url = "/users/create/"
 
         # 1. Admin
-        self.admin_user = User.objects.create_user(username="admin_creator", password="123", email="admin@mail.com")
+        self.admin_user = User.objects.create_user(username="admin_creator", password="123", email="admin@client.com")
         UserProfile.objects.filter(user=self.admin_user).update(role=UserProfile.ADMIN)
 
         # 2. Commercial
@@ -27,20 +60,18 @@ class UserCreateSecurityTests(TestCase):
         self.client_user = User.objects.create_user(username="normal_client", password="123", email="client@mail.com")
         UserProfile.objects.filter(user=self.client_user).update(role=UserProfile.CLIENT)
 
-        # Perfect base payload to create a CLIENT
+        # Perfect base payload to create a CLIENT. Ninguém escolhe password na criação (ver
+        # CreateWithoutPasswordTests) — não faz parte do payload "perfeito".
         self.valid_client_payload = {
             "username": "new_client",
-            "password": "strongPassword123",
             "email": "new@client.com",
             "role": UserProfile.CLIENT,
             "entity_type": UserProfile.EMPRESA,
             "entity_size": UserProfile.MEDIA,
-            "nif": "999999999",
+            "nif": "500000018",
             "main_cae": "62010",
             "address": "Main Street",
-            "region": "Norte",
-            "nuts_ii": True,
-            "nuts_iii": False,
+            "postal_code": "4000-001",
         }
 
     # --- TEST 1: Client Rule (Blocked) ---
@@ -94,8 +125,7 @@ class UserCreateSecurityTests(TestCase):
 
         payload_admin = {
             "username": "new_commercial",
-            "password": "strongPassword123",  # Fixed: Needs > 8 characters
-            "email": "commercial@mail.com",
+            "email": "commercial@client.com",
             "role": UserProfile.COMMERCIAL_GRANTS,
         }
 
@@ -130,11 +160,12 @@ class UserCreateSecurityTests(TestCase):
 
     # --- TEST 6: Fails due to missing required data (Error 400) ---
     def test_create_fails_if_missing_credentials(self):
-        """Ensures creating without username, email, or password returns a 400 error."""
+        """Ensures creating without username/email returns a 400 error. Ninguém envia
+        password na criação (ver CreateWithoutPasswordTests) — deixou de ser um campo
+        obrigatório aqui."""
         incomplete_payload = {
-            "username": "no_password",
-            "email": "test@mail.com",
-            # Intentionally missing the password
+            "username": "no_email",
+            # Intentionally missing the email
         }
         response = self.client.post(
             self.base_url,
@@ -142,13 +173,22 @@ class UserCreateSecurityTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 400)
-        self.assertIn("password", response.json()["error"].lower())
+        self.assertIn("email", response.json()["error"].lower())
+
+    def test_create_fails_if_missing_username(self):
+        response = self.client.post(
+            self.base_url,
+            data=json.dumps({"email": "no-username@mail.com"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("username", response.json()["error"].lower())
 
     # --- TEST 7: Fails due to duplicated Email/Username (Error 400) ---
     def test_create_fails_if_username_or_email_exists(self):
         """Ensures accounts cannot be created with already existing credentials."""
         duplicate_payload = self.valid_client_payload.copy()
-        duplicate_payload["email"] = "admin@mail.com"
+        duplicate_payload["email"] = "admin@client.com"
 
         response = self.client.post(
             self.base_url,
@@ -273,8 +313,10 @@ class UserUpdateSecurityTests(TestCase):
         self.assertEqual(response.status_code, 200)
 
         self.target_user.profile.refresh_from_db()
-        self.assertEqual(self.target_user.profile.address, "Address Edited By Admin")
         self.assertEqual(self.target_user.profile.role, UserProfile.COMMERCIAL_PUBLIC)
+        # Ao passar a um papel INTERNO, os campos de entidade sao ignorados: descrevem uma
+        # empresa candidata, nao uma pessoa da equipa (ver service._STAFF_ROLES).
+        self.assertNotEqual(self.target_user.profile.address, "Address Edited By Admin")
 
     # --- TEST 5: Unauthenticated User ---
     def test_unauthenticated_user_cannot_update(self):
@@ -446,6 +488,41 @@ class UserPasswordSecurityTests(TestCase):
     def _pw_url(self, uid):
         return f"{self.base_url}{uid}/password/"
 
+    # --- TEST 0: a password NUNCA se define pelo /update/, por ninguém ---
+    def test_update_route_cannot_set_a_password(self):
+        """A password só se define pelo link enviado por email (ver users_change_password).
+
+        Enquanto `update_user` aceitava `password` no corpo, um comercial punha a password
+        que quisesse na conta de qualquer client/viewer que gere — e entrava nela. O admin é
+        aqui o caso mais forte: se nem ele consegue, mais ninguém consegue.
+        """
+        self.client.login(username="admin_pw", password="adminpass")
+        response = self.client.put(
+            f"{self.base_url}{self.target_user.id}/update/",
+            data=json.dumps({"password": "IntrusoForte123!", "first_name": "Alvo"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.target_user.refresh_from_db()
+        # O resto do pedido foi aplicado...
+        self.assertEqual(self.target_user.first_name, "Alvo")
+        # ...mas a password ficou a original — a nova não entra.
+        self.assertFalse(self.target_user.check_password("IntrusoForte123!"))
+        self.assertTrue(self.target_user.check_password("oldpass"))
+
+    def test_commercial_cannot_set_a_client_password_via_update(self):
+        commercial = User.objects.create_user(
+            username="com_pw", password="Xk93!vTq21mZ", email="com@pw.com")
+        UserProfile.objects.filter(user=commercial).update(role=UserProfile.COMMERCIAL_GRANTS)
+        self.client.login(username="com_pw", password="Xk93!vTq21mZ")
+        self.client.put(
+            f"{self.base_url}{self.target_user.id}/update/",
+            data=json.dumps({"password": "IntrusoForte123!"}),
+            content_type="application/json",
+        )
+        self.target_user.refresh_from_db()
+        self.assertFalse(self.target_user.check_password("IntrusoForte123!"))
+
     # --- TEST 1: Other user (neither self nor admin) → 403 ---
     def test_other_user_cannot_change_password(self):
         """A user who is neither self nor admin gets 403 when changing another's password."""
@@ -462,51 +539,70 @@ class UserPasswordSecurityTests(TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertIn("You do not have permission to change another user's password.", response.json()["error"])
 
-    # --- TEST 2: Own password with correct current password → 200 ---
-    def test_user_can_change_own_password(self):
+    # --- TEST 2: o proprio pede -> recebe email, a password NAO muda aqui ---
+    def test_own_request_sends_email_and_does_not_set_password(self):
         self.client.login(username="target_pw", password="oldpass")
 
-        # Fixed: Added >8 characters to bypass validation
-        payload = {"current_password": "oldpass", "password": "newpassword123"}
         response = self.client.post(
             self._pw_url(self.target_user.id),
-            data=json.dumps(payload),
+            data=json.dumps({"password": "newpassword123"}),
             content_type="application/json",
         )
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["target@pw.com"])
+        # O corpo do pedido e IGNORADO: a password so muda pelo link do email.
         self.target_user.refresh_from_db()
-        self.assertTrue(self.target_user.check_password("newpassword123"))
+        self.assertFalse(self.target_user.check_password("newpassword123"))
+        self.assertTrue(self.target_user.check_password("oldpass"))
 
-    # --- TEST 3: Own password with incorrect current password → 400 ---
-    def test_user_change_own_password_wrong_current(self):
+    # --- TEST 3: o corpo do pedido nao tem efeito nenhum ---
+    def test_request_body_is_ignored(self):
         self.client.login(username="target_pw", password="oldpass")
 
-        # Fixed: Added >8 characters to bypass validation
-        payload = {"current_password": "wrongpassword", "password": "newpassword123"}
-        response = self.client.post(
-            self._pw_url(self.target_user.id),
-            data=json.dumps(payload),
-            content_type="application/json",
-        )
+        # Sem password, com a atual errada, ou vazio: o resultado e sempre o mesmo email.
+        for payload in ({}, {"current_password": "errada"}, {"password": "x"}):
+            mail.outbox.clear()
+            response = self.client.post(
+                self._pw_url(self.target_user.id),
+                data=json.dumps(payload), content_type="application/json",
+            )
+            self.assertEqual(response.status_code, 200, payload)
+            self.assertEqual(len(mail.outbox), 1, payload)
 
-        self.assertEqual(response.status_code, 400)
-
-    # --- TEST 4: Admin resets another user's password (without current) → 200 ---
-    def test_admin_can_reset_other_password(self):
+    # --- TEST 4: o admin dispara o email de outrem, mas nao escolhe a password ---
+    def test_admin_triggers_email_without_choosing_password(self):
         self.client.login(username="admin_pw", password="adminpass")
 
-        # Fixed: Added >8 characters to bypass validation
-        payload = {"password": "resetpassword123"}
         response = self.client.post(
             self._pw_url(self.target_user.id),
-            data=json.dumps(payload),
+            data=json.dumps({"password": "resetpassword123"}),
             content_type="application/json",
         )
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(mail.outbox[0].to, ["target@pw.com"])
+        # Quem gere a conta nunca fica a saber a password de outra pessoa.
         self.target_user.refresh_from_db()
-        self.assertTrue(self.target_user.check_password("resetpassword123"))
+        self.assertFalse(self.target_user.check_password("resetpassword123"))
+
+    # --- TEST 4b: sem email registado, ou conta inativa, nao ha para onde enviar ---
+    def test_cannot_send_without_email_or_when_inactive(self):
+        self.client.login(username="admin_pw", password="adminpass")
+
+        sem_email = User.objects.create_user(username="sem_email_pw", password="x")
+        UserProfile.objects.filter(user=sem_email).update(role=UserProfile.CLIENT)
+        response = self.client.post(self._pw_url(sem_email.id))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("email", response.json()["error"].lower())
+
+        self.target_user.is_active = False
+        self.target_user.save(update_fields=["is_active"])
+        response = self.client.post(self._pw_url(self.target_user.id))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("inativa", response.json()["error"].lower())
+        self.assertEqual(len(mail.outbox), 0)
 
 
 class UserActivateAndMeTests(TestCase):
@@ -728,8 +824,8 @@ class UserListFilterTests(TestCase):
         )
         self.assertEqual(resp.status_code, 403)
 
-    # --- password reset: commercial reseta a de viewer/client sem saber a atual ---
-    def test_commercial_can_reset_client_password(self):
+    # --- password: o comercial dispara o email do client, nao lhe escolhe a password ---
+    def test_commercial_triggers_client_password_email(self):
         self.client.login(username="comm_f", password="123")
         resp = self.client.post(
             f"{self.base_url}{self.cb.id}/password/",
@@ -737,7 +833,7 @@ class UserListFilterTests(TestCase):
         )
         self.assertEqual(resp.status_code, 200)
         self.cb.refresh_from_db()
-        self.assertTrue(self.cb.check_password("novaPassword123"))
+        self.assertFalse(self.cb.check_password("novaPassword123"))
 
     def test_commercial_cannot_reset_admin_password(self):
         self.client.login(username="comm_f", password="123")
@@ -760,17 +856,15 @@ class UserFieldValidationTests(TestCase):
 
         self.valid_payload = {
             "username": "test_validation",
-            "password": "strongPassword123",
-            "email": "val@mail.com",
+            "email": "val@client.com",
             "role": UserProfile.CLIENT,
             "entity_type": UserProfile.EMPRESA,
             "entity_size": UserProfile.MEDIA,
-            "nif": "123456789",
+            "nif": "500000018",
             "main_cae": "62010",
             "address": "Main Street",
+            "postal_code": "4000-001",
             "region": "Norte",
-            "nuts_ii": True,
-            "nuts_iii": False,
         }
 
     # --- REGRA 1: ENUMS ---
@@ -846,7 +940,7 @@ class UserFieldValidationTests(TestCase):
     # --- REGRA 6: Campos obrigatórios vazios (Strings Vazias) ---
     def test_client_empty_required_fields(self):
         """Garante que se enviar o campo mas com string vazia (''), dá erro."""
-        required_fields = ["nif", "main_cae", "address", "region"]
+        required_fields = ["nif", "main_cae", "address", "postal_code"]
 
         for field in required_fields:
             payload = self.valid_payload.copy()
@@ -897,21 +991,22 @@ class PasswordResetTests(TestCase):
         service.request_password_reset("ninguem@x.pt")
         self.assertEqual(len(mail.outbox), 0)
 
-    def test_request_reset_works_for_viewer_without_usable_password(self):
-        # Serve também para DEFINIR a 1ª password (não só repor uma esquecida) — o viewer
-        # nunca teve password nenhuma, mas continua inativo (is_active=False) até promovido,
-        # por isso não há risco em deixá-lo passar por aqui.
-        service.request_password_reset("lead@x.pt")
+    def test_request_reset_works_for_active_user_without_usable_password(self):
+        # Serve também para DEFINIR a 1ª password, não só repor uma esquecida: uma conta
+        # criada por um admin (ou um viewer já promovido) ainda não tem password utilizável.
+        ativo = User.objects.create_user("com_sem_pw", email="sem-pw@x.pt", is_active=True)
+        ativo.set_unusable_password()
+        ativo.save()
+        service.request_password_reset("sem-pw@x.pt")
         self.assertEqual(len(mail.outbox), 1)
-        self.assertEqual(mail.outbox[0].to, ["lead@x.pt"])
+        self.assertEqual(mail.outbox[0].to, ["sem-pw@x.pt"])
 
-    def test_reset_confirm_sets_first_password_for_viewer(self):
-        uidb64, token = self._token_for(self.viewer)
-        service.reset_password_with_token(uidb64, token, "primeiraPasswordForte123")
-        self.viewer.refresh_from_db()
-        self.assertTrue(self.viewer.check_password("primeiraPasswordForte123"))
-        # Continua inativo — ter password não é o mesmo que poder entrar.
-        self.assertFalse(self.viewer.is_active)
+    def test_request_reset_ignores_inactive_viewer(self):
+        # SEGURANÇA: o email de um viewer é escrito por um pedido ANÓNIMO (o match), e é o
+        # seletor deste endpoint. Deixar passar contas inativas permitia a quem soubesse o
+        # NIF público apontar a ficha ao seu email e deixar uma password à espera da promoção.
+        service.request_password_reset("lead@x.pt")
+        self.assertEqual(len(mail.outbox), 0)
 
     def test_reset_confirm_with_valid_token_changes_password(self):
         uidb64, token = self._token_for(self.user)
@@ -985,3 +1080,256 @@ class PasswordResetTests(TestCase):
 
     def test_reset_request_view_rejects_get(self):
         self.assertEqual(self.client.get("/users/password-reset/").status_code, 405)
+
+class StaffProfileHasNoEntityFieldsTests(TestCase):
+    """Um admin/comercial identifica-se por utilizador, nome, email e papel — os campos de
+    entidade (NIF, CAE, morada, NUTS…) descrevem uma EMPRESA candidata e não se aplicam."""
+
+    ENTITY_FIELDS = ("entity_type", "entity_size", "incorporation_date", "nif", "main_cae",
+                     "secondary_cae", "address", "postal_code", "city", "county", "region",
+                     "nuts_ii", "nuts_iii", "job_title", "matched_grants")
+
+    def setUp(self):
+        self.client = Client()
+        self.admin = User.objects.create_user(
+            username="admin_staff", password="Xk93!vTq21mZ", email="admin@staff.pt",
+            first_name="Ana Admin")
+        UserProfile.objects.filter(user=self.admin).update(role=UserProfile.ADMIN)
+
+        self.commercial = User.objects.create_user(
+            username="com_staff", password="Xk93!vTq21mZ", email="com@staff.pt")
+        UserProfile.objects.filter(user=self.commercial).update(
+            role=UserProfile.COMMERCIAL_GRANTS)
+
+        self.client_user = User.objects.create_user(
+            username="cli_staff", password="Xk93!vTq21mZ", email="cli@staff.pt")
+        UserProfile.objects.filter(user=self.client_user).update(
+            role=UserProfile.CLIENT, nif="500829993", address="Rua X")
+
+    def test_staff_detail_has_only_identity_fields(self):
+        for user in (self.admin, self.commercial):
+            detail = service.get_user_detail(user.id)
+            self.assertEqual(
+                set(detail),
+                {"id", "username", "email", "first_name", "role",
+                 "is_active", "is_staff", "is_superuser", "date_joined"},
+                msg=detail["role"],
+            )
+            for field in self.ENTITY_FIELDS:
+                self.assertNotIn(field, detail, msg=f"{detail['role']} não devia expor {field}")
+
+    def test_client_detail_keeps_entity_fields(self):
+        detail = service.get_user_detail(self.client_user.id)
+        for field in self.ENTITY_FIELDS:
+            self.assertIn(field, detail)
+        self.assertEqual(detail["nif"], "500829993")
+
+    def test_client_detail_lists_matched_grants(self):
+        from avisos.models import Grant
+        grant = Grant.objects.create(
+            source="portugal", scraping_url="https://x/G1/", grant_code="G1",
+            title="Aviso G1", ai_processed=True, active=True,
+        )
+        self.client_user.profile.matched_grants.set([grant])
+        detail = service.get_user_detail(self.client_user.id)
+        self.assertEqual(
+            detail["matched_grants"],
+            [{"id": grant.id, "grant_code": "G1", "title": "Aviso G1"}],
+        )
+
+    def test_entity_fields_are_ignored_when_creating_staff(self):
+        self.client.login(username="admin_staff", password="Xk93!vTq21mZ")
+        response = self.client.post(
+            "/users/create/",
+            data=json.dumps({
+                "username": "novo_comercial", "password": "Xk93!vTq21mZ",
+                "email": "novo@staff.pt", "role": UserProfile.COMMERCIAL_PUBLIC,
+                # Enviados por hábito pelo cliente — devem ser ignorados em silêncio, não 400.
+                "nif": "999999999", "address": "Morada que não devia entrar",
+            }),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 201)
+        profile = User.objects.get(username="novo_comercial").profile
+        self.assertEqual(profile.role, UserProfile.COMMERCIAL_PUBLIC)
+        self.assertFalse(profile.nif)
+        self.assertFalse(profile.address)
+
+    def test_entity_fields_are_ignored_when_updating_staff(self):
+        self.client.login(username="admin_staff", password="Xk93!vTq21mZ")
+        response = self.client.put(
+            f"/users/{self.commercial.id}/update/",
+            data=json.dumps({"nif": "999999999", "address": "Também não entra",
+                             "first_name": "Carlos Comercial"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.commercial.refresh_from_db()
+        self.commercial.profile.refresh_from_db()
+        self.assertEqual(self.commercial.first_name, "Carlos Comercial")  # este entra
+        self.assertFalse(self.commercial.profile.nif)
+        self.assertFalse(self.commercial.profile.address)
+
+
+class CreateWithoutPasswordTests(TestCase):
+    """NINGUÉM define a password na criação — nem quem cria a conta de OUTRA pessoa (um
+    admin/comercial), nem quem se regista a si próprio (registo público). A conta nasce
+    sempre sem password utilizável e a pessoa recebe por email o link para a escolher."""
+
+    def setUp(self):
+        self.client = Client()
+        cache.clear()
+        self.admin = User.objects.create_user(
+            username="admin_np", password="Xk93!vTq21mZ", email="admin@np.pt")
+        UserProfile.objects.filter(user=self.admin).update(role=UserProfile.ADMIN)
+        mail.outbox.clear()
+
+    def _create(self, payload):
+        return self.client.post("/users/create/", data=json.dumps(payload),
+                                content_type="application/json")
+
+    def test_staff_created_account_has_no_password_and_gets_email(self):
+        self.client.login(username="admin_np", password="Xk93!vTq21mZ")
+        response = self._create({
+            "username": "novo_com", "email": "novo@com.pt",
+            "first_name": "Rita Comercial", "role": UserProfile.COMMERCIAL_GRANTS,
+        })
+        self.assertEqual(response.status_code, 201)
+
+        created = User.objects.get(username="novo_com")
+        self.assertFalse(created.has_usable_password())
+        self.assertEqual(created.first_name, "Rita Comercial")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["novo@com.pt"])
+
+    def test_staff_created_account_ignores_a_password_in_the_body(self):
+        self.client.login(username="admin_np", password="Xk93!vTq21mZ")
+        self._create({
+            "username": "com_pw", "email": "compw@np.pt",
+            "role": UserProfile.COMMERCIAL_PUBLIC, "password": "escolhidaPeloAdmin123",
+        })
+        created = User.objects.get(username="com_pw")
+        self.assertFalse(created.check_password("escolhidaPeloAdmin123"))
+        self.assertFalse(created.has_usable_password())
+
+    def test_public_self_registration_has_no_password_and_gets_email(self):
+        """O registo público segue exatamente a mesma regra: sem password na hora, link
+        por email para a escolher — deixou de haver atrito nenhum a favorecer aqui."""
+        response = self._create({
+            "username": "visitante", "email": "visitante@np.pt",
+            "entity_type": UserProfile.EMPRESA, "entity_size": UserProfile.MEDIA,
+            "nif": "500829993", "main_cae": "62010", "address": "Rua X",
+            "postal_code": "4000-001",
+        })
+        self.assertEqual(response.status_code, 201)
+
+        created = User.objects.get(username="visitante")
+        self.assertFalse(created.has_usable_password())
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["visitante@np.pt"])
+
+    def test_public_self_registration_ignores_a_password_in_the_body(self):
+        response = self._create({
+            "username": "visitante2", "email": "visitante2@np.pt",
+            "password": "aMinhaPassword123",
+            "entity_type": UserProfile.EMPRESA, "entity_size": UserProfile.MEDIA,
+            "nif": "500829993", "main_cae": "62010", "address": "Rua X",
+            "postal_code": "4000-001",
+        })
+        self.assertEqual(response.status_code, 201)
+        created = User.objects.get(username="visitante2")
+        self.assertFalse(created.check_password("aMinhaPassword123"))
+        self.assertFalse(created.has_usable_password())
+
+
+class NifValidationTests(TestCase):
+    """_is_valid_company_nif: 9 dígitos, dígito de controlo (mod 11) e não é NIF de pessoa
+    singular (prefixo 1/2/3). Testado diretamente — sem precisar de bater na view."""
+
+    def test_valid_company_nif(self):
+        # 500000018: prefixo "5" (pessoa coletiva) + dígito de controlo correto.
+        self.assertTrue(service._is_valid_company_nif("500000018"))
+
+    def test_valid_company_nif_used_across_the_suite(self):
+        # O NIF placeholder mais usado nos outros testes — confirma que é mesmo válido,
+        # não só "parece" válido por ter 9 dígitos.
+        self.assertTrue(service._is_valid_company_nif("500829993"))
+
+    def test_wrong_check_digit_is_rejected(self):
+        self.assertFalse(service._is_valid_company_nif("500000019"))  # último dígito errado
+
+    def test_personal_nif_prefix_is_rejected(self):
+        # Gera um NIF de pessoa singular (prefixo "1") com CHECKSUM VÁLIDO — para isolar
+        # exatamente a regra do prefixo, sem se confundir com a regra do dígito de controlo.
+        first8 = "10000000"
+        checksum = sum(int(digit) * weight for digit, weight in zip(first8, range(9, 1, -1)))
+        remainder = checksum % 11
+        check_digit = 0 if remainder < 2 else 11 - remainder
+        personal_nif = first8 + str(check_digit)
+        self.assertTrue(personal_nif[0] in ("1", "2", "3"))  # confirma a premissa do teste
+        self.assertFalse(service._is_valid_company_nif(personal_nif))
+
+    def test_wrong_length_is_rejected(self):
+        self.assertFalse(service._is_valid_company_nif("50000001"))    # 8 dígitos
+        self.assertFalse(service._is_valid_company_nif("5000000180"))  # 10 dígitos
+
+    def test_non_digits_are_rejected(self):
+        self.assertFalse(service._is_valid_company_nif("50000001X"))
+
+    def test_empty_or_none_is_rejected(self):
+        self.assertFalse(service._is_valid_company_nif(""))
+        self.assertFalse(service._is_valid_company_nif(None))
+
+
+class PostalCodeLocationTests(TestCase):
+    """_fill_location_from_postal_code: deriva city/county/region a partir do código postal
+    (CTT + NUTS). O mock global do módulo (setUpModule) devolve sempre (None, None, None) —
+    aqui sobrepõe-se um mock PRÓPRIO para exercer a derivação a sério, sem tocar a rede."""
+
+    def test_derives_city_county_and_region_from_postal_code(self):
+        with mock.patch("users.service.ctt_lookup",
+                        return_value=("Guimarães", "Guimarães", "Braga")):
+            defaults = {"postal_code": "4800-937"}
+            service._fill_location_from_postal_code(defaults)
+        self.assertEqual(defaults["city"], "Guimarães")
+        self.assertEqual(defaults["county"], "Guimarães")
+        # nuts.json real: Guimarães -> NUTS III Ave -> NUTS II "antiga" Norte.
+        self.assertEqual(defaults.get("region"), "Norte")
+        self.assertNotIn("district", defaults)  # UserProfile não tem esse campo
+
+    def test_does_nothing_without_postal_code(self):
+        with mock.patch("users.service.ctt_lookup") as lookup:
+            defaults = {"address": "Rua X"}
+            service._fill_location_from_postal_code(defaults)
+        lookup.assert_not_called()
+        self.assertNotIn("city", defaults)
+
+    def test_degrades_silently_when_ctt_finds_nothing(self):
+        # Sem CTT_KEY, código postal inválido, ou falha de rede — ctt_lookup já devolve
+        # (None, None, None) nesses casos (ver common/ctt.py); a derivação não pode rebentar.
+        with mock.patch("users.service.ctt_lookup", return_value=(None, None, None)):
+            defaults = {"postal_code": "0000-000"}
+            service._fill_location_from_postal_code(defaults)
+        self.assertNotIn("city", defaults)
+        self.assertNotIn("region", defaults)
+
+    def test_registration_end_to_end_derives_region_from_postal_code(self):
+        # Prova a ligação ponta-a-ponta: POST /users/create/ com postal_code (sem region)
+        # acaba com o perfil a ter city/county/region preenchidos, via _apply_profile.
+        with mock.patch("users.service.ctt_lookup",
+                        return_value=("Guimarães", "Guimarães", "Braga")):
+            response = self.client.post(
+                "/users/create/",
+                data=json.dumps({
+                    "username": "registo_cp", "email": "registo@client.com",
+                    "entity_type": UserProfile.EMPRESA, "entity_size": UserProfile.MEDIA,
+                    "nif": "500000018", "main_cae": "62010", "address": "Rua X",
+                    "postal_code": "4800-937",
+                }),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 201)
+        profile = User.objects.get(username="registo_cp").profile
+        self.assertEqual(profile.city, "Guimarães")
+        self.assertEqual(profile.county, "Guimarães")
+        self.assertEqual(profile.region, "Norte")

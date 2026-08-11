@@ -12,11 +12,11 @@ import os
 from datetime import date
 
 from common.dates import parse_date as _parse_closing_date
+from common.docling.converter import download_pdf, pdf_to_markdown, find_existing_document, text_is_invitation
 
 from .scrape_compete import scrape_compete2030_web
 from .scrape_portugal import scrape_portugal2030_web
 from .scrape_prr import scrape_prr_web
-from .Docling.converter import download_pdf, pdf_to_markdown, find_existing_document, text_is_invitation
 from .IA.pipeline import run_pipeline, consolidate_markdowns
 from .documents import (
     classify_document, order_documents, needs_consolidation, amendment_ordinal,
@@ -48,25 +48,25 @@ def _process_grant_safe(grant: dict, download_dir: str, source_label: str):
 def _candidate_documents(grant: dict) -> list[dict]:
     """Documentos do aviso relevantes para extração (base/republicação/alteração)."""
     out = []
-    for d in grant.get("documentos") or []:
-        url = d.get("url")
+    for document in grant.get("documentos") or []:
+        url = document.get("url")
         if not url:
             continue
-        doc_type = classify_document(d.get("nome", ""))
+        doc_type = classify_document(document.get("nome", ""))
         if doc_type in _PRIMARY_TYPES:
-            out.append({"name": d.get("nome", ""), "url": url, "type": doc_type})
+            out.append({"name": document.get("nome", ""), "url": url, "type": doc_type})
     return out
 
 
 def _annex_documents(grant: dict) -> list[dict]:
     """Anexos do aviso — NÃO são descarregados, só fica o nome + url para referência."""
     out = []
-    for d in grant.get("documentos") or []:
-        url = d.get("url")
+    for document in grant.get("documentos") or []:
+        url = document.get("url")
         if not url:
             continue
-        if classify_document(d.get("nome", "")) == ANNEX:
-            out.append({"name": d.get("nome", ""), "url": url, "type": ANNEX})
+        if classify_document(document.get("nome", "")) == ANNEX:
+            out.append({"name": document.get("nome", ""), "url": url, "type": ANNEX})
     return out
 
 
@@ -80,30 +80,105 @@ def _latest_notice(grant: dict) -> tuple[str | None, str]:
     return ln, ""  # PRR: latest_notice é uma string (url)
 
 
-def _store_documents(grant_rec, ordered: list[dict], canonical_url: str) -> None:
+def _store_documents(grant_rec, other_documents: list[dict], canonical_url: str) -> None:
     grant_rec.documents.all().delete()
     GrantDocument.objects.bulk_create([
         GrantDocument(
             grant=grant_rec,
-            doc_type=d["type"],
-            name=d.get("name"),
-            url=d.get("url", ""),
-            ordinal=amendment_ordinal(d.get("name", "")),
-            is_canonical=(d.get("url") == canonical_url),
+            doc_type=document["type"],
+            name=document.get("name"),
+            url=document.get("url", ""),
+            ordinal=amendment_ordinal(document.get("name", "")),
+            is_canonical=(document.get("url") == canonical_url),
         )
-        for d in ordered
+        for document in other_documents
     ])
 
 
 def _discard_files(*paths: str | None) -> None:
     """Remove (best-effort) ficheiros de um aviso que decidimos NÃO processar (ex: convite)."""
-    for p in paths:
-        if not p:
+    for file_path in paths:
+        if not file_path:
             continue
         try:
-            os.remove(p)
+            os.remove(file_path)
         except OSError:
             pass
+
+
+def _is_in_db(canonical_url: str, code: str | None) -> bool:
+    """O aviso já existe na BD? Procura pelo URL canónico ou pelo código (uma republicação
+    traz um canonical_url novo para um grant_code já conhecido)."""
+    return (Grant.objects.filter(scraping_url=canonical_url).exists()
+            or (bool(code) and Grant.objects.filter(grant_code=code).exists()))
+
+
+def _fetch_markdown(canonical_url: str, download_dir: str):
+    """Descarrega o PDF canónico e converte-o em markdown.
+
+    Devolve (path, markdown, md_path) ou None quando não há nada a processar: não-PDF, erro,
+    ou CONVITE. Os convites são rejeitados em dois pontos — `reject_invitations` lê a
+    "Natureza do aviso" no texto cru (barato, antes de converter), e o `text_is_invitation`
+    é a rede de segurança para PDFs cujo texto cru saiu pobre e só ficou legível depois da
+    conversão; nesse caso os ficheiros já escritos são apagados.
+    """
+    path = download_pdf(canonical_url, download_dir, reject_invitations=True)
+    if not path:
+        return None
+    source_name = os.path.splitext(os.path.basename(path))[0]
+
+    converted = pdf_to_markdown(path, download_dir)
+    if not converted:
+        return None
+    canonical_md, md_path = converted
+
+    if text_is_invitation(canonical_md):
+        logger.info("[Convite] %s: Natureza=convite — ignorado", source_name)
+        _discard_files(path, md_path)
+        return None
+    return path, canonical_md, md_path
+
+
+def _consolidate(canonical_md: str, canonical_url: str, other_documents: list,
+                 download_dir: str, source_name: str) -> tuple[str, bool]:
+    """Se o documento canónico for um diff puro, aplica-o sobre o documento base.
+
+    Devolve (markdown_final, needs_review). Sem base para aplicar o diff, devolve o próprio
+    diff e needs_review=True — extrair de um diff isolado dá um aviso incompleto, que fica
+    assim marcado para revisão humana em vez de entrar em silêncio.
+    """
+    if not needs_consolidation(canonical_md):
+        return canonical_md, False
+
+    base_doc = next(
+        (document for document in other_documents
+         if document["type"] in (BASE, REPUBLICATION) and document["url"] != canonical_url),
+        None,
+    )
+    base_md = None
+    if base_doc:
+        bpath = download_pdf(base_doc["url"], download_dir)
+        bconv = pdf_to_markdown(bpath, download_dir) if bpath else None
+        base_md = bconv[0] if bconv else None
+
+    if base_md:
+        logger.info("[Consolidação] %s: aplicar diff sobre base", source_name)
+        return consolidate_markdowns(base_md, [canonical_md]), False
+
+    logger.warning("[Consolidação] %s: diff sem base — marcado needs_review", source_name)
+    return canonical_md, True
+
+
+def _store_canonical_and_related(grant_rec, canonical_name: str, canonical_url: str,
+                                 other_documents: list, annexes: list, needs_review: bool) -> None:
+    """Marca o needs_review e regista os documentos do aviso, com o canónico à cabeça."""
+    grant_rec.needs_review = needs_review
+    grant_rec.save(update_fields=["needs_review"])
+    canonical_type = classify_document(canonical_name)
+    if canonical_type not in (BASE, REPUBLICATION, AMENDMENT, RECTIFICATION):
+        canonical_type = BASE
+    canonical_rec = {"name": canonical_name, "url": canonical_url, "type": canonical_type}
+    _store_documents(grant_rec, [canonical_rec] + other_documents + annexes, canonical_url)
 
 
 def _process_grant(grant: dict, download_dir: str, source_label: str):
@@ -124,78 +199,40 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     #  • PDF não na pasta → (re)descarrega, converte, verifica convite e extrai (a seguir).
     code = grant.get("grant_code")
     if find_existing_document(canonical_url, download_dir):
-        in_db = (Grant.objects.filter(scraping_url=canonical_url).exists()
-                 or (bool(code) and Grant.objects.filter(grant_code=code).exists()))
-        if in_db:
+        if _is_in_db(canonical_url, code):
             save_scraped_grant({**grant, "url": canonical_url}, source_label)
         return None, False
 
     # was_new lê-se ANTES de qualquer escrita nesta função — é a única forma fiável de saber
     # se o save_ai_grant abaixo vai CRIAR um registo ou ATUALIZAR um já existente (republicação/
     # alteração de um grant_code conhecido, ou canonical_url novo de um aviso já na BD).
-    was_new = not (
-        Grant.objects.filter(scraping_url=canonical_url).exists()
-        or (bool(code) and Grant.objects.filter(grant_code=code).exists())
-    )
+    was_new = not _is_in_db(canonical_url, code)
 
     # PDF NÃO está na pasta (aviso novo, PDF apagado, ou canónico novo/republicação):
     # descarrega + converte + verifica convite + extrai. O save_ai_grant faz match por
     # grant_code e ATUALIZA o registo existente (não duplica), reapontando o scraping_url.
     annexes = _annex_documents(grant)
     # Outros documentos primários (para consolidação de alterações e para registo)
-    ordered = order_documents([d for d in _candidate_documents(grant) if d["url"] != canonical_url])
+    other_documents = order_documents([document for document in _candidate_documents(grant) if document["url"] != canonical_url])
 
-    # Download efetivo (PDF novo). O `reject_invitations` faz a verificação de convite
-    # BARATA e primeiro: lê a "Natureza do aviso" no texto do PDF (pypdf) ANTES de converter —
-    # convites detetáveis aqui devolvem None e nem chegam a ser convertidos nem gravados.
-    # não-PDF / erro / convite → return sem criar qualquer registo.
-    path = download_pdf(canonical_url, download_dir, reject_invitations=True)
-    if not path:
+    fetched = _fetch_markdown(canonical_url, download_dir)
+    if fetched is None:
         return None, False
+    path, canonical_md, md_path = fetched
     source_name = os.path.splitext(os.path.basename(path))[0]
-
-    converted = pdf_to_markdown(path, download_dir)
-    if not converted:
-        return None, False
-    canonical_md, md_path = converted
-
-    # Rede de segurança: PDFs onde o texto cru saiu pobre (ex: capa mal extraída) e a Natureza
-    # só ficou legível depois da conversão. Se for convite, ignoramos e apagamos os ficheiros.
-    if text_is_invitation(canonical_md):
-        logger.info("[Convite] %s: Natureza=convite — ignorado", source_name)
-        _discard_files(path, md_path)
-        return None, False
 
     # É concurso → grava os dados do HTML correspondente (cria o registo).
     save_scraped_grant({**grant, "url": canonical_url}, source_label)
 
-    # Consolidação: se o canónico for um diff puro, aplicar sobre o documento base
-    final_md = canonical_md
-    needs_review = False
-    if needs_consolidation(canonical_md):
-        base_doc = next(
-            (d for d in ordered
-             if d["type"] in (BASE, REPUBLICATION) and d["url"] != canonical_url),
-            None,
-        )
-        base_md = None
-        if base_doc:
-            bpath = download_pdf(base_doc["url"], download_dir)
-            bconv = pdf_to_markdown(bpath, download_dir) if bpath else None
-            base_md = bconv[0] if bconv else None
-        if base_md:
-            logger.info("[Consolidação] %s: aplicar diff sobre base", source_name)
-            final_md = consolidate_markdowns(base_md, [canonical_md])
-        else:
-            needs_review = True
-            logger.warning("[Consolidação] %s: diff sem base — marcado needs_review", source_name)
+    final_md, needs_review = _consolidate(
+        canonical_md, canonical_url, other_documents, download_dir, source_name)
 
     # annex_documents: TODOS os documentos da página do aviso — apenas nome + url
     # no JSON de saída (não são descarregados, ficam só para referência).
     extra = {"annex_documents": [
-        {"name": d.get("nome", ""), "url": d["url"]}
-        for d in grant.get("documentos") or []
-        if d.get("url")
+        {"name": document.get("nome", ""), "url": document["url"]}
+        for document in grant.get("documentos") or []
+        if document.get("url")
     ]}
     ai_data = run_pipeline(final_md, source_name, extra=extra)
     # Só chegamos aqui quando o PDF canónico ainda não estava em disco — aviso novo ou
@@ -208,13 +245,8 @@ def _process_grant(grant: dict, download_dir: str, source_label: str):
     ) if ai_data else None
 
     if grant_rec:
-        grant_rec.needs_review = needs_review
-        grant_rec.save(update_fields=["needs_review"])
-        canonical_type = classify_document(canonical_name)
-        if canonical_type not in (BASE, REPUBLICATION, AMENDMENT, RECTIFICATION):
-            canonical_type = BASE
-        canonical_rec = {"name": canonical_name, "url": canonical_url, "type": canonical_type}
-        _store_documents(grant_rec, [canonical_rec] + ordered + annexes, canonical_url)
+        _store_canonical_and_related(
+            grant_rec, canonical_name, canonical_url, other_documents, annexes, needs_review)
     return grant_rec, (was_new if grant_rec else False)
 
 
@@ -242,13 +274,13 @@ def _scrape(scraper, download_dir: str, source_label: str) -> list[dict]:
     terminados e envia UM email-resumo aos comerciais dos avisos processados — separado em
     criados vs. atualizados (ver _process_grant/notify_grants).
     Devolve os dicts de origem dos avisos processados (o que a rota expõe)."""
-    all_data = scraper()
+    scraped_grants = scraper()
     new_grants, created_records, updated_records = [], [], []
-    for g in all_data:
-        rec, was_new = _process_grant_safe(g, download_dir, source_label)
-        if rec:
-            new_grants.append(g)
-            (created_records if was_new else updated_records).append(rec)
+    for grant_dict in scraped_grants:
+        grant_record, was_new = _process_grant_safe(grant_dict, download_dir, source_label)
+        if grant_record:
+            new_grants.append(grant_dict)
+            (created_records if was_new else updated_records).append(grant_record)
     deactivate_expired_grants()
     if created_records or updated_records:
         notify_grants(created_records, updated_records)

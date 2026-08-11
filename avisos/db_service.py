@@ -103,48 +103,227 @@ def save_scraped_grant(grant_dict: dict, source: str) -> Grant | None:
     return grant
 
 
-@transaction.atomic
-def save_ai_grant(
-    dados_ia: dict,
-    scraping_url: str = "",
-    pdf_path: str = "",
-    markdown_path: str = "",
-    force_overwrite: bool = False,
-) -> Grant | None:
-    # Atómico: o delete+recreate das relações (fases, áreas, taxas…) nunca fica a meio —
-    # um erro faz rollback completo em vez de deixar o aviso sem filhos.
-    aviso_data = dados_ia.get("Grant", {})
-    grant_code = aviso_data.get("grant_code")
+def _find_or_build_grant(scraping_url: str, grant_code: str | None) -> Grant:
+    """O aviso a que esta extração pertence: procura pelo URL canónico, depois pelo código;
+    se não existir nenhum, constrói um novo (ainda por gravar).
 
+    Sem `scraping_url` o aviso fica com um URL sintético `unknown:<código>` — é a chave
+    natural do modelo e não pode ficar vazia.
+    """
     grant = None
     if scraping_url:
         grant = Grant.objects.filter(scraping_url=scraping_url).first()
     if grant is None and grant_code:
         grant = Grant.objects.filter(grant_code=grant_code).first()
     if grant is None:
-        grant = Grant(scraping_url=scraping_url or f"unknown:{grant_code}", source="")
+        return Grant(scraping_url=scraping_url or f"unknown:{grant_code}", source="")
 
     # Aponta o scraping_url para o canónico mais recente (ex: nova republicação/alteração).
     if scraping_url and grant.scraping_url != scraping_url:
         grant.scraping_url = scraping_url
+    return grant
 
+
+def _apply_ai_fields(grant: Grant, grant_fields: dict, force_overwrite: bool) -> None:
+    """Escreve no aviso os campos extraídos pela IA.
+
+    Três regras, por ordem de precedência:
+    - valor vazio na extração nunca apaga o que lá está;
+    - campo HTML autoritativo (_HTML_LOCKED_FIELDS): a IA só preenche o que o HTML deixou
+      vazio, e nunca sobrescreve — nem com force_overwrite;
+    - restantes: sobrescreve se `force_overwrite`, ou se o campo estiver vazio.
+    """
     for field in _GRANT_AI_FIELDS:
-        value = aviso_data.get(field)
+        value = grant_fields.get(field)
         if value in (None, [], ""):
             continue
         current_empty = getattr(grant, field, None) in (None, [], "")
         if field in _HTML_LOCKED_FIELDS:
-            # Campos HTML autoritativos: a IA só preenche como fallback quando o HTML
-            # não trouxe valor; nunca sobrescreve (mesmo com force_overwrite).
             if current_empty:
                 setattr(grant, field, value)
         elif force_overwrite or current_empty:
             setattr(grant, field, value)
 
+
+def _delete_children(grant: Grant) -> None:
+    """Apaga as relações-filhas antes de as recriar.
+
+    A ordem importa: `phases`/`covered_areas` são apagadas ANTES de `phase_areas`, para que a
+    cascata das FKs não deixe linhas órfãs a meio.
+    """
+    grant.beneficiaries_by_action.all().delete()
+    grant.phases.all().delete()
+    grant.covered_areas.all().delete()
+    grant.phase_areas.all().delete()
+    grant.financing_rates.all().delete()
+    grant.expense_limits.all().delete()
+    grant.non_compliance_penalties.all().delete()
+    grant.evaluation_methodologies.all().delete()
+
+
+def _create_phases_and_areas(grant: Grant, ai_extraction: dict) -> tuple[dict, dict]:
+    """Cria fases e áreas (uma a uma, para a BD gerar os ids) e devolve os mapas
+    código-de-junção → instância, que ligam os PhaseArea por FK REAL."""
+    phase_by_code: dict[str, Phase] = {}
+    for phase_data in ai_extraction.get("phases", []):
+        phase_record = Phase.objects.create(
+            grant=grant,
+            name=phase_data.get("name"),
+            start_date=phase_data.get("start_date"),
+            end_date=phase_data.get("end_date"),
+            access_condition=phase_data.get("access_condition"),
+        )
+        join_code = phase_data.get("phase_code")
+        if join_code:
+            phase_by_code[str(join_code)] = phase_record
+
+    area_by_code: dict[str, CoveredArea] = {}
+    for area_data in ai_extraction.get("CoveredArea", []):
+        area_record = CoveredArea.objects.create(
+            grant=grant,
+            geographic_area=area_data.get("geographic_area"),
+        )
+        join_code = area_data.get("area_code")
+        if join_code:
+            area_by_code[str(join_code)] = area_record
+    return phase_by_code, area_by_code
+
+
+def _create_children(grant: Grant, ai_extraction: dict) -> None:
+    """Recria todas as relações-filhas a partir do JSON da IA."""
+    BeneficiaryByAction.objects.bulk_create([
+        BeneficiaryByAction(
+            grant=grant,
+            action_type=beneficiary_data.get("action_type"),
+            entities=beneficiary_data.get("entities", []),
+        ) for beneficiary_data in ai_extraction.get("BeneficiaryByAction", [])
+    ])
+
+    phase_by_code, area_by_code = _create_phases_and_areas(grant, ai_extraction)
+
+    # phase/area ficam null quando o código não corresponde a nenhuma fase/área (ex: dotação
+    # por fundo/global, cujo codigo_fase é "FEDER"/"GLOBAL").
+    PhaseArea.objects.bulk_create([
+        PhaseArea(
+            grant=grant,
+            phase=phase_by_code.get(str(phase_area_data.get("phase_code"))),
+            area=area_by_code.get(str(phase_area_data.get("area_code"))),
+            fund_name=phase_area_data.get("fund_name"),
+            budget_allocation=phase_area_data.get("budget_allocation"),
+            max_financing_rate=phase_area_data.get("max_financing_rate"),
+            distribution=phase_area_data.get("distribution", []),
+        ) for phase_area_data in ai_extraction.get("PhaseArea", [])
+    ])
+
+    FinancingRate.objects.bulk_create([
+        FinancingRate(
+            grant=grant,
+            company_size=rate_data.get("company_size"),
+            aid_regime=rate_data.get("aid_regime"),
+            base_rate=rate_data.get("base_rate"),
+            regional_bonus=rate_data.get("regional_bonus"),
+            max_global_rate=rate_data.get("max_global_rate"),
+            minimis_accumulation_limit=rate_data.get("minimis_accumulation_limit"),
+            specific_condition=rate_data.get("specific_condition"),
+        ) for rate_data in ai_extraction.get("FinancingRate", [])
+    ])
+
+    ExpenseLimit.objects.bulk_create([
+        ExpenseLimit(
+            grant=grant,
+            expense_category=expense_limit_data.get("expense_category"),
+            applicable_ocs_methodology=expense_limit_data.get("applicable_ocs_methodology"),
+            max_absolute_value=expense_limit_data.get("max_absolute_value"),
+            max_percentage_value=expense_limit_data.get("max_percentage_value"),
+            calculation_base=expense_limit_data.get("calculation_base"),
+            specific_conditions=expense_limit_data.get("specific_conditions"),
+        ) for expense_limit_data in ai_extraction.get("ExpenseLimit", [])
+    ])
+
+    NonCompliancePenalty.objects.bulk_create([
+        NonCompliancePenalty(
+            grant=grant,
+            indicator_types=penalty_data.get("indicator_types"),
+            compliance_grade_formula=penalty_data.get("compliance_grade_formula"),
+            general_tolerance_threshold=penalty_data.get("general_tolerance_threshold"),
+            low_density_tolerance_threshold=penalty_data.get("low_density_tolerance_threshold"),
+            reduction_per_percentage_point=penalty_data.get("reduction_per_percentage_point"),
+            penalty_tiers=penalty_data.get("penalty_tiers", []),
+            max_penalty_percentage=penalty_data.get("max_penalty_percentage"),
+            financing_revocation_threshold=penalty_data.get("financing_revocation_threshold"),
+            rule_description=penalty_data.get("rule_description"),
+        ) for penalty_data in ai_extraction.get("NonCompliancePenalty", [])
+    ])
+
+    EvaluationMethodology.objects.bulk_create([
+        EvaluationMethodology(
+            grant=grant,
+            project_merit_formula=methodology_data.get("project_merit_formula"),
+            scoring_scale=methodology_data.get("scoring_scale"),
+            min_global_score=methodology_data.get("min_global_score"),
+            evaluation_criteria=methodology_data.get("evaluation_criteria", []),
+            tiebreaker_criteria=methodology_data.get("tiebreaker_criteria", []),
+        ) for methodology_data in ai_extraction.get("EvaluationMethodology", [])
+    ])
+
+
+def _log_ai_extraction(grant: Grant, ai_extraction: dict, markdown_path: str) -> None:
+    """Regista o que a IA gerou (auditável em logs/avisos.log): campos preenchidos vs vazios
+    e contagem das entidades relacionadas. O JSON completo fica em output/json/<fonte>.json."""
+    filled_fields = [phase_data for phase_data in _GRANT_AI_FIELDS if getattr(grant, phase_data, None) not in (None, [], "")]
+    empty_fields = [phase_data for phase_data in _GRANT_AI_FIELDS if phase_data not in filled_fields]
+    logger.info(
+        "IA GEROU aviso %s (id=%s, url=%s): %d/%d campos preenchidos | vazios: %s | "
+        "fases=%d áreas=%d dotações=%d taxas=%d limites=%d penalizações=%d metodologias=%d "
+        "beneficiários=%d | markdown=%s",
+        grant.grant_code or "?", grant.pk, grant.scraping_url,
+        len(filled_fields), len(_GRANT_AI_FIELDS), ", ".join(empty_fields) or "nenhum",
+        len(ai_extraction.get("phases", [])), len(ai_extraction.get("CoveredArea", [])),
+        len(ai_extraction.get("PhaseArea", [])), len(ai_extraction.get("FinancingRate", [])),
+        len(ai_extraction.get("ExpenseLimit", [])), len(ai_extraction.get("NonCompliancePenalty", [])),
+        len(ai_extraction.get("EvaluationMethodology", [])),
+        len(ai_extraction.get("BeneficiaryByAction", [])),
+        markdown_path or grant.markdown_path,
+    )
+
+
+def _save_embeddings(grant: Grant) -> None:
+    """Pré-calcula os embeddings do aviso (um por tipo: GENERAL, SECTOR…), para o match
+    semântico ficar SEMPRE pronto — o match só lê, nunca gera. Só chama a OpenAI para os
+    tipos cujo texto mudou. Best-effort: sem OPENAI_API_KEY ou em falha, fica por gerar
+    (o match cai para taxa+dotação) e a gravação do aviso segue na mesma."""
+    # Import diferido: match.grant_embeddings importa avisos.models (evita import circular).
+    try:
+        from match.grant_embeddings import save_grant_embeddings
+        save_grant_embeddings(grant)
+    except Exception:
+        logger.exception("Falha ao gerar os embeddings do aviso %s (segue sem semântica).",
+                         grant.grant_code or grant.pk)
+
+
+@transaction.atomic
+def save_ai_grant(
+    ai_extraction: dict,
+    scraping_url: str = "",
+    pdf_path: str = "",
+    markdown_path: str = "",
+    force_overwrite: bool = False,
+) -> Grant | None:
+    """Grava no aviso o resultado da extração da IA: campos + relações-filhas (substituídas
+    por completo) + embeddings.
+
+    Atómico: o delete+recreate das relações (fases, áreas, taxas…) nunca fica a meio — um
+    erro faz rollback completo em vez de deixar o aviso sem filhos.
+    """
+    grant_fields = ai_extraction.get("Grant", {})
+    grant = _find_or_build_grant(scraping_url, grant_fields.get("grant_code"))
+
+    _apply_ai_fields(grant, grant_fields, force_overwrite)
+
     # annex_documents é uma chave de TOPO do JSON (não vem dentro de "Grant"), por isso não
-    # entra no loop _GRANT_AI_FIELDS acima — tratamo-la aqui. Vem fresca do scrape a cada
-    # processamento, logo atualiza-se quando presente.
-    annexes = dados_ia.get("annex_documents")
+    # entra em _apply_ai_fields. Vem fresca do scrape a cada processamento, logo atualiza-se
+    # sempre que presente.
+    annexes = ai_extraction.get("annex_documents")
     if annexes is not None:
         grant.annex_documents = annexes or []
 
@@ -158,142 +337,9 @@ def save_ai_grant(
     grant.last_updated_by = None
     grant.save()
 
-    grant.beneficiaries_by_action.all().delete()
-    grant.phases.all().delete()
-    grant.covered_areas.all().delete()
-    grant.phase_areas.all().delete()
-    grant.financing_rates.all().delete()
-    grant.expense_limits.all().delete()
-    grant.non_compliance_penalties.all().delete()
-    grant.evaluation_methodologies.all().delete()
-
-    BeneficiaryByAction.objects.bulk_create([
-        BeneficiaryByAction(
-            grant=grant,
-            action_type=b.get("action_type"),
-            entities=b.get("entities", []),
-        ) for b in dados_ia.get("BeneficiaryByAction", [])
-    ])
-
-    # Fases e áreas: cria os registos (a BD gera os ids) e mapeia o código de junção do
-    # JSON (codigo_fase/codigo_area) → instância, para ligar o PhaseArea por FK REAL.
-    phase_by_code: dict[str, Phase] = {}
-    for f in dados_ia.get("phases", []):
-        ph = Phase.objects.create(
-            grant=grant,
-            name=f.get("name"),
-            start_date=f.get("start_date"),
-            end_date=f.get("end_date"),
-            access_condition=f.get("access_condition"),
-        )
-        code = f.get("phase_code")
-        if code:
-            phase_by_code[str(code)] = ph
-
-    area_by_code: dict[str, CoveredArea] = {}
-    for a in dados_ia.get("CoveredArea", []):
-        ar = CoveredArea.objects.create(
-            grant=grant,
-            geographic_area=a.get("geographic_area"),
-        )
-        code = a.get("area_code")
-        if code:
-            area_by_code[str(code)] = ar
-
-    # PhaseArea liga-se a Phase/CoveredArea por FK (via os códigos de junção). phase/area
-    # ficam null quando o código não corresponde a nenhuma fase/área (ex: dotação por
-    # fundo/global, cujo codigo_fase é "FEDER"/"GLOBAL").
-    PhaseArea.objects.bulk_create([
-        PhaseArea(
-            grant=grant,
-            phase=phase_by_code.get(str(fa.get("phase_code"))),
-            area=area_by_code.get(str(fa.get("area_code"))),
-            fund_name=fa.get("fund_name"),
-            budget_allocation=fa.get("budget_allocation"),
-            max_financing_rate=fa.get("max_financing_rate"),
-            distribution=fa.get("distribution", []),
-        ) for fa in dados_ia.get("PhaseArea", [])
-    ])
-
-    FinancingRate.objects.bulk_create([
-        FinancingRate(
-            grant=grant,
-            company_size=t.get("company_size"),
-            aid_regime=t.get("aid_regime"),
-            base_rate=t.get("base_rate"),
-            regional_bonus=t.get("regional_bonus"),
-            max_global_rate=t.get("max_global_rate"),
-            minimis_accumulation_limit=t.get("minimis_accumulation_limit"),
-            specific_condition=t.get("specific_condition"),
-        ) for t in dados_ia.get("FinancingRate", [])
-    ])
-
-    ExpenseLimit.objects.bulk_create([
-        ExpenseLimit(
-            grant=grant,
-            expense_category=lim.get("expense_category"),
-            applicable_ocs_methodology=lim.get("applicable_ocs_methodology"),
-            max_absolute_value=lim.get("max_absolute_value"),
-            max_percentage_value=lim.get("max_percentage_value"),
-            calculation_base=lim.get("calculation_base"),
-            specific_conditions=lim.get("specific_conditions"),
-        ) for lim in dados_ia.get("ExpenseLimit", [])
-    ])
-
-    NonCompliancePenalty.objects.bulk_create([
-        NonCompliancePenalty(
-            grant=grant,
-            indicator_types=p.get("indicator_types"),
-            compliance_grade_formula=p.get("compliance_grade_formula"),
-            general_tolerance_threshold=p.get("general_tolerance_threshold"),
-            low_density_tolerance_threshold=p.get("low_density_tolerance_threshold"),
-            reduction_per_percentage_point=p.get("reduction_per_percentage_point"),
-            penalty_tiers=p.get("penalty_tiers", []),
-            max_penalty_percentage=p.get("max_penalty_percentage"),
-            financing_revocation_threshold=p.get("financing_revocation_threshold"),
-            rule_description=p.get("rule_description"),
-        ) for p in dados_ia.get("NonCompliancePenalty", [])
-    ])
-
-    EvaluationMethodology.objects.bulk_create([
-        EvaluationMethodology(
-            grant=grant,
-            project_merit_formula=m.get("project_merit_formula"),
-            scoring_scale=m.get("scoring_scale"),
-            min_global_score=m.get("min_global_score"),
-            evaluation_criteria=m.get("evaluation_criteria", []),
-            tiebreaker_criteria=m.get("tiebreaker_criteria", []),
-        ) for m in dados_ia.get("EvaluationMethodology", [])
-    ])
-
-    # Registo do que a IA gerou (auditável em logs/avisos.log): campos preenchidos vs vazios
-    # e contagem das entidades relacionadas. O JSON completo fica em output/json/<fonte>.json.
-    filled = [f for f in _GRANT_AI_FIELDS if getattr(grant, f, None) not in (None, [], "")]
-    empty = [f for f in _GRANT_AI_FIELDS if f not in filled]
-    logger.info(
-        "IA GEROU aviso %s (id=%s, url=%s): %d/%d campos preenchidos | vazios: %s | "
-        "fases=%d áreas=%d dotações=%d taxas=%d limites=%d penalizações=%d metodologias=%d "
-        "beneficiários=%d | markdown=%s",
-        grant.grant_code or "?", grant.pk, grant.scraping_url,
-        len(filled), len(_GRANT_AI_FIELDS), ", ".join(empty) or "nenhum",
-        len(dados_ia.get("phases", [])), len(dados_ia.get("CoveredArea", [])),
-        len(dados_ia.get("PhaseArea", [])), len(dados_ia.get("FinancingRate", [])),
-        len(dados_ia.get("ExpenseLimit", [])), len(dados_ia.get("NonCompliancePenalty", [])),
-        len(dados_ia.get("EvaluationMethodology", [])),
-        len(dados_ia.get("BeneficiaryByAction", [])),
-        markdown_path or grant.markdown_path,
-    )
-
-    # Pré-calcula os embeddings do aviso (um por tipo: GENERAL, SECTOR…), para o match
-    # semântico ficar SEMPRE pronto — o match só lê, nunca gera. Só chama a OpenAI para os
-    # tipos cujo texto mudou. Best-effort: sem OPENAI_API_KEY ou em falha, fica por gerar
-    # (o match cai para taxa+dotação) e a gravação do aviso segue na mesma.
-    # Import diferido: match.grant_embeddings importa avisos.models (evita import circular).
-    try:
-        from match.grant_embeddings import save_grant_embeddings
-        save_grant_embeddings(grant)
-    except Exception:
-        logger.exception("Falha ao gerar os embeddings do aviso %s (segue sem semântica).",
-                         grant.grant_code or grant.pk)
+    _delete_children(grant)
+    _create_children(grant, ai_extraction)
+    _log_ai_extraction(grant, ai_extraction, markdown_path)
+    _save_embeddings(grant)
 
     return grant

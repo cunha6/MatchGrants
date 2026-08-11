@@ -1,54 +1,20 @@
-"""Chamadas à API do OpenAI."""
+"""Chamadas à API do OpenAI específicas do pipeline de avisos (chunks + routing).
+
+create_client/call_openai_text (genéricos, sem chunks) vivem em common/openai_client.py.
+"""
 
 import json
 import logging
-import os
 import time
 
-from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 from .prompts import ROUTER_SYSTEM, build_messages_from_chunks
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # Modelos que não aceitam o parâmetro temperature
 _MODELS_SEM_TEMP = ("o1", "o3", "o4", "gpt-5")
-
-
-def create_client() -> AsyncOpenAI:
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key or api_key.startswith("sk-..."):
-        raise RuntimeError("OPENAI_API_KEY não está definida no ficheiro .env")
-    return AsyncOpenAI(api_key=api_key)
-
-
-async def call_openai_text(
-    client: AsyncOpenAI,
-    system_prompt: str,
-    user_content: str,
-    label: str,
-    model: str,
-    max_tokens: int = 16_384,
-) -> str:
-    """Envia um prompt de texto livre e devolve a resposta em texto (não-JSON)."""
-    t = time.time()
-    logger.info(f"  [{label}] → {model}")
-    kwargs: dict = dict(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        max_completion_tokens=max_tokens,
-    )
-    if not any(model.startswith(p) for p in _MODELS_SEM_TEMP):
-        kwargs["temperature"] = 0
-    response = await client.chat.completions.create(**kwargs)
-    logger.info(f"  [{label}] OK ({time.time()-t:.1f}s)")
-    return response.choices[0].message.content or ""
 
 
 async def call_openai(
@@ -61,7 +27,7 @@ async def call_openai(
     extra_user: str = "",
 ) -> dict:
     """Envia chunks para o OpenAI e devolve o JSON parseado."""
-    t = time.time()
+    started_at = time.time()
     logger.info(f"  [{label}] {len(chunks)} secções → {model}")
 
     messages = build_messages_from_chunks(system_prompt, chunks)
@@ -74,7 +40,7 @@ async def call_openai(
         response_format={"type": "json_object"},
         max_completion_tokens=max_tokens,
     )
-    if not any(model.startswith(p) for p in _MODELS_SEM_TEMP):
+    if not any(model.startswith(model_prefix) for model_prefix in _MODELS_SEM_TEMP):
         kwargs["temperature"] = 0
 
     response = await client.chat.completions.create(**kwargs)
@@ -84,7 +50,7 @@ async def call_openai(
     logger.info(
         f"  [{label}] OK  "
         f"in={usage.prompt_tokens} out={usage.completion_tokens} tokens  "
-        f"({time.time()-t:.1f}s){truncated}"
+        f"({time.time()-started_at:.1f}s){truncated}"
     )
 
     raw = response.choices[0].message.content or "{}"
@@ -108,10 +74,10 @@ async def classify_ambiguous_chunks(
         return {}
 
     parts = [
-        f"CHUNK_ID: {c.get('chunk_index', id(c))}\n"
-        f"HEADER: {c.get('title', '')[:80]}\n"
-        f"TEXT: {c.get('text', '')[:200]}\n---"
-        for c in chunks
+        f"CHUNK_ID: {chunk.get('chunk_index', id(chunk))}\n"
+        f"HEADER: {chunk.get('title', '')[:80]}\n"
+        f"TEXT: {chunk.get('text', '')[:200]}\n---"
+        for chunk in chunks
     ]
 
     try:

@@ -111,15 +111,15 @@ def _parse_decimal(value) -> Decimal | None:
             return Decimal(str(value))
         except InvalidOperation:
             return None
-    s = re.sub(r"[^\d,.\-]", "", str(value).replace("\xa0", " "))
-    if not s:
+    cleaned_number = re.sub(r"[^\d,.\-]", "", str(value).replace("\xa0", " "))
+    if not cleaned_number:
         return None
-    if "," in s and "." in s:       # '1.234.567,89' → '.' milhares, ',' decimal
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:                  # '990000,50' → ',' decimal
-        s = s.replace(",", ".")
+    if "," in cleaned_number and "." in cleaned_number:       # '1.234.567,89' → '.' milhares, ',' decimal
+        cleaned_number = cleaned_number.replace(".", "").replace(",", ".")
+    elif "," in cleaned_number:                  # '990000,50' → ',' decimal
+        cleaned_number = cleaned_number.replace(",", ".")
     try:
-        return Decimal(s)
+        return Decimal(cleaned_number)
     except InvalidOperation:
         return None
 
@@ -142,12 +142,12 @@ def _find_xlsx_url() -> str:
     """Descobre o URL do Excel: percorre todos os `<a>` da página e devolve o 1.º href que
     termina em '.xlsx' (resolvido para absoluto). Sem URL fixa."""
     try:
-        resp = requests.get(PLAN_URL, headers=_HEADERS, timeout=_TIMEOUT)
-        resp.raise_for_status()
+        http_response = requests.get(PLAN_URL, headers=_HEADERS, timeout=_TIMEOUT)
+        http_response.raise_for_status()
     except requests.RequestException as exc:
         raise PlannedGrantsSyncError(f"Falha ao aceder ao plano anual: {exc}") from exc
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(http_response.text, "html.parser")
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"].strip()
         if href.lower().endswith(".xlsx"):
@@ -159,11 +159,11 @@ def _download_workbook():
     """Descarrega o Excel para memória e devolve o workbook (só-leitura, valores calculados)."""
     url = _find_xlsx_url()
     try:
-        resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
-        resp.raise_for_status()
+        http_response = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
+        http_response.raise_for_status()
     except requests.RequestException as exc:
         raise PlannedGrantsSyncError(f"Falha ao descarregar o Excel do plano anual: {exc}") from exc
-    return load_workbook(io.BytesIO(resp.content), read_only=True, data_only=True)
+    return load_workbook(io.BytesIO(http_response.content), read_only=True, data_only=True)
 
 
 # --- Sincronização -------------------------------------------------------

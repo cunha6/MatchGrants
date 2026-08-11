@@ -16,7 +16,7 @@ from .chunker import chunk_by_markdown, _parse_markdown_sections, map_category, 
 
 def coverage_report(markdown: str, source: str = "doc") -> dict:
     """Relatório de cobertura de um markdown: secções totais, descartadas e por categoria."""
-    sections = [(k, t) for k, t in _parse_markdown_sections(markdown) if len(t) >= 30]
+    sections = [(section_title, section_text) for section_title, section_text in _parse_markdown_sections(markdown) if len(section_text) >= 30]
     chunks = chunk_by_markdown(markdown, source, source)
 
     dropped: list[str] = []
@@ -26,10 +26,10 @@ def coverage_report(markdown: str, source: str = "doc") -> dict:
 
     total = len(sections)
     covered = total - len(dropped)
-    by_cat = Counter(c["category"] for c in chunks)
+    by_cat = Counter(chunk["category"] for chunk in chunks)
     prompts_hit = sorted({
-        p for c in chunks
-        for p in CATEGORIA_PARA_PROMPTS.get(c["category"], "").split(",") if p
+        prompt_name for chunk in chunks
+        for prompt_name in CATEGORIA_PARA_PROMPTS.get(chunk["category"], "").split(",") if prompt_name
     })
 
     return {
@@ -56,7 +56,7 @@ def _print(report: dict) -> None:
 
 def _main(argv: list[str]) -> None:
     if argv:
-        paths = [Path(a) for a in argv]
+        paths = [Path(argument_path) for argument_path in argv]
     else:
         paths = sorted(Path("output/markdown").rglob("*.md"))
 
@@ -65,9 +65,9 @@ def _main(argv: list[str]) -> None:
         return
 
     pcts = []
-    for p in paths:
-        md = p.read_text(encoding="utf-8")
-        report = coverage_report(md, p.stem)
+    for prompt_name in paths:
+        md = prompt_name.read_text(encoding="utf-8")
+        report = coverage_report(md, prompt_name.stem)
         _print(report)
         pcts.append(report["coverage_pct"])
 

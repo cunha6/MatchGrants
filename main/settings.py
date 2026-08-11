@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,17 +10,36 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Configuração por ambiente (produção define estas no .env; os defaults mantêm o dev igual).
 # Em produção: DJANGO_SECRET_KEY=<aleatória>, DJANGO_DEBUG=false, DJANGO_ALLOWED_HOSTS=dominio.pt
-SECRET_KEY = os.getenv(
-    'DJANGO_SECRET_KEY',
-    'django-insecure-h6dqv)z6y#ekqe5$_ug+r^c8m#s09%xehaxcfo3ux6!h@p-cvw',  # só para dev
-)
-
 DEBUG = os.getenv('DJANGO_DEBUG', 'true').lower() in ('true', '1', 'yes')
 
+# SECRET_KEY assina as sessões E os tokens de reset de password (ver
+# users.service.request_password_reset -> default_token_generator). A chave abaixo está no
+# repositório: quem a conhece forja um token de reset para QUALQUER conta e toma-a. Por isso
+# em produção (DEBUG=false) a variável é obrigatória — a app recusa arrancar sem ela em vez de
+# degradar em silêncio para uma chave pública.
+_DEV_SECRET_KEY = 'django-insecure-h6dqv)z6y#ekqe5$_ug+r^c8m#s09%xehaxcfo3ux6!h@p-cvw'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY') or _DEV_SECRET_KEY
+
+# Validação do header Host. Em dev fica o wildcard (o container é acedido por localhost, pelo
+# IP da máquina ou pelo nome do serviço, conforme o sítio de onde se chama); em produção tem
+# de ser explícito, senão o wildcard abriria a porta a Host-header/cache poisoning.
 ALLOWED_HOSTS = [
-    h.strip() for h in os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    h.strip() for h in os.getenv('DJANGO_ALLOWED_HOSTS', '*' if DEBUG else '').split(',')
     if h.strip()
 ]
+
+if not DEBUG:
+    if SECRET_KEY == _DEV_SECRET_KEY:
+        raise ImproperlyConfigured(
+            "DJANGO_SECRET_KEY tem de estar definida quando DEBUG=false — a chave de "
+            "desenvolvimento está no repositório e permitiria forjar tokens de reset de "
+            "password de qualquer conta."
+        )
+    if not ALLOWED_HOSTS:
+        raise ImproperlyConfigured(
+            "DJANGO_ALLOWED_HOSTS tem de estar definida quando DEBUG=false "
+            "(ex: DJANGO_ALLOWED_HOSTS=matchgrants.pt,www.matchgrants.pt)."
+        )
 
 # Endurecimento automático quando DEBUG=false (produção atrás de HTTPS).
 if not DEBUG:
@@ -60,7 +81,16 @@ NIF_KEYS = [
 ]
 BASE_KEY = os.getenv('BASE_KEY')
 CTT_KEY = os.getenv('CTT_KEY')
+# Chaves do OpenRouter (validação LLM dos matches): são estas DUAS e mais nenhuma. A validação
+# roda entre elas a cada chamada, para não esgotar o limite gratuito de uma só. Uma chave em
+# falta no .env é simplesmente descartada — com uma só configurada, não há rotação.
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+OPENROUTER_API_KEYS = [
+    k for k in (
+        os.getenv('OPENROUTER_API_KEY'),
+        os.getenv('OPENROUTER_API_KEY1'),
+    ) if k
+]
 
 # --- Email (Brevo — SMTP relay, evita os bloqueios de basic auth do Microsoft 365) ---
 # Em dev (DEBUG) o backend por defeito é a consola: os emails são impressos no log em vez
@@ -71,7 +101,9 @@ EMAIL_BACKEND = os.getenv(
     else 'django.core.mail.backends.smtp.EmailBackend',
 )
 EMAIL_HOST = os.getenv('EMAIL_HOST', '')
-EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+# `or 587` (em vez de um default no getenv): uma linha `EMAIL_PORT=` vazia no .env devolve ""
+# — e não o default —, e int("") rebentava o arranque da app.
+EMAIL_PORT = int(os.getenv('EMAIL_PORT') or 587)
 # BREVO_SMTP_LOGIN/KEY são as credenciais da SMTP key do Brevo (Settings -> SMTP & API no
 # painel Brevo) — não são a password da conta. EMAIL_HOST_USER/PASSWORD ficam como fallback
 # genérico, para o caso de se voltar a trocar de fornecedor SMTP no futuro.
@@ -136,13 +168,26 @@ DATABASES = {
 # Encaminha o modelo match.NifCompany para a BD 'nif'; tudo o resto vai para 'default'.
 DATABASE_ROUTERS = ['match.routers.NifRouter']
 
+# Cache PARTILHADO entre processos (tabela no Postgres). O default do Django é o LocMemCache,
+# que vive dentro de cada worker: com os 2 workers do gunicorn (ver Dockerfile), o throttle do
+# pedido de reset de password (users.views) permitiria o dobro dos emails, e o match retido à
+# espera do contacto (match.services) só seria encontrado se o 2º pedido calhasse no mesmo
+# worker. Ambos precisam de um estado único — daí a BD, que já existe (evita mais um serviço).
+# A tabela é criada por `python manage.py createcachetable` (já no arranque do docker-compose).
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'django_cache',
+    },
+}
+
 # Logging para a consola (docker logs): erros das apps ficam registados com stack trace
 # em vez de se perderem — os handlers de exceção das views devolvem mensagens limpas.
 # Os logs de 'avisos' (o que a IA gerou + auditoria de quem editou o quê) e de 'anuncios'
 # (import + auditoria de edições) vão TAMBÉM para logs/*.log — a pasta está no volume do
 # compose, por isso persiste no host.
 LOGS_DIR = BASE_DIR / 'logs'
-LOGS_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGGING = {
     'version': 1,

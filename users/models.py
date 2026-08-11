@@ -90,5 +90,12 @@ class UserProfile(models.Model):
     # --- Contacto (preenchido pelo pop-up do match sem login, não vem do nif.pt) ---
     job_title = models.CharField(max_length=150, blank=True, null=True)   # função na empresa
 
+    # --- Resultado do último match (só client, ver match/views.py:evaluate_nif) ---
+    # 'avisos.Grant' em string: referência preguiçosa, evita import direto (avisos->users
+    # já existe; users->avisos não existia antes disto).
+    matched_grants = models.ManyToManyField(
+        "avisos.Grant", blank=True, related_name="matched_by_profiles",
+    )
+
     def __str__(self):
         return f"{self.user.username} ({self.role})"

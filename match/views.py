@@ -8,10 +8,10 @@ from django.views.decorators.http import require_http_methods
 
 from common.session_access import allow_grants
 from users.models import UserProfile
-from users.permissions import require_role
+from users.permissions import get_role, require_role
+from .leads import promote_viewer_to_client
 from .services import (
     NifMatchingService, NifValidationError, NifServiceError, MissingClientDataError,
-    promote_viewer_to_client,
 )
 
 
@@ -67,11 +67,18 @@ def evaluate_nif(request):
         "name": data.get("name"),
         "job_title": data.get("job_title"),
     }
+    # O match retido à espera do contacto é guardado em cache por SESSÃO (ver
+    # NifMatchingService._contact_cache_key) — sem uma chave de sessão, dois visitantes a
+    # avaliar o mesmo NIF partilhavam a entrada. `create()` garante que já existe uma antes
+    # de o cache ser escrito (numa 1ª visita a sessão ainda não foi gravada).
+    if not request.session.session_key:
+        request.session.create()
     try:
         result = NifMatchingService().evaluate(
             nif, overrides=overrides, contact=contact,
             # Só quem NÃO está autenticado gera um viewer (lead) e passa pelo gate de contacto.
             create_viewer=not request.user.is_authenticated,
+            cache_scope=request.session.session_key,
         )
     except NifValidationError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
@@ -88,6 +95,15 @@ def evaluate_nif(request):
         # common/session_access.py e avisos/views.grants_detail) — impede ver outros avisos
         # trocando o id na URL.
         allow_grants(request, (m.get("opportunity_id") for m in result.get("matches", [])))
+    elif get_role(request.user) == UserProfile.CLIENT:
+        # Um client autenticado a consultar o PRÓPRIO NIF: guarda o resultado no perfil para
+        # aparecer nos detalhes da conta (ver users/service.py:_serialize). Compara com o NIF
+        # do perfil — um client a testar um NIF alheio não deve "herdar" avisos no perfil.
+        profile = getattr(request.user, "profile", None)
+        if profile is not None and profile.nif == result.get("nif"):
+            profile.matched_grants.set(
+                m["opportunity_id"] for m in result.get("matches", [])
+            )
 
     return JsonResponse(result, json_dumps_params={"ensure_ascii": False, "indent": 2})
 

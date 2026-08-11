@@ -53,7 +53,7 @@ embed = generate_embedding
 def embed_many(texts: list[str]) -> list[list[float] | None]:
     """Embeddings de vários textos numa ÚNICA chamada à API (evita chamadas repetidas).
     Entradas vazias → None na posição respetiva; a ordem do resultado espelha a entrada."""
-    idx = [i for i, t in enumerate(texts) if (t or "").strip()]
+    idx = [i for i, text_input in enumerate(texts) if (text_input or "").strip()]
     out: list[list[float] | None] = [None] * len(texts)
     if not idx:
         return out

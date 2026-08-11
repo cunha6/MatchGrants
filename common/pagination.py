@@ -40,7 +40,7 @@ def paginate_queryset(queryset, page: int, page_size: int, serialize, items_key:
         "page": page_obj.number,
         "page_size": page_size,
         "num_pages": paginator.num_pages,
-        items_key: [serialize(item) for item in page_obj],
+        items_key: [serialize(page_item) for page_item in page_obj],
     }
 
 

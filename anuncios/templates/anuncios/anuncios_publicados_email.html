@@ -1,10 +1,11 @@
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 {% comment %}
-Design copiado à mão de emails/anunciosPublicados.tsx (via emails/html/anunciosPublicados_email.html) —
-este template é o único dos anúncios que é genuinamente dinâmico por envio (lista real de
-anúncios criados/atualizados), por isso usa o motor de templates do Django ({% for %}) em vez
-do pipeline React Email/render_emails (esse só sabe gerar HTML estático, sem props reais).
-Se o design do .tsx mudar, replica a mudança aqui à mão — não há regeneração automática.
+Design copiado à mão de emails/anunciosPublicados.tsx — este template é genuinamente dinâmico
+por envio (lista real de anúncios criados/atualizados), por isso usa o motor de templates do
+Django ({% for %}) em vez do pipeline React Email/render_emails (esse só sabe gerar HTML
+estático, sem props reais). Se o design do .tsx mudar, replica a mudança aqui à mão — não há
+regeneração automática. Para ver o .tsx renderizado, corre
+`python manage.py render_emails anunciosPublicados`.
 {% endcomment %}
 <html dir="ltr" lang="pt">
   <head>
@@ -27,8 +28,8 @@ Se o design do .tsx mudar, replica a mudança aqui à mão — não há regenera
                          style="display:block;outline:none;border:none;text-decoration:none" />
                     <h1 style="font-family:'Gellix',Arial,sans-serif;font-size:36px;line-height:1.15;letter-spacing:-1px;font-weight:700;color:#0312c2;margin:28px 0 16px">
                       {% if new_notices and updated_notices %}Anúncios novos e atualizados
-                      {% elif new_notices %}{{ new_notices|length|yesno:",Novo anúncio publicado,Novos anúncios publicados" }}
-                      {% else %}{{ updated_notices|length|yesno:",Anúncio atualizado,Anúncios atualizados" }}
+                      {% elif new_notices %}{% if new_notices|length == 1 %}Novo anúncio publicado{% else %}Novos anúncios publicados{% endif %}
+                      {% else %}{% if updated_notices|length == 1 %}Anúncio atualizado{% else %}Anúncios atualizados{% endif %}
                       {% endif %}
                     </h1>
                     <p style="font-family:'Gellix',Arial,sans-serif;font-size:16px;line-height:1.6;color:rgba(3,18,194,0.85);margin:0">

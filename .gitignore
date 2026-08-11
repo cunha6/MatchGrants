@@ -1,3 +1,7 @@
+# Bytecode compilado — é regenerado a cada arranque, nunca se versiona
+__pycache__/
+*.py[cod]
+
 # IDEs
 .vscode/
 .idea/
@@ -25,6 +29,9 @@ logs/
 # Artefactos de cobertura de testes
 .coverage
 htmlcov/
+
+# Cache do linter
+.ruff_cache/
 
 # Ambiente virtual
 venv/

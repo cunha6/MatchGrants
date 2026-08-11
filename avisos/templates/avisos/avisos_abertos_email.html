@@ -1,10 +1,10 @@
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 {% comment %}
-Design copiado à mão de emails/avisosAbertos.tsx (via emails/html/avisosAbertos_email.html) —
-este template é o único dos quatro que é genuinamente dinâmico por envio (lista real de
-avisos criados/atualizados), por isso usa o motor de templates do Django ({% for %}) em vez
-do pipeline React Email/render_emails (esse só sabe gerar HTML estático, sem props reais).
-Se o design do .tsx mudar, replica a mudança aqui à mão — não há regeneração automática.
+Design copiado à mão de emails/avisosAbertos.tsx — este template é genuinamente dinâmico por
+envio (lista real de avisos criados/atualizados), por isso usa o motor de templates do Django
+({% for %}) em vez do pipeline React Email/render_emails (esse só sabe gerar HTML estático,
+sem props reais). Se o design do .tsx mudar, replica a mudança aqui à mão — não há regeneração
+automática. Para ver o .tsx renderizado, corre `python manage.py render_emails avisosAbertos`.
 {% endcomment %}
 <html dir="ltr" lang="pt">
   <head>
@@ -27,8 +27,8 @@ Se o design do .tsx mudar, replica a mudança aqui à mão — não há regenera
                          style="display:block;outline:none;border:none;text-decoration:none" />
                     <h1 style="font-family:'Gellix',Arial,sans-serif;font-size:36px;line-height:1.15;letter-spacing:-1px;font-weight:700;color:#0312c2;margin:28px 0 16px">
                       {% if new_grants and updated_grants %}Avisos novos e atualizados
-                      {% elif new_grants %}{{ new_grants|length|yesno:",Novo aviso aberto,Novos avisos abertos" }}
-                      {% else %}{{ updated_grants|length|yesno:",Aviso atualizado,Avisos atualizados" }}
+                      {% elif new_grants %}{% if new_grants|length == 1 %}Novo aviso aberto{% else %}Novos avisos abertos{% endif %}
+                      {% else %}{% if updated_grants|length == 1 %}Aviso atualizado{% else %}Avisos atualizados{% endif %}
                       {% endif %}
                     </h1>
                     <p style="font-family:'Gellix',Arial,sans-serif;font-size:16px;line-height:1.6;color:rgba(3,18,194,0.85);margin:0">

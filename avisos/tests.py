@@ -15,6 +15,11 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
+from selenium.common.exceptions import (
+    StaleElementReferenceException, TimeoutException,
+    UnexpectedAlertPresentException,
+)
+
 from django.contrib.auth.models import User
 from django.test import SimpleTestCase, TestCase, override_settings
 
@@ -24,7 +29,7 @@ from common.text import normalize
 from users.models import UserProfile
 
 from .db_service import _parse_allocation
-from .Docling.converter import text_is_invitation
+from common.docling.converter import text_is_invitation
 from .documents import (
     AMENDMENT, ANNEX, BASE, OTHER, PRORROGATION, RECTIFICATION, REPUBLICATION,
     amendment_ordinal, classify_document, is_consolidated_markdown,
@@ -516,8 +521,8 @@ class GrantCollectionEditTests(TestCase):
         self.client.force_login(self.commercial)
         self._edit({"phase_areas": [{"fund_name": "FEDER", "max_financing_rate": 85.0}]})
         self.grant.refresh_from_db()
-        from avisos.views import _financing_rate
-        self.assertEqual(_financing_rate(self.grant), 85.0)  # PhaseArea manda sobre FinancingRate
+        from avisos.serializers import financing_rate
+        self.assertEqual(financing_rate(self.grant), 85.0)  # PhaseArea manda sobre FinancingRate
 
     def test_phase_id_not_belonging_returns_400(self):
         from .models import Grant as G, Phase
@@ -1122,6 +1127,23 @@ class GrantDocumentServeTests(TestCase):
             body = self.client.get(f"/avisos/{g.pk}/").json()
         self.assertIsNone(body["document_url"])
 
+    def test_serve_requires_prior_match_without_login(self):
+        # O PDF segue a MESMA política do detalhe: sem sessão nem match prévio, não é servido
+        # — senão o documento continuava enumerável por id, contornando o gate do detalhe.
+        self.client.logout()
+        with override_settings(BASE_DIR=self.tmp):
+            resp = self.client.get(f"/avisos/{self.grant.pk}/document/")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_serve_allowed_after_match_grants_it(self):
+        self.client.logout()
+        session = self.client.session
+        session[SESSION_KEY] = [self.grant.pk]
+        session.save()
+        with override_settings(BASE_DIR=self.tmp):
+            resp = self.client.get(f"/avisos/{self.grant.pk}/document/")
+        self.assertEqual(resp.status_code, 200)
+
 
 class ScrapeNotifiesCommercialsTests(TestCase):
     """Cobertura em falta: só havia testes de parsing de HTML isolados, nunca do pipeline
@@ -1193,3 +1215,93 @@ class ScrapeNotifiesCommercialsTests(TestCase):
         # As duas secções do template aparecem, uma para cada lista.
         self.assertIn("Novos avisos", html)
         self.assertIn("Avisos atualizados", html)
+
+
+class AvisosEmailHeadlineTests(TestCase):
+    """O título do email era construído com `yesno` sobre um |length, que devolve sempre o
+    1º argumento para qualquer lista não vazia — ou seja, o <h1> saía VAZIO em todos os
+    envios de uma só lista (ex: qualquer edição manual, que envia notify_grants([], [g]))."""
+
+    def setUp(self):
+        self.commercial = User.objects.create_user("com_head", email="com_head@x.pt")
+        self.commercial.profile.role = UserProfile.COMMERCIAL_GRANTS
+        self.commercial.profile.save()
+
+    def _html(self, new_count, updated_count):
+        from django.core import mail
+        from .notifications import notify_grants
+        mail.outbox = []
+        grants = [
+            Grant.objects.create(source="portugal", scraping_url=f"https://x/h{i}/",
+                                 grant_code=f"H{i}", title=f"Aviso {i}", ai_processed=True)
+            for i in range(new_count + updated_count)
+        ]
+        notify_grants(grants[:new_count], grants[new_count:])
+        return mail.outbox[0].alternatives[0][0]
+
+    def test_headline_singular_new(self):
+        self.assertIn("Novo aviso aberto", self._html(1, 0))
+
+    def test_headline_plural_new(self):
+        self.assertIn("Novos avisos abertos", self._html(2, 0))
+
+    def test_headline_singular_updated(self):
+        self.assertIn("Aviso atualizado", self._html(0, 1))
+
+    def test_headline_plural_updated(self):
+        self.assertIn("Avisos atualizados", self._html(0, 2))
+
+    def test_headline_both_lists(self):
+        self.assertIn("Avisos novos e atualizados", self._html(1, 1))
+
+
+class LoadAllPagesResilienceTests(SimpleTestCase):
+    """O ciclo de "Carregar mais" trata como FIM NORMAL tudo o que o impeça de continuar —
+    incluindo o site a falhar do lado dele. O que já foi carregado é sempre aproveitado."""
+
+    class _ClickRecorder:
+        """Driver falso: cada tentativa de clique levanta o que estiver na fila."""
+
+        def __init__(self, raises):
+            self._raises = list(raises)
+            self.alert_dismissed = False
+            self.switch_to = self
+
+        @property
+        def alert(self):
+            recorder = self
+
+            class _Alert:
+                def accept(self_inner):
+                    recorder.alert_dismissed = True
+            return _Alert()
+
+    def _run(self, side_effects):
+        driver = self._ClickRecorder([])
+        with patch("avisos.scrape_portugal._wait_click", side_effect=side_effects):
+            clicks = scrape_portugal._load_all_pages(driver)
+        return clicks, driver
+
+    def test_site_error_alert_keeps_what_was_loaded(self):
+        # Foi o que aconteceu em produção: 1 clique bom e, no seguinte, o portugal2030.pt
+        # devolveu 502 e mostrou um alert. Antes rebentava o scrape inteiro com HTTP 500.
+        alert = UnexpectedAlertPresentException(
+            msg="unexpected alert open", alert_text="502: erro a ir buscar os avisos")
+        clicks, driver = self._run([1, alert])
+
+        self.assertEqual(clicks, 1)              # o clique bem-sucedido conta
+        self.assertTrue(driver.alert_dismissed)  # sem isto, o page_source voltava a falhar
+
+    def test_button_disappearing_ends_normally(self):
+        # Duas tentativas sem sucesso (rápida + paciente) = chegámos ao fim da listagem.
+        clicks, _ = self._run([1, TimeoutException(), TimeoutException()])
+        self.assertEqual(clicks, 1)
+
+    def test_second_slower_attempt_still_counts(self):
+        # A 1ª tentativa expira mas a 2ª (mais paciente) acerta — o ciclo continua.
+        clicks, _ = self._run([TimeoutException(), 1, TimeoutException(), TimeoutException()])
+        self.assertEqual(clicks, 1)
+
+    def test_stale_element_ends_normally(self):
+        clicks, _ = self._run([StaleElementReferenceException()])
+        self.assertEqual(clicks, 0)

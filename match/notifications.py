@@ -1,5 +1,5 @@
 """Email de boas-vindas enviado a quem preenche o contacto (email/nome/função) no pop-up do
-match sem login — ver NifMatchingService.create_or_update_viewer (services.py).
+match sem login — ver leads.create_or_update_viewer.
 
 O HTML (emails/html/welcome_email.html) é gerado a partir de emails/welcome.tsx pelo
 management command `render_emails` — esse .tsx é a fonte de verdade; este ficheiro só lê o

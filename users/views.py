@@ -1,6 +1,6 @@
 import json
 
-from django.contrib.auth import authenticate, login, logout, update_session_auth_hash
+from django.contrib.auth import authenticate, login, logout
 from django.core.cache import cache
 from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -86,8 +86,8 @@ def _payload(request):
 @require_http_methods(["POST"])
 def login_view(request):
     """POST {username, password} -> start a session (sessionid cookie)."""
-    data = _payload(request)
-    username = (data.get("username") or "").strip()
+    payload = _payload(request)
+    username = (payload.get("username") or "").strip()
 
     cache_key = f"login_attempts:{username.lower()}"
     if username and cache.get(cache_key, 0) >= _LOGIN_MAX_ATTEMPTS:
@@ -95,7 +95,7 @@ def login_view(request):
             {"error": "Too many failed login attempts. Try again later."}, status=429
         )
 
-    user = authenticate(request, username=username, password=data.get("password"))
+    user = authenticate(request, username=username, password=payload.get("password"))
     if user is None:
         if username:
             cache.set(cache_key, cache.get(cache_key, 0) + 1, _LOGIN_LOCK_SECONDS)
@@ -125,8 +125,8 @@ def password_reset_request_view(request):
     """POST {email} -> pede o email de reset/definição de password. Resposta SEMPRE igual
     (200, mesma mensagem) quer o email exista ou não — nunca revela se uma conta existe.
     Funciona mesmo para quem nunca teve password (viewers). Ver service.request_password_reset."""
-    data = _payload(request)
-    email = (data.get("email") or "").strip()
+    payload = _payload(request)
+    email = (payload.get("email") or "").strip()
     message = "Se existir uma conta com esse email, foi enviado um link de redefinição."
 
     cache_key = f"password_reset_attempts:{email.lower()}"
@@ -145,10 +145,10 @@ def password_reset_confirm_view(request):
     """POST {uid, token, password} -> define a nova password se o link for válido.
     200 em sucesso; 400 se o link for inválido/expirado ou a password não cumprir a
     política (mesma mensagem para os dois — ver service.reset_password_with_token)."""
-    data = _payload(request)
+    payload = _payload(request)
     try:
         service.reset_password_with_token(
-            data.get("uid") or "", data.get("token") or "", data.get("password"),
+            payload.get("uid") or "", payload.get("token") or "", payload.get("password"),
         )
     except ValueError as e:
         return JsonResponse({"error": str(e)}, status=400)
@@ -171,7 +171,7 @@ def users_all(request):
         if get_role(request.user) in _COMMERCIAL_ROLES:
             allowed = set(_FILTER_FIELDS) - {"address"}
             filters = _build_filters(request, allowed)
-            data = service.get_all_users(
+            payload = service.get_all_users(
                 role=_COMMERCIAL_MANAGED_ROLES, active=None, filters=filters,
                 page=page, page_size=page_size, exclude_superuser=True,
             )
@@ -180,11 +180,11 @@ def users_all(request):
             role_filter = request.GET.get("role") or None
             active_param = (request.GET.get("active") or "true").lower()
             active = None if active_param == "all" else (active_param != "false")
-            data = service.get_all_users(
+            payload = service.get_all_users(
                 role=role_filter, active=active, filters=filters,
                 page=page, page_size=page_size,
             )
-        return JsonResponse(data, json_dumps_params={"ensure_ascii": False, "indent": 2})
+        return JsonResponse(payload, json_dumps_params={"ensure_ascii": False, "indent": 2})
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
 
@@ -241,17 +241,17 @@ def users_detail(request, user_id):
     - client: themselves only
     """
     try:
-        data = service.get_user_detail(user_id)
-        if data is None:
+        payload = service.get_user_detail(user_id)
+        if payload is None:
             return JsonResponse({"error": "User not found"}, status=404)
 
         role = get_role(request.user)
         is_self = request.user.id == int(user_id)
-        if not _can_manage(role, data.get("role"), is_self, data.get("is_superuser")):
+        if not _can_manage(role, payload.get("role"), is_self, payload.get("is_superuser")):
             return JsonResponse(
                 {"error": "You do not have permission to view this user."}, status=403
             )
-        return JsonResponse(data, json_dumps_params={"ensure_ascii": False, "indent": 2})
+        return JsonResponse(payload, json_dumps_params={"ensure_ascii": False, "indent": 2})
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
 
@@ -282,6 +282,9 @@ def users_create(request):
         if requester_role != UserProfile.ADMIN:
             payload = {k: v for k, v in payload.items() if k != "role"}
 
+        # Ninguém define a password na criação (admin/comercial a criar de outrem, ou o
+        # próprio a registar-se) — a conta nasce sem password utilizável e a pessoa recebe
+        # por email o link para a escolher (ver service.create_user).
         result = service.create_user(payload)
         return JsonResponse(result, json_dumps_params={"ensure_ascii": False, "indent": 2}, status=201)
     except ValueError as e:
@@ -317,12 +320,12 @@ def users_update(request, user_id):
             # pass the requested role through, but only admin may change it
             payload = {k: v for k, v in payload.items() if k != "role"}
 
-        data = service.update_user(user_id, payload)
+        payload = service.update_user(user_id, payload)
 
-        if data is None:
+        if payload is None:
             return JsonResponse({"error": "User not found"}, status=404)
 
-        return JsonResponse(data, json_dumps_params={"ensure_ascii": False, "indent": 2})
+        return JsonResponse(payload, json_dumps_params={"ensure_ascii": False, "indent": 2})
     except ValueError as e:
         return JsonResponse({"error": str(e)}, status=400)
     except Exception as e:
@@ -333,42 +336,45 @@ def users_update(request, user_id):
 @require_role(*_ALL_ROLES)
 @require_http_methods(["POST"])
 def users_change_password(request, user_id):
-    """Change password. Each user changes their own (current validated); admin resets any;
-    commercial (grants ou public) reseta a de viewer/client (sem validar a password atual,
-    tal como o admin — não é deles)."""
-    try:
-        payload = _payload(request)
-        role = get_role(request.user)
-        is_admin = role == UserProfile.ADMIN
-        is_self = request.user.id == user_id
+    """Envia o email para a pessoa DEFINIR ela própria a nova password.
 
-        target = service.get_user_detail(user_id)
-        if target is None:
-            return JsonResponse({"error": "User not found"}, status=404)
-        if not _can_manage(role, target.get("role"), is_self, target.get("is_superuser")):
-            return JsonResponse(
-                {"error": "You do not have permission to change another user's password."},
-                status=403,
-            )
-        # reset direto (sem validar a password atual) para quem gere a conta de outrem.
-        by_admin = is_admin or (role in _COMMERCIAL_ROLES and not is_self)
-        ok = service.change_password(
-            user_id,
-            payload.get("password"),
-            current_password=payload.get("current_password"),
-            by_admin=by_admin,
+    Ninguém — nem o próprio, nem um admin — escreve aqui uma password: o pedido só dispara o
+    link de redefinição para o email JÁ REGISTADO na conta. Assim a password nunca passa pelo
+    corpo do pedido nem pelas mãos de quem gere a conta, e só quem controla a caixa de correio
+    a consegue definir. O link é o mesmo de /users/password-reset/ (assinado, ligado ao hash
+    atual, expira em 3 dias).
+
+    O corpo do pedido é ignorado — `password`/`current_password` deixaram de ter efeito.
+    """
+    role = get_role(request.user)
+    is_self = request.user.id == user_id
+
+    target = service.get_user_detail(user_id)
+    if target is None:
+        return JsonResponse({"error": "User not found"}, status=404)
+    if not _can_manage(role, target.get("role"), is_self, target.get("is_superuser")):
+        return JsonResponse(
+            {"error": "You do not have permission to change another user's password."},
+            status=403,
         )
-        if ok is None:
-            return JsonResponse({"error": "User not found"}, status=404)
-        # changed own password -> keep the current session valid
-        if request.user.id == user_id:
-            request.user.refresh_from_db()
-            update_session_auth_hash(request, request.user)
-        return JsonResponse({"message": "Password updated"})
-    except ValueError as e:
-        return JsonResponse({"error": str(e)}, status=400)
-    except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+
+    # Sem email não há para onde enviar; e uma conta inativa não recebe o link (ver
+    # service.request_password_reset). Quem gere a conta já vê os dois estados no detalhe,
+    # por isso dizê-lo aqui não revela nada de novo — evita só um silêncio confuso.
+    if not target.get("email"):
+        return JsonResponse(
+            {"error": "Esta conta não tem email registado — não há para onde enviar o link."},
+            status=400,
+        )
+    if not target.get("is_active"):
+        return JsonResponse(
+            {"error": "Conta inativa: ative-a primeiro para poder definir a password."},
+            status=400,
+        )
+
+    service.request_password_reset(target["email"])
+    return JsonResponse(
+        {"message": "Enviámos um email com o link para definir a nova password."})
 
 
 @csrf_exempt

@@ -1,6 +1,5 @@
 import {
   Body,
-  Button,
   Column,
   Container,
   Head,
@@ -16,6 +15,26 @@ import {
 import * as React from 'react';
 
 const FONT = "'Gellix', Arial, sans-serif";
+
+// Botão "bulletproof": o Outlook clássico (motor Word) não respeita bem
+// display:inline-block/padding num <a> — o resultado real é o botão a não aparecer de todo
+// (não só sem estilo, ausente). O <Button> do react-email só tem o truque dos caracteres
+// invisíveis para simular padding, que não chega. Aqui geram-se DOIS botões no mesmo HTML: um
+// <v:roundrect> VML (só o Outlook o vê, via <!--[if mso]-->) e um <a> normal para todos os
+// outros clientes (escondido do Outlook via <!--[if !mso]><!--> ... <!--<![endif]-->). Tudo
+// num único bloco de HTML em bruto — dividir isto por vários elementos React quebraria a
+// fronteira dos comentários condicionais (cada elemento fecha-se a si próprio).
+function bulletproofButtonHtml(href: string, label: string, widthPx: number): string {
+  return `<!--[if mso]>
+<v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:word" href="${href}" style="height:50px;v-text-anchor:middle;width:${widthPx}px;" arcsize="50%" strokecolor="#0312c2" fillcolor="#0312c2">
+<w:anchorlock/>
+<center style="color:#ffffff;font-family:Arial,sans-serif;font-size:15px;font-weight:bold;">${label}</center>
+</v:roundrect>
+<![endif]-->
+<!--[if !mso]><!-->
+<a href="${href}" target="_blank" style="font-family:'Gellix', Arial, sans-serif;background-color:#0312c2;color:#ffffff;font-size:15px;font-weight:700;border-radius:100px;padding:16px 32px;text-decoration:none;display:inline-block;">${label}</a>
+<!--<![endif]-->`;
+}
 
 const comoAtuamos = [
   'Mapeamento de oportunidades e programas de financiamento',
@@ -49,9 +68,15 @@ export default function Welcome() {
               incentivos com estratégia, rigor técnico e impacto real.
             </Text>
 
-            <Button style={pillButton} href="https://outlook.office.com/book/Consultoria@aliados.consulting/?ismsaljsauthenabled">
-              Marcar reunião
-            </Button>
+            <div
+              dangerouslySetInnerHTML={{
+                __html: bulletproofButtonHtml(
+                  'https://outlook.office.com/book/Consultoria@aliados.consulting/?ismsaljsauthenabled',
+                  'Marcar reunião',
+                  230,
+                ),
+              }}
+            />
 
             <Text style={{ ...bodyParagraph, marginTop: '32px' }}>
               Fale com um dos nossos colaboradores e receba um atendimento personalizado.
@@ -147,18 +172,6 @@ const heroText = {
   lineHeight: '1.6',
   color: 'rgba(3,18,194,0.85)',
   margin: '0 0 28px',
-};
-
-const pillButton = {
-  fontFamily: FONT,
-  backgroundColor: '#0312c2',
-  color: '#ffffff',
-  fontSize: '15px',
-  fontWeight: '700',
-  borderRadius: '100px',
-  padding: '16px 32px',
-  textDecoration: 'none',
-  display: 'inline-block',
 };
 
 const body = {

@@ -13,7 +13,7 @@ from common.files import safe_media_path
 from common.pagination import paginate
 from users.models import UserProfile
 from users.permissions import require_role
-from . import notifications, services
+from . import notifications, services, specifications_ai
 from .models import Notice
 
 # Pasta (relativa ao BASE_DIR) onde ficam os cadernos de encargos descarregados.
@@ -38,15 +38,15 @@ _NON_EDITABLE_FIELDS = frozenset({"last_update_source", "last_updated_by"})
 # "Tudo menos o id" (e os campos regenerados acima): qualquer outro campo próprio do anúncio
 # pode ser editado.
 _EDITABLE_FIELDS = frozenset(
-    f.name for f in Notice._meta.fields
-    if not f.primary_key and f.name not in _NON_EDITABLE_FIELDS
+    model_field.name for model_field in Notice._meta.fields
+    if not model_field.primary_key and model_field.name not in _NON_EDITABLE_FIELDS
 )
 
 
 def _audit_value(value, limit: int = 300) -> str:
     """Representação curta de um valor para o log de auditoria (trunca listas/textos longos)."""
-    s = repr(value)
-    return s if len(s) <= limit else s[:limit] + "…[truncado]"
+    text_repr = repr(value)
+    return text_repr if len(text_repr) <= limit else text_repr[:limit] + "…[truncado]"
 
 
 @csrf_exempt
@@ -56,9 +56,10 @@ def import_notices(request):
     notices in the DB. `num_days` é opcional (15 por omissão).
 
     POST only — it has side effects (writes to the DB and spawns the extraction process),
-    so it must not be a safe GET. Registers the notices immediately (fast) and then kills
-    any previous extraction and (re)launches the tender-specifications download in a
-    SEPARATE process (survives the runserver reloads).
+    so it must not be a safe GET. Registers the notices immediately (fast) and then launches
+    the tender-specifications download in a SEPARATE process (survives the runserver
+    reloads). Se já houver uma extração a decorrer, ela NÃO é interrompida — o campo
+    `specifications` da resposta diz qual dos dois casos aconteceu.
     """
     try:
         num_days = int(request.GET.get("num_days", 15))
@@ -67,11 +68,13 @@ def import_notices(request):
     try:
         # 1) Fast notice registration (no specifications download) — quick response.
         summary = services.import_notices(num_days, download_specs=False)
-        # 2) Kill the previous extraction and (re)launch the specifications download in a
-        #    separate process (no second API fetch — the notices are already registered).
-        services.spawn_specifications_download()
+        # 2) Launch the specifications download in a separate process (no second API fetch —
+        #    the notices are already registered). Uma extração já em curso NÃO é interrompida:
+        #    demora dezenas de minutos e o 2º pedido não a pode deitar fora a meio.
         summary["specifications"] = (
-            "extraction (re)started in a separate process — progress in the runserver console"
+            "extraction started in a separate process — progress in the runserver console"
+            if services.spawn_specifications_download()
+            else "an extraction was already running — left untouched, nothing was restarted"
         )
         return JsonResponse(summary, json_dumps_params={"ensure_ascii": False, "indent": 2})
     except services.BaseGovError as e:
@@ -118,6 +121,43 @@ def notice_detail(request, pk):
 
 
 @csrf_exempt
+@require_POST
+@require_role(*_EDIT_ROLES)
+def notice_ai_detail(request, pk):
+    """POST /anuncios/<id>/detail/ — detalhe gerado por IA a partir do caderno de encargos:
+    descrição detalhada, critérios de avaliação (tal como escritos no documento) e
+    observações. Prompt fixo, sem input do cliente. POST porque tem efeitos (pode disparar
+    conversão Docling + uma chamada paga ao OpenAI) — não é uma leitura pura. Só admin e
+    commercial_public — ao contrário do detalhe simples (notice_detail), este tem custo
+    (chamada à IA), por isso não fica aberto a client.
+
+    NÃO bloqueia à espera do OpenAI: se ainda não houver nada cacheado, arranca a geração
+    em background e devolve logo 202 {"status": "generating"} — repetir a chamada mais
+    tarde (ex: ao reabrir o anúncio) devolve 200 com o detalhe já pronto. Cacheado em
+    Notice.specifications_description/evaluation/observations: uma vez gerado, chamadas
+    seguintes devolvem o valor gravado sem repetir o custo. `?refresh=true` força uma
+    nova geração (também em background).
+    """
+    notice = Notice.objects.filter(pk=pk).first()
+    if notice is None:
+        return JsonResponse({"error": "Anúncio não encontrado."}, status=404)
+    force = request.GET.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        status, detail = specifications_ai.generate_detail_async(notice, force=force)
+    except specifications_ai.SpecificationsNotFound as e:
+        return JsonResponse({"error": str(e)}, status=404)
+    except Exception as e:
+        logger.exception("Erro a arrancar o detalhe IA do anúncio %s", pk)
+        return JsonResponse({"error": f"Erro ao gerar o detalhe IA: {e}"}, status=502)
+    if status == "generating":
+        return JsonResponse({"status": "generating"}, status=202)
+    return JsonResponse(
+        detail.model_dump() | {"status": "done"},
+        json_dumps_params={"ensure_ascii": False, "indent": 2},
+    )
+
+
+@csrf_exempt
 @require_http_methods(["PUT", "PATCH"])
 @require_role(*_EDIT_ROLES)
 def notice_edit(request, pk):
@@ -127,21 +167,21 @@ def notice_edit(request, pk):
     if notice is None:
         return JsonResponse({"error": "Anúncio não encontrado."}, status=404)
     try:
-        data = json.loads(request.body or "{}")
+        payload = json.loads(request.body or "{}")
     except json.JSONDecodeError:
         return JsonResponse({"error": "Corpo JSON inválido."}, status=400)
-    if not isinstance(data, dict):
+    if not isinstance(payload, dict):
         return JsonResponse({"error": "Esperado um objeto JSON de campos a alterar."}, status=400)
 
-    updated = [f for f in data if f in _EDITABLE_FIELDS]
-    ignored = [f for f in data if f not in _EDITABLE_FIELDS]
+    updated = [field_name for field_name in payload if field_name in _EDITABLE_FIELDS]
+    ignored = [field_name for field_name in payload if field_name not in _EDITABLE_FIELDS]
     # Auditoria: captura o valor ANTIGO antes de aplicar, para registar antigo -> novo.
     changes = {}
-    for f in updated:
-        old = getattr(notice, f, None)
-        if old != data[f]:
-            changes[f] = (old, data[f])
-        setattr(notice, f, data[f])
+    for field_name in updated:
+        old = getattr(notice, field_name, None)
+        if old != payload[field_name]:
+            changes[field_name] = (old, payload[field_name])
+        setattr(notice, field_name, payload[field_name])
     if updated:
         # Qualquer escrita por este endpoint é uma edição MANUAL — marca a origem e quem a fez,
         # para se distinguir do que a importação (base.gov.pt) grava.
@@ -153,7 +193,8 @@ def notice_edit(request, pk):
             # validate_unique=False aqui; a unicidade do notice_number é apanhada pelo
             # IntegrityError abaixo (e evita uma query extra em cada edição).
             notice.full_clean(
-                exclude=[f.name for f in Notice._meta.fields if f.name not in updated],
+                exclude=[model_field.name for model_field in Notice._meta.fields
+                         if model_field.name not in updated],
                 validate_unique=False,
             )
             notice.save()
@@ -172,8 +213,8 @@ def notice_edit(request, pk):
                 "EDIÇÃO anúncio %s (id=%s) por %s: %s",
                 notice.notice_number or "?", notice.pk, request.user.username,
                 " | ".join(
-                    f"{f}: {_audit_value(old)} -> {_audit_value(new)}"
-                    for f, (old, new) in changes.items()
+                    f"{field_name}: {_audit_value(old)} -> {_audit_value(new)}"
+                    for field_name, (old, new) in changes.items()
                 ),
             )
             # Comerciais recebem email das alterações (best-effort — não bloqueia a resposta).

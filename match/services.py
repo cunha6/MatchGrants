@@ -6,34 +6,34 @@ contribuinte -> extração de metadados -> cruzamento com as oportunidades ativa
 (avisos.Grant) segundo o SCORING_CONFIG -> lista de matches ordenada por score.
 
 A view limita-se a invocar `NifMatchingService().evaluate(nif)`.
+
+Responsabilidades vizinhas vivem em módulos próprios: o cliente do nif.pt e a
+normalização dos seus dados em company_metadata.py, e o ciclo de vida do lead
+(viewer) em leads.py. Aqui fica o motor de matching e a orquestração do pedido.
 """
 
+import hashlib
+import json
 import logging
-import re
 import threading
 
 import requests
 from django.conf import settings
-from django.contrib.auth.models import User
 from django.core.cache import cache
-from django.db import transaction
 from django.db.models import Exists, OuterRef, Q
 
 from avisos.models import Grant, GrantCae, GrantEmbedding
 from common.cae import cae_all_prefixes
-from users.models import UserProfile
-from .disposable_email import is_disposable_email
-from .models import NifCompany
-from .nuts import nuts_for
-from .ctt import ctt_lookup
+from common.email_validation import email_error_label
+from .company_metadata import extract_metadata
 from .scoring_rules import (
-    SCORING_CONFIG, MAX_SCORE, _normalize, classify_dimension, is_eligible,
+    SCORING_CONFIG, MAX_SCORE, _normalize, is_eligible,
     missing_required_fields,
 )
 from . import embeddings
+from . import leads
 from . import grant_embeddings
 from . import llm_validation
-from . import notifications
 from .ranking import (
     active_phase_id, company_area_id, effective_budget_rate,
     max_financing_rate_from_rates,
@@ -62,34 +62,6 @@ def _next_nif_key() -> str | None:
     return key
 
 
-def promote_viewer_to_client(nif: str) -> dict | None:
-    """Promove um viewer a client: muda o role e ativa a conta (is_active=True).
-
-    Idempotente. Devolve os dados atualizados ou None se não existir perfil com o NIF.
-    Nota: as credenciais (username/password) são definidas mais tarde, num passo próprio
-    — aqui a conta fica ativa mas ainda sem password utilizável até esse passo.
-    """
-    profile = UserProfile.objects.filter(nif=nif).select_related("user").first()
-    if profile is None:
-        return None
-
-    user = profile.user
-    if profile.role != UserProfile.CLIENT:
-        profile.role = UserProfile.CLIENT
-        profile.save(update_fields=["role"])
-    if not user.is_active:
-        user.is_active = True
-        user.save(update_fields=["is_active"])
-
-    return {
-        "user_id": user.id,
-        "nif": nif,
-        "role": profile.role,
-        "is_active": user.is_active,
-        "has_login": user.has_usable_password(),
-    }
-
-
 def _company_general_text(metadata: dict) -> str:
     """Texto GERAL do cliente (compara com o embedding GENERAL do aviso) — junta tudo o que
     o descreve: atividade + nome + tipo de entidade + CAE + localização.
@@ -105,12 +77,12 @@ def _company_general_text(metadata: dict) -> str:
         parts.append(str(metadata["name"]))
     if metadata.get("entity_type"):
         parts.append(str(metadata["entity_type"]))
-    caes = [str(c) for c in (metadata.get("cae_codes") or []) if c]
-    if caes:
-        parts.append("CAE: " + ", ".join(caes))
-    loc = [str(metadata.get(f)) for f in ("region", "county", "city", "address") if metadata.get(f)]
-    if loc:
-        parts.append("Localização: " + ", ".join(loc))
+    cae_codes = [str(cae_code) for cae_code in (metadata.get("cae_codes") or []) if cae_code]
+    if cae_codes:
+        parts.append("CAE: " + ", ".join(cae_codes))
+    location_parts = [str(metadata.get(field_name)) for field_name in ("region", "county", "city", "address") if metadata.get(field_name)]
+    if location_parts:
+        parts.append("Localização: " + ", ".join(location_parts))
     return "\n".join(parts)
 
 
@@ -125,65 +97,12 @@ def _company_sector_text(metadata: dict) -> str:
     if activity:
         return activity
     parts: list[str] = []
-    caes = [str(c) for c in (metadata.get("cae_codes") or []) if c]
-    if caes:
-        parts.append("CAE: " + ", ".join(caes))
+    cae_codes = [str(cae_code) for cae_code in (metadata.get("cae_codes") or []) if cae_code]
+    if cae_codes:
+        parts.append("CAE: " + ", ".join(cae_codes))
     if metadata.get("name"):
         parts.append(str(metadata["name"]))
     return "\n".join(parts)
-
-
-# Código de natureza jurídica (structure.nature do nif.pt) → descrição legível.
-NATURE_LABELS = {
-    "UNI": "Sociedade Unipessoal por Quotas",
-    "LDA": "Sociedade por Quotas",
-    "SA": "Sociedade Anónima",
-    "COO": "Cooperativa",
-    "ASS": "Associação",
-    "FUN": "Fundação",
-    "ACE": "Agrupamento Complementar de Empresas",
-    "AEIE": "Agrupamento Europeu de Interesse Económico",
-    "SUC": "Sucursal",
-    "MUT": "Mutualidade / Associação Mutualista",
-    "EIRL": "Estabelecimento Individual de Responsabilidade Limitada",
-    "ENI": "Empresário em Nome Individual",
-}
-
-# Código de natureza → tipo de entidade usado no matching (ver match_entity_type).
-NATURE_TO_ENTITY_TYPE = {
-    "UNI": "empresa", "LDA": "empresa", "SA": "empresa", "EIRL": "empresa",
-    "ENI": "empresa", "ACE": "empresa", "AEIE": "empresa", "SUC": "empresa",
-    "COO": "cooperativa",
-    "ASS": "associacao", "MUT": "associacao",
-    "FUN": "fundacao",
-}
-
-# Padrões no NOME → tipo de beneficiário. Servem para as entidades públicas/sociais que a
-# natureza jurídica do nif.pt NÃO distingue (município, junta, misericórdia...). Ordem: do
-# mais específico para o mais genérico (o primeiro que casar ganha).
-_NAME_TYPE_PATTERNS = [
-    (re.compile(r"comunidade intermunicipal|\bcim\b|entidade intermunicipal", re.I), "intermunicipio"),
-    (re.compile(r"[aá]rea metropolitana|multimunicipal", re.I), "multimunicipio"),
-    (re.compile(r"\b(junta|uni[aã]o)\s+de\s+freguesias?\b", re.I), "junta_freguesia"),
-    (re.compile(r"miseric[oó]rdia|santa casa", re.I), "misericordia"),
-    (re.compile(r"munic[ií]pio|c[aâ]mara municipal", re.I), "municipio"),
-    (re.compile(r"funda[cç][aã]o", re.I), "fundacao"),
-    (re.compile(r"cooperativa|\bcrl\b", re.I), "cooperativa"),
-    (re.compile(r"universidade|instituto polit[eé]cnico|agrupamento de escolas|\bescola\b", re.I), "ensino"),
-    (re.compile(r"associa[cç][aã]o", re.I), "associacao"),
-]
-
-
-def infer_entity_type(name: str | None, nature: str | None) -> str | None:
-    """Infere o tipo de beneficiário pelo NOME (entidades públicas/sociais que a natureza
-    jurídica não distingue) e, em fallback, pela natureza jurídica do nif.pt.
-
-    O nome tem prioridade porque um "Município de X" ou "Santa Casa da Misericórdia de Y" não
-    tem uma natureza jurídica societária que os identifique. None quando nada permite inferir."""
-    for pattern, etype in _NAME_TYPE_PATTERNS:
-        if pattern.search(name or ""):
-            return etype
-    return NATURE_TO_ENTITY_TYPE.get(nature)
 
 
 class NifValidationError(Exception):
@@ -204,8 +123,8 @@ class MissingClientDataError(Exception):
 
     def __init__(self, fields: list[dict]):
         self.fields = fields
-        labels = ", ".join(f["label"] for f in fields) or "dados em falta"
-        super().__init__(f"São necessárias mais informações para fazer o match: {labels}.")
+        missing_labels = ", ".join(field_name["label"] for field_name in fields) or "dados em falta"
+        super().__init__(f"São necessárias mais informações para fazer o match: {missing_labels}.")
 
 
 # Contacto pedido a quem não tem sessão antes de revelar os resultados (ver
@@ -220,18 +139,21 @@ _CONTACT_FIELDS = [
 def _missing_contact_fields(contact: dict) -> list[dict]:
     """Campos de contacto em falta ([{field,label}, ...]); vazia se completo.
 
-    O email também é tratado como "em falta" se o domínio for webmail genérico/gratuito
-    (gmail, outlook, hotmail...) ou de um serviço de email temporário/descartável (ver
-    match.disposable_email) — mesmo preenchido, não serve para captar um lead de EMPRESA.
-    Label distinta ("Email inválido") para o front-end conseguir mostrar por que é que o
-    pop-up voltou a pedir o email."""
+    O email também é tratado como "em falta" quando está preenchido mas não serve para
+    captar um lead de EMPRESA: formato inválido (ex: "x"), domínio inexistente, ou domínio
+    de webmail genérico/gratuito/descartável — ver `common.email_validation.email_error_label`
+    (partilhada com o registo de conta em `users/service.py`, mesma regra de negócio). Label
+    ESPECÍFICA ao motivo, para o front-end conseguir mostrar por que é que o pop-up voltou a
+    pedir o email."""
     missing = []
     for field, label in _CONTACT_FIELDS:
         value = contact.get(field)
         if not value:
             missing.append({"field": field, "label": label})
-        elif field == "email" and is_disposable_email(value):
-            missing.append({"field": field, "label": "Email inválido"})
+        elif field == "email":
+            error_label = email_error_label(value)
+            if error_label:
+                missing.append({"field": field, "label": error_label})
     return missing
 
 
@@ -269,9 +191,13 @@ class NifMatchingService:
             response.raise_for_status() 
             payload = response.json()
         except (requests.RequestException, ValueError) as exc:
-            # O detalhe fica no log — a str(exc) inclui o URL com a NIF_KEY e não
-            # pode ir na resposta HTTP.
-            logger.warning("Falha ao contactar a API nif.pt (nif=%s): %s", nif, exc)
+            # A str(exc) das exceções do requests inclui o URL — e o URL leva a NIF_KEY.
+            # Não pode ir na resposta HTTP nem, já agora, no log: os logs vão para a consola
+            # (docker logs) e para ficheiro, e uma chave de API não tem nada que ficar lá.
+            logger.warning(
+                "Falha ao contactar a API nif.pt (nif=%s): %s", nif,
+                str(exc).replace(self.api_key, "***"),
+            )
             raise NifServiceError(
                 f"Falha ao contactar a API nif.pt ({type(exc).__name__}). Tenta novamente."
             )
@@ -293,103 +219,6 @@ class NifMatchingService:
             raise NifValidationError("O contribuinte existe mas não está ativo.")
 
         return record
-
-    def extract_metadata(self, record: dict) -> dict:
-        """Normaliza o registo da API nos metadados usados pelo matching e no perfil.
-
-        - `cae` vem como LISTA na API (ex: ["88102", "85100"]) — também tolera string.
-        - `entity_type` é derivado de `structure.nature` (COO, ASS, SA…).
-        - Captura morada, contactos, capital social e data de início de atividade.
-        - `dimension` (micro/pequena/media/grande) não vem do nif.pt: é calculada a
-          partir do enriquecimento por NIF (empregados + proveitos operacionais) do
-          dictionary_by_nif.json, carregado na BD 'nif' (ver `_enrichment_for`). Fica
-          None quando não há dados suficientes.
-        """
-        geo = record.get("geo") or {}
-        structure = record.get("structure") or {}
-        contacts = record.get("contacts") or {}
-        nature = structure.get("nature")
-
-        cae_raw = record.get("cae")
-        if isinstance(cae_raw, list):
-            cae_codes = [str(c) for c in cae_raw if c]
-        elif cae_raw:
-            cae_codes = [str(cae_raw)]
-        else:
-            cae_codes = []
-
-        nif = str(record.get("nif") or "")
-        enrich = self._enrichment_for(nif)
-        employees = enrich.employees if enrich else None
-        operating_revenue = enrich.operating_revenue if enrich else None
-        # Dimensão vem pré-calculada e gravada no SQLite (load_nif_dictionary); só
-        # recalcula em fallback se, por algum motivo, não estiver gravada.
-        dimension = (enrich.dimension if enrich else None) \
-            or classify_dimension(employees, operating_revenue)
-
-        pc4, pc3 = record.get("pc4"), record.get("pc3")
-        postal_code = f"{pc4}-{pc3}" if pc4 and pc3 else (pc4 or None)
-
-        # CTT: o código postal (do nif.pt) → localidade/concelho/distrito precisos. Preferimos
-        # estes valores; se a CTT não responder, caímos para o enriquecimento (SQLite)/nif.pt.
-        ctt_local, ctt_concelho, ctt_distrito = ctt_lookup(postal_code)
-        region = (enrich.region if enrich else "") or geo.get("region") or ""
-        city = ctt_local or record.get("city") or geo.get("county") or ""
-        county = ctt_concelho or (enrich.municipality if enrich else "") or geo.get("county") or ""
-        district = ctt_distrito or (enrich.district if enrich else "") or ""
-
-        # NUTS II/III pela CIDADE vinda da CTT (procura no nuts.json; fallback pelo concelho).
-        # Assim "4800-937" → CTT dá "Guimarães" → nuts.json dá NUTS II "Norte", NUTS III "Ave".
-        # `nuts_ii_old` = NUTS II standard (5 continentais) para casar com os avisos.
-        nuts_ii, nuts_iii, nuts_ii_old = nuts_for(city, county)
-        return {
-            "nif": nif,
-            "name": record.get("title") or "",
-            "nature": nature,
-            "nature_label": NATURE_LABELS.get(nature, nature),
-            # Tipo de beneficiário: nome (entidades públicas/sociais) + natureza jurídica.
-            "entity_type": infer_entity_type(record.get("title"), nature),
-            "dimension": dimension,
-            "employees": employees,
-            "operating_revenue": float(operating_revenue) if operating_revenue is not None else None,
-            "cae_codes": cae_codes,
-            "main_cae": cae_codes[0] if cae_codes else None,
-            "secondary_cae": cae_codes[1:],
-            "address": record.get("address") or "",
-            "postal_code": postal_code,
-            "city": city,
-            "region": region,
-            "county": county,
-            "district": district,
-            "nuts_ii": nuts_ii,
-            "nuts_iii": nuts_iii,
-            "nuts_ii_old": nuts_ii_old,
-            "parish": geo.get("parish") or "",
-            "capital": structure.get("capital"),
-            "capital_currency": structure.get("capital_currency"),
-            "start_date": record.get("start_date"),
-            "activity": record.get("activity") or "",
-            "contacts": {
-                "email": contacts.get("email"),
-                "phone": contacts.get("phone"),
-                "website": contacts.get("website"),
-                "fax": contacts.get("fax"),
-            },
-        }
-
-    @staticmethod
-    def _enrichment_for(nif: str) -> NifCompany | None:
-        """Registo de enriquecimento (BD 'nif') para o NIF, ou None.
-
-        Tolerante: se a BD 'nif' ainda não existir/estiver por carregar, devolve None
-        em vez de rebentar o fluxo do match.
-        """
-        if not nif:
-            return None
-        try:
-            return NifCompany.objects.filter(nif=nif).first()
-        except Exception:
-            return None
 
     # --- Motor de matching -----------------------------------------------
 
@@ -420,8 +249,8 @@ class NifMatchingService:
         """
         company_vectors = company_vectors or {}
         client_tokens = [
-            _normalize(client_metadata.get(f))
-            for f in ("region", "county", "city", "nuts_ii", "nuts_iii", "nuts_ii_old") if client_metadata.get(f)
+            _normalize(client_metadata.get(field_name))
+            for field_name in ("region", "county", "city", "nuts_ii", "nuts_iii", "nuts_ii_old") if client_metadata.get(field_name)
         ]
 
         results = []
@@ -483,10 +312,10 @@ class NifMatchingService:
 
         # Atividade 1º, depois taxa, depois dotação — todos decrescentes.
         results.sort(
-            key=lambda r: (
-                r["activity_relevance"] if r["activity_relevance"] is not None else -1.0,
-                r["effective_financing_rate"] if r["effective_financing_rate"] is not None else -1.0,
-                r["effective_budget_allocation"] if r["effective_budget_allocation"] is not None else -1.0,
+            key=lambda match_row: (
+                match_row["activity_relevance"] if match_row["activity_relevance"] is not None else -1.0,
+                match_row["effective_financing_rate"] if match_row["effective_financing_rate"] is not None else -1.0,
+                match_row["effective_budget_allocation"] if match_row["effective_budget_allocation"] is not None else -1.0,
             ),
             reverse=True,
         )
@@ -504,129 +333,54 @@ class NifMatchingService:
         restantes passam sem validação (llm_adequate=None): ficam sempre na lista, no fundo,
         onde já estavam por relevância."""
         to_validate = results[:cls.LLM_VALIDATION_CAP]
-        grants_in_order = [grant_by_id[r["opportunity_id"]] for r in to_validate]
+        grants_in_order = [grant_by_id[match_row["opportunity_id"]] for match_row in to_validate]
         verdicts = llm_validation.validate_matches(client_metadata, grants_in_order) \
             if grants_in_order else {}
 
         final = []
-        for r in results:
+        for match_row in results:
             # Só os avisos do top-N enviados têm veredito; os restantes ficam com None (passam).
-            verdict = verdicts.get(r["opportunity_id"])
-            r["llm_adequate"] = verdict["adequate"] if verdict else None
-            r["llm_reason"] = verdict["reason"] if verdict else None
+            verdict = verdicts.get(match_row["opportunity_id"])
+            match_row["llm_adequate"] = verdict["adequate"] if verdict else None
+            match_row["llm_reason"] = verdict["reason"] if verdict else None
             # Só é removido quando o LLM diz EXPLICITAMENTE que não é adequado.
             if verdict is None or verdict["adequate"]:
-                final.append(r)
+                final.append(match_row)
         removed = len(results) - len(final)
         if removed:
             logger.info("Validação LLM: %d de %d avisos (top-%d) removidos por não adequados.",
                         removed, min(len(results), cls.LLM_VALIDATION_CAP), cls.LLM_VALIDATION_CAP)
         return final
 
-    @transaction.atomic
-    def create_or_update_viewer(self, metadata: dict, contact: dict | None = None) -> User:
-        """Cria/atualiza um utilizador role=viewer com os dados MÍNIMOS do lead.
-
-        Idempotente pelo NIF: se já existir um perfil com o mesmo NIF, atualiza-o em
-        vez de duplicar. O utilizador fica com username=NIF e password inutilizável
-        (sem login até um admin definir credenciais).
-
-        Só grava dados DIRETOS do nif.pt (público) — NIF, CAE, natureza jurídica, atividade,
-        morada, NUTS, dimensão. Deliberadamente NÃO grava: tipo de entidade (é INFERIDO por
-        nós a partir do nome+natureza, não um campo do nif.pt), capital social, faturação/nº
-        empregados, nem telefone/site/fax — quem faz o match sem login não deixa esses dados
-        na BD. (Um utilizador AUTENTICADO nunca chega a chamar este método — ver `evaluate`.)
-
-        `contact` (email/nome/função): NÃO vem do nif.pt — vem do pop-up de contacto que o
-        `evaluate` pede antes de revelar os resultados a quem não tem sessão. Só entra quando
-        preenchido (`evaluate` só chama isto com contacto completo ou vazio, nunca parcial).
-        """
-        nif = metadata["nif"]
-
-        profile = UserProfile.objects.filter(nif=nif).select_related("user").first()
-        if profile:
-            user, is_new = profile.user, False
-        else:
-            # Viewer nasce inativo e sem password — é só um registo de acesso ao match.
-            # get_or_create tolera um User pré-existente com username=NIF (ex: perfil ainda
-            # sem nif) — sem isto a unicidade do username rebentava com IntegrityError.
-            user, is_new = User.objects.get_or_create(
-                username=nif, defaults={"is_active": False}
-            )
-            if is_new:
-                user.set_unusable_password()
-                user.save()
-            # O signal post_save cria o perfil (role=client); get_or_create cobre contas
-            # antigas que possam não o ter.
-            profile, _ = UserProfile.objects.get_or_create(user=user)
-
-        main_cae = metadata.get("main_cae")
-        profile.nif = nif
-        # Dimensão do SQLite -> entity_size do perfil (mesmas choices). `or` preserva um
-        # valor manual já existente quando a dimensão é desconhecida.
-        profile.entity_size = metadata.get("dimension") or profile.entity_size
-        profile.activity = metadata.get("activity") or profile.activity
-        # CAE e natureza jurídica: campos DIRETOS do nif.pt (record["cae"] / structure.nature),
-        # não inferidos por nós — por isso entram, ao contrário de entity_type (esse é
-        # calculado por infer_entity_type a partir do nome + desta mesma natureza).
-        if main_cae and len(main_cae) == 5:
-            profile.main_cae = main_cae
-        profile.secondary_cae = [c for c in (metadata.get("secondary_cae") or []) if len(str(c)) == 5]
-        profile.nature = metadata.get("nature")
-        # Morada.
-        profile.address = metadata.get("address") or profile.address
-        profile.city = metadata.get("city")
-        profile.county = metadata.get("county")
-        profile.parish = metadata.get("parish")
-        profile.postal_code = metadata.get("postal_code")
-        # NUTS: a região é reaproveitada para guardar a NUTS II RESOLVIDA (nuts.json, a mesma
-        # que os avisos usam), não o texto bruto do nif.pt — cai para este só se a resolução
-        # de NUTS falhar (concelho não encontrado em nuts.json).
-        profile.region = (
-            metadata.get("nuts_ii_old") or metadata.get("nuts_ii") or metadata.get("region")
-            or profile.region
-        )
-
-        # Role/estado: só aplica viewer+inativo a contas novas ou que ainda sejam viewer.
-        # Um viewer promovido a client mantém o role e o is_active — uma nova avaliação
-        # do NIF atualiza os dados mas NUNCA o rebaixa.
-        if is_new or profile.role == UserProfile.VIEWER:
-            profile.role = UserProfile.VIEWER
-            if user.is_active:
-                user.is_active = False
-                user.save(update_fields=["is_active"])
-
-        # Contacto (email/nome/função) — só o que vier preenchido, nunca apaga um valor já
-        # guardado com um campo vazio de um pedido anterior.
-        contact = contact or {}
-        had_email = bool(user.email)
-        user_fields = []
-        if contact.get("email"):
-            user.email = str(contact["email"]).strip()
-            user_fields.append("email")
-        if contact.get("name"):
-            user.first_name = str(contact["name"]).strip()
-            user_fields.append("first_name")
-        if user_fields:
-            user.save(update_fields=user_fields)
-        if contact.get("job_title"):
-            profile.job_title = str(contact["job_title"]).strip()
-
-        profile.save()
-
-        # Boas-vindas: só na 1ª vez que este viewer preenche o email (não reenviar em cada
-        # match seguinte do mesmo NIF). Nunca rebenta o fluxo — ver notifications.
-        if not had_email and user.email:
-            notifications.send_welcome_email(user.email)
-
-        return user
-
     # TTL do cache que guarda o match já calculado à espera do contacto (ver `evaluate`).
     CONTACT_CACHE_TTL = 900  # 15 min — tempo de sobra para preencher o pop-up
     _CONTACT_CACHE_PREFIX = "match_pending_contact:"
 
+    @classmethod
+    def _contact_cache_key(cls, nif: str, overrides: dict | None, scope: str | None) -> str:
+        """Chave do match retido à espera do contacto.
+
+        Inclui `scope` (a sessão de quem pediu) — sem isso, dois visitantes a avaliar o MESMO
+        NIF partilhavam a entrada: o segundo consumia o resultado do primeiro e o primeiro
+        pagava um recálculo completo. E inclui um resumo dos `overrides`, para que reenviar
+        com o CAE/região CORRIGIDOS recalcule, em vez de devolver o resultado do valor antigo.
+        """
+        payload = json.dumps(overrides or {}, sort_keys=True, default=str)
+        digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        return f"{cls._CONTACT_CACHE_PREFIX}{scope or '-'}:{nif}:{digest}"
+
+    @staticmethod
+    def _sanitize_contact(contact: dict, missing_contact: list[dict]) -> dict:
+        """Nunca grava um email inválido/descartável no perfil nem dispara o email de
+        boas-vindas — é tratado como se não tivesse vindo (create_or_update_viewer não
+        sabe distinguir "descartável" de "válido", por isso sanitiza-se aqui antes)."""
+        if contact.get("email") and any(f["field"] == "email" for f in missing_contact):
+            return {**contact, "email": None}
+        return contact
+
     def evaluate(self, nif: str, overrides: dict | None = None,
-                 create_viewer: bool = True, contact: dict | None = None) -> dict:
+                 create_viewer: bool = True, contact: dict | None = None,
+                 cache_scope: str | None = None) -> dict:
         """Orquestra o fluxo completo e devolve o payload pronto para a resposta.
 
         `overrides` permite preencher dados que o nif.pt/enriquecimento não trazem
@@ -641,32 +395,65 @@ class NifMatchingService:
         e `viewer_user_id` vem a None.
 
         `contact` (email/nome/função) — GATE de captação de lead, só para quem não tem
-        sessão: o match é sempre CALCULADO já nesta chamada (a procura nunca espera pelo
-        contacto), mas se `contact` vier incompleto, os `matches` ficam retidos — levanta
-        MissingClientDataError (mesmo 422/`needs_more_info` do CAE/localização em falta) em
-        vez de os devolver. O cálculo fica em cache (`CONTACT_CACHE_TTL`) para o pedido
-        seguinte, já com o contacto preenchido, não repetir nif.pt/embeddings/LLM. O lead
-        (dados da empresa) é sempre registado, com ou sem contacto ainda.
+        sessão. Um pedido com `contact` ainda VAZIO (a 1ª chamada, só o NIF, antes do
+        pop-up aparecer) CALCULA o match já nesta chamada (a procura não espera por um
+        contacto que nem chegou a ser pedido) e fica em cache (`CONTACT_CACHE_TTL`) à
+        espera dele. Mas um `contact` já SUBMETIDO (o pop-up foi preenchido) e ainda assim
+        INVÁLIDO nem chega a gerar essa pesquisa — a validação em si (formato +
+        disposable_email_domains.json) é local, em milisegundos, e dizer isso ao fim de
+        uma pesquisa inteira (nif.pt + embeddings + LLM, o essencial da latência do match)
+        só porque o email veio mal só atrasava o pop-up sem propósito. Nos dois casos
+        levanta-se MissingClientDataError (mesmo 422/`needs_more_info` do CAE/localização
+        em falta). O lead (dados da empresa) só é registado quando a pesquisa chega a
+        correr — um contacto submetido-mas-inválido não fica registado; a próxima
+        tentativa (mesmo NIF, contacto vazio ou já corrigido) é que o regista.
+
+        `cache_scope`: identificador de quem está a pedir (a chave da sessão, passada pela
+        view) — isola a entrada em cache por visitante. Ver `_contact_cache_key`.
         """
         contact = contact or {}
-        cache_key = f"{self._CONTACT_CACHE_PREFIX}{nif}"
 
-        if create_viewer and not _missing_contact_fields(contact):
+        # Contacto SUBMETIDO (pelo menos um campo preenchido) mas INVÁLIDO: rejeita já,
+        # sem tocar em nif.pt/cache/LLM — ver docstring acima. `_missing_contact_fields`
+        # não depende de metadata (só de `contact`), por isso pode correr aqui, antes de
+        # sequer se saber quem é a empresa.
+        if create_viewer and any(contact.values()):
+            early_missing = _missing_contact_fields(contact)
+            if early_missing:
+                raise MissingClientDataError(early_missing)
+
+        cache_key = self._contact_cache_key(nif, overrides, cache_scope)
+
+        if create_viewer:
             cached = cache.get(cache_key)
             if cached:
-                cache.delete(cache_key)
                 metadata, matches = cached["metadata"], cached["matches"]
-                user = self.create_or_update_viewer(metadata, contact)
-                return {
-                    "company": dict(metadata), "nif": metadata["nif"],
-                    "viewer_user_id": user.id, "matches": matches,
-                }
-            # sem cache (expirou, ou é a 1ª chamada já com o contacto preenchido de raiz) —
-            # recalcula tudo abaixo, como de costume.
+                missing_contact = _missing_contact_fields(contact)
+                user = leads.create_or_update_viewer(
+                    metadata, self._sanitize_contact(contact, missing_contact))
+                if not missing_contact:
+                    cache.delete(cache_key)
+                    return {
+                        "company": dict(metadata), "nif": metadata["nif"],
+                        "viewer_user_id": user.id, "matches": matches,
+                    }
+                # Continua incompleto/inválido: mantém em cache para a tentativa seguinte
+                # (não recalcula nif.pt/embeddings só porque o contacto ainda não serve).
+                raise MissingClientDataError(missing_contact)
+            # sem cache (expirou, ou é mesmo a 1ª chamada para este nif/overrides/scope) —
+            # calcula tudo abaixo, como de costume.
 
         record = self.fetch_company(nif)
-        metadata = self.extract_metadata(record)
+        metadata = extract_metadata(record)
         metadata = self._apply_overrides(metadata, overrides)
+
+        missing_contact = _missing_contact_fields(contact) if create_viewer else []
+        user = None
+        if create_viewer:
+            # O lead (dados da empresa) é registado ANTES de qualquer 422 — mesmo que falte o
+            # CAE/localização, quem consultou fica guardado (é o objetivo do viewer).
+            user = leads.create_or_update_viewer(
+                metadata, self._sanitize_contact(contact, missing_contact))
 
         missing = missing_required_fields(metadata)
         if missing:
@@ -677,21 +464,10 @@ class NifMatchingService:
         company_vectors = self._company_vectors(metadata)
         matches = self.process_matches(metadata, company_vectors)
 
-        user = None
-        if create_viewer:
-            missing_contact = _missing_contact_fields(contact)
-            # Um email de domínio descartável NUNCA é gravado no perfil nem dispara o email de
-            # boas-vindas — é tratado como se não tivesse vindo (create_or_update_viewer não
-            # sabe distinguir "descartável" de "válido", por isso sanitiza-se aqui antes).
-            safe_contact = contact
-            if contact.get("email") and any(f["field"] == "email" for f in missing_contact):
-                safe_contact = {**contact, "email": None}
-            # Regista/atualiza sempre o lead (dados da empresa) — o contacto entra se vier.
-            user = self.create_or_update_viewer(metadata, safe_contact)
-            if missing_contact:
-                cache.set(cache_key, {"metadata": metadata, "matches": matches},
-                          self.CONTACT_CACHE_TTL)
-                raise MissingClientDataError(missing_contact)
+        if missing_contact:
+            cache.set(cache_key, {"metadata": metadata, "matches": matches},
+                      self.CONTACT_CACHE_TTL)
+            raise MissingClientDataError(missing_contact)
 
         # `company` expõe os dados ricos do contribuinte (incluindo a `activity`).
         return {
@@ -712,11 +488,11 @@ class NifMatchingService:
             GrantEmbedding.Type.SECTOR: _company_sector_text(metadata),
             GrantEmbedding.Type.GENERAL: _company_general_text(metadata),
         }
-        types = [t for t, text in texts.items() if text.strip()]
+        types = [embedding_type for embedding_type, text in texts.items() if text.strip()]
         if not types:
             return {}
-        vectors = embeddings.embed_many([texts[t] for t in types])
-        return {t: v for t, v in zip(types, vectors) if v is not None}
+        vectors = embeddings.embed_many([texts[embedding_type] for embedding_type in types])
+        return {embedding_type: vector for embedding_type, vector in zip(types, vectors) if vector is not None}
 
     @staticmethod
     def _apply_overrides(metadata: dict, overrides: dict | None) -> dict:
@@ -726,14 +502,14 @@ class NifMatchingService:
         overrides = overrides or {}
 
         if not metadata.get("cae_codes"):
-            caes = overrides.get("cae_codes") or overrides.get("cae")
-            if isinstance(caes, str):
-                caes = caes.replace(";", ",").split(",")
-            caes = [str(c).strip() for c in (caes or []) if str(c).strip()]
-            if caes:
-                metadata["cae_codes"] = caes
-                metadata["main_cae"] = caes[0]
-                metadata["secondary_cae"] = caes[1:]
+            cae_codes = overrides.get("cae_codes") or overrides.get("cae")
+            if isinstance(cae_codes, str):
+                cae_codes = cae_codes.replace(";", ",").split(",")
+            cae_codes = [str(cae_code).strip() for cae_code in (cae_codes or []) if str(cae_code).strip()]
+            if cae_codes:
+                metadata["cae_codes"] = cae_codes
+                metadata["main_cae"] = cae_codes[0]
+                metadata["secondary_cae"] = cae_codes[1:]
 
         if not metadata.get("region") and overrides.get("region"):
             metadata["region"] = str(overrides["region"]).strip()
@@ -770,9 +546,9 @@ class NifMatchingService:
             "phases", "covered_areas", "phase_areas", "financing_rates",
             "beneficiaries_by_action", "embeddings",
         )
-        caes = [str(c).strip() for c in (client_metadata or {}).get("cae_codes", []) if c]
-        if caes:
-            prefixes = set().union(*(cae_all_prefixes(c) for c in caes))
+        cae_codes = [str(cae_code).strip() for cae_code in (client_metadata or {}).get("cae_codes", []) if cae_code]
+        if cae_codes:
+            prefixes = set().union(*(cae_all_prefixes(cae_code) for cae_code in cae_codes))
             included = GrantCae.objects.filter(
                 grant=OuterRef("pk"), kind=GrantCae.INCLUDED)
             matching = included.filter(prefix__in=prefixes)
@@ -795,8 +571,8 @@ class NifMatchingService:
         # lê-se só de onde ele está mesmo declarado: destinatários finais + beneficiários
         # por ação.
         beneficiary_parts = list(grant.final_recipients or [])
-        for b in grant.beneficiaries_by_action.all():
-            beneficiary_parts += list(b.entities or [])
+        for beneficiary in grant.beneficiaries_by_action.all():
+            beneficiary_parts += list(beneficiary.entities or [])
 
         return {
             "id": grant.id,
@@ -805,13 +581,13 @@ class NifMatchingService:
             "included_caes": grant.included_caes or [],
             "excluded_caes": grant.excluded_caes or [],
             "eligible_regions": grant.eligible_regions or [],
-            "eligibility_text": _normalize(" | ".join(str(p) for p in eligibility_parts)),
-            "beneficiary_text": _normalize(" | ".join(str(p) for p in beneficiary_parts)),
+            "eligibility_text": _normalize(" | ".join(str(eligibility_part) for eligibility_part in eligibility_parts)),
+            "beneficiary_text": _normalize(" | ".join(str(eligibility_part) for eligibility_part in beneficiary_parts)),
             # Dados para o ranking por dotação/taxa efetivas (fase ativa × área da empresa).
             "total_allocation": grant.total_allocation,
             "phases": [
-                {"id": p.id, "start_date": p.start_date, "end_date": p.end_date}
-                for p in grant.phases.all()
+                {"id": eligibility_part.id, "start_date": eligibility_part.start_date, "end_date": eligibility_part.end_date}
+                for eligibility_part in grant.phases.all()
             ],
             "covered_areas": [
                 {"id": a.id, "geographic_area": a.geographic_area}

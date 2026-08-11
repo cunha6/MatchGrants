@@ -233,6 +233,48 @@ components:
         program_url: { type: string, nullable: true, description: "GET /anuncios/{id}/document/programaConcurso/, se o ficheiro existir." }
         last_update_source: { type: string, enum: [scrape, manual] }
         last_updated_by: { type: string, nullable: true }
+        ai_detail: { $ref: "#/components/schemas/NoticeAiDetailState" }
+
+    NoticeAiDetailState:
+      type: object
+      description: "Estado + último detalhe IA cacheado do caderno de encargos (dentro de NoticeDetail — mesmos dados de POST /anuncios/{id}/detail/, sem precisar de chamar essa rota). status=pending se a geração ainda nunca foi pedida — os restantes campos vêm vazios nesse caso."
+      properties:
+        status:
+          type: string
+          enum: [pending, generating, done, error]
+        descricao_detalhada: { type: string }
+        avaliacao:
+          type: string
+          description: "Frase única com o tipo de critério de adjudicação e os fatores/pesos (ex: \"Multifator – Preço (30%) + Qualidade Técnica (70%)\", ou \"Monofator – Preço mais baixo (100%)\")."
+        observacoes:
+          type: array
+          items: { type: string }
+
+    NoticeAiDetail:
+      type: object
+      description: "Detalhe gerado por IA a partir do caderno de encargos (POST /anuncios/{id}/detail/). Prompt fixo, extração factual — não é uma opinião da IA sobre o concurso. Devolvido quando já está pronto (status=done); enquanto está a gerar, o endpoint devolve 202 (ver NoticeAiDetailGenerating)."
+      properties:
+        status:
+          type: string
+          enum: [done]
+        descricao_detalhada:
+          type: string
+          description: Descrição detalhada do objeto do procedimento, extraída do caderno de encargos.
+        avaliacao:
+          type: string
+          description: "Frase única com o tipo de critério de adjudicação (Monofator/Multifator/Outro) e os fatores/subfatores + pesos, tal como escritos no documento (ex: \"Multifator – Proposta economicamente mais vantajosa: Preço (30%) + Experiência Técnica da Equipa (35%) + Qualidade Técnica da Proposta (35%)\"). \"Monofator – Preço mais baixo (100%)\" se o critério for só o preço; \"Não foi possível identificar os critérios de avaliação no documento.\" se a secção não existir."
+        observacoes:
+          type: array
+          items: { type: string }
+          description: Lista de notas relevantes, uma por item (alvará, visita ao local, caução, prazo de execução, etc.).
+
+    NoticeAiDetailGenerating:
+      type: object
+      description: "Devolvido com 202 enquanto o detalhe IA está a ser gerado em background — repetir o pedido mais tarde (ex: ao reabrir o anúncio) devolve 200 com NoticeAiDetail quando estiver pronto."
+      properties:
+        status:
+          type: string
+          enum: [generating]
 
     NoticeEditRequest:
       type: object
@@ -345,9 +387,12 @@ components:
           type: array
           description: >-
             Além de campos em branco, `field: "email"` também aparece quando o email foi
-            preenchido mas o domínio é webmail genérico/gratuito (gmail, outlook, hotmail...)
-            ou de um serviço de email temporário/descartável conhecido — o gate exige um email
-            de empresa. Nesse caso `label` vem "Email inválido" em vez de "Email".
+            preenchido mas não serve para captar um lead de empresa — o `label` varia consoante
+            o motivo: "Email inválido" para formato incorreto ou domínio webmail
+            genérico/gratuito (gmail, outlook, hotmail...)/temporário-descartável conhecido; uma
+            mensagem dedicada ("O domínio deste email não existe — introduza um email
+            profissional da empresa.") quando o domínio, apesar de bem formatado, não tem
+            registos DNS (MX/A) — não existe de facto.
           items:
             type: object
             properties:
@@ -373,23 +418,43 @@ components:
 
     UserDetail:
       type: object
-      description: Perfil do utilizador (auth.User + users.UserProfile fundidos).
+      description: >
+        Perfil do utilizador (auth.User + users.UserProfile fundidos). Os campos variam com o
+        PAPEL: um `admin`/`commercial_grants`/`commercial_public` é uma pessoa da equipa e traz
+        SÓ os campos de identidade (id, username, first_name, email, role, is_active, is_staff,
+        is_superuser, date_joined). Os campos de ENTIDADE abaixo (NIF, CAE, morada, NUTS,
+        job_title) descrevem uma EMPRESA candidata e só saem para `client` e `viewer` — nas
+        contas internas não vêm sequer com valor nulo, estão ausentes da resposta.
       properties:
         id: { type: integer }
         username: { type: string }
         email: { type: string }
-        first_name: { type: string }
+        first_name: { type: string, description: "Nome da pessoa. Definível na criação e na atualização." }
         role: { type: string, enum: [admin, commercial_grants, commercial_public, client, viewer] }
         is_active: { type: boolean }
-        job_title: { type: string, nullable: true, description: "Função na empresa — preenchida pelo pop-up de contacto do match sem login." }
+        job_title: { type: string, nullable: true, description: "Só client/viewer. Função na empresa — preenchida pelo pop-up de contacto do match sem login." }
         nif: { type: string, nullable: true }
         entity_type: { type: string, nullable: true }
         entity_size: { type: string, nullable: true }
         main_cae: { type: string, nullable: true }
         secondary_cae: { type: array, items: { type: string } }
-        region: { type: string, nullable: true }
-        city: { type: string, nullable: true }
-        county: { type: string, nullable: true }
+        postal_code: { type: string, nullable: true, description: "Código postal introduzido no registo — fonte de city/county/region (ver POST /users/create/)." }
+        region: { type: string, nullable: true, description: "Derivado automaticamente do postal_code (CTT + NUTS), não pedido diretamente." }
+        city: { type: string, nullable: true, description: "Derivado automaticamente do postal_code." }
+        county: { type: string, nullable: true, description: "Derivado automaticamente do postal_code." }
+        matched_grants:
+          type: array
+          description: >
+            Só client. Resultado do ÚLTIMO POST /match/evaluate-nif/ feito por este client
+            sobre o PRÓPRIO NIF (substituído a cada novo match, não é um histórico
+            acumulado). Cada item tem o suficiente para o front-end linkar para
+            GET /avisos/<id>/.
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              grant_code: { type: string, nullable: true }
+              title: { type: string, nullable: true }
       additionalProperties: true
 
     UserListEnvelope:
@@ -517,6 +582,10 @@ paths:
     get:
       tags: [avisos]
       summary: Detalhe completo de um aviso
+      description: >-
+        Com sessão, qualquer aviso. Sem sessão, só os avisos devolvidos por um match feito NA
+        MESMA sessão (cookie) — trocar o id na URL para um aviso fora desse conjunto dá 404,
+        indistinguível de um id inexistente.
       parameters:
         - name: id
           in: path
@@ -529,7 +598,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/GrantDetail" }
         "404":
-          description: Aviso não encontrado
+          description: Aviso não acessível nesta sessão ou inexistente
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -572,6 +641,10 @@ paths:
     get:
       tags: [avisos]
       summary: Abre o pdf do aviso
+      description: >-
+        Mesma política de acesso do detalhe: com sessão, qualquer aviso; sem sessão, só os
+        avisos devolvidos por um match feito NA MESMA sessão (cookie). Um aviso fora desse
+        conjunto dá 404, igual a um id inexistente — o PDF não é enumerável por id.
       parameters:
         - name: id
           in: path
@@ -584,7 +657,7 @@ paths:
             application/pdf:
               schema: { type: string, format: binary }
         "404":
-          description: Aviso ou documento não disponível
+          description: Aviso não acessível nesta sessão, inexistente, ou documento indisponível
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -748,6 +821,59 @@ paths:
         "404":
           description: Anúncio não encontrado
 
+  /anuncios/{id}/detail/:
+    post:
+      tags: [contratações públicas]
+      summary: Detalhe IA do caderno de encargos
+      security: [{ sessionAuth: [] }]
+      description: >
+        NÃO bloqueia à espera do OpenAI. Se já houver um detalhe cacheado (status=done),
+        devolve-o logo com 200. Caso contrário arranca a conversão do caderno de encargos
+        para markdown + o pedido ao OpenAI numa thread de FUNDO e devolve 202 já — repetir
+        o pedido mais tarde (ex: ao reabrir o anúncio) devolve 200 quando estiver pronto.
+        Cacheado em Notice.specifications_description/evaluation/observations — uma vez
+        gerado, chamadas seguintes não repetem o custo. `?refresh=true` força uma nova
+        geração (também em background). Papel exigido: admin ou commercial_public (ao
+        contrário do detalhe simples de /anuncios/{id}/, client não tem acesso — este
+        endpoint tem custo).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: refresh
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Força nova geração mesmo que já exista um detalhe cacheado.
+      responses:
+        "200":
+          description: Detalhe já pronto (cacheado ou gerado agora, se force=true tiver terminado).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NoticeAiDetail" }
+        "202":
+          description: Ainda não há detalhe pronto — arrancou (ou já estava a decorrer) a geração em background.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NoticeAiDetailGenerating" }
+        "401":
+          description: Sem sessão
+        "403":
+          description: Sem permissão
+        "404":
+          description: Anúncio não encontrado, ou sem caderno de encargos disponível/convertível
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "405":
+          description: Método não permitido (só POST)
+        "502":
+          description: Erro a gerar o detalhe IA (ex. falha na chamada ao OpenAI)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /anuncios/{id}/document/cadernoEncargos/:
     get:
       tags: [contratações públicas]
@@ -829,7 +955,10 @@ paths:
         sem os 3 campos de contacto a resposta é 422 (mesmo mecanismo do CAE/localização em
         falta) — reenviar o mesmo NIF com email/name/job_title preenchidos devolve os
         resultados (calculados só uma vez, servidos de cache). Autenticado, só consulta —
-        `viewer_user_id` vem null, contacto é ignorado e nunca há retenção.
+        `viewer_user_id` vem null, contacto é ignorado e nunca há retenção. Se quem chama é um
+        `client` autenticado e o NIF pedido é o do PRÓPRIO perfil, os `matches` desta chamada
+        substituem `UserProfile.matched_grants` (ver `UserDetail.matched_grants`) — não
+        acumula histórico, fica só o último resultado.
       requestBody:
         required: true
         content:
@@ -864,7 +993,13 @@ paths:
       tags: [match]
       summary: Promove um viewer a client
       security: [{ sessionAuth: [] }]
-      description: "Papel exigido: admin, commercial_grants ou commercial_public."
+      description: >
+        Papel exigido: admin, commercial_grants ou commercial_public. Ao ativar, envia à conta
+        o email com o link para definir a password (só na ativação — promover de novo uma conta
+        já ativa não reenvia). Ao ATIVAR a conta,
+        qualquer password definida enquanto ela ainda era viewer é invalidada (um viewer nasce
+        de um pedido anónimo, logo essa password não é de confiança) — por isso `has_login`
+        vem a false e as credenciais são definidas depois, já com a conta ativa.
       parameters:
         - name: nif
           in: path
@@ -923,8 +1058,10 @@ paths:
       description: >
         Público. Resposta SEMPRE 200 com a mesma mensagem, exista ou não uma conta com esse
         email — nunca revela se a conta existe. Funciona mesmo para contas que nunca tiveram
-        password (viewers), servindo também para definir a primeira. Throttle de 3 pedidos /
-        15 min por email (silencioso — mesma resposta).
+        password, servindo também para definir a primeira. Só chega a contas ATIVAS: o email
+        de um viewer é escrito por um pedido anónimo (o match), por isso deixá-lo passar aqui
+        permitiria a quem soubesse o NIF público deixar uma password à espera da promoção.
+        Throttle de 3 pedidos / 15 min por email (silencioso — mesma resposta).
       requestBody:
         required: true
         content:
@@ -1029,7 +1166,25 @@ paths:
       summary: Cria um utilizador
       description: >
         Client: 403. commercial_grants/commercial_public só podem criar 'client'. Admin escolhe
-        qualquer papel. Sem sessão: cria sempre 'client' (role pedido é ignorado).
+        qualquer papel. Sem sessão: cria sempre 'client' (role pedido é ignorado) — é a rota
+        de registo público.
+
+        PASSWORD: NINGUÉM escolhe a password na criação — nem quem cria a conta de outrem (um
+        admin/comercial), nem quem se regista a si próprio (registo público, sem sessão). A
+        conta nasce sempre SEM password utilizável e a pessoa recebe logo por email o link
+        para a escolher (ver POST /users/password-reset/confirm/). Uma `password` que venha
+        no corpo é ignorada em silêncio.
+
+        CAMPOS DE ENTIDADE (role=client, o caso do registo público): `entity_type`,
+        `entity_size`, `nif`, `main_cae`, `address` e `postal_code` são obrigatórios.
+        - `nif`: tem de ser um NIF de EMPRESA/entidade válido — 9 dígitos, dígito de controlo
+          correto (algoritmo oficial), e não pode começar por 1/2/3 (NIF de pessoa singular).
+        - `email`: para além do formato, o domínio tem de existir (consulta DNS) e não pode
+          ser um webmail genérico/gratuito nem um serviço de email temporário/descartável
+          conhecido — mesma regra do gate de contacto do match (ver `common/email_validation.py`).
+        - `postal_code`: SUBSTITUI `region` como campo pedido ao utilizador — a `region`
+          (e `city`/`county`) é derivada automaticamente a partir dele (CTT + NUTS) e devolvida
+          já preenchida na resposta. `nuts_ii`/`nuts_iii` deixaram de ser obrigatórios.
       requestBody:
         required: true
         content:
@@ -1126,30 +1281,25 @@ paths:
   /users/{id}/password/:
     post:
       tags: [users]
-      summary: Altera a password
+      summary: Envia o email para definir a password
       security: [{ sessionAuth: [] }]
       description: >
-        Cada utilizador altera a própria (valida a atual); admin repõe qualquer uma;
-        commercial_grants/commercial_public repõe a de um viewer/client (sem validar a atual).
+        NÃO define uma password: dispara o link de redefinição para o email JÁ REGISTADO na
+        conta. Ninguém — nem o próprio, nem o admin — escolhe aqui uma password, pelo que ela
+        nunca passa no corpo do pedido nem pelas mãos de quem gere a conta. O link é o mesmo do
+        /users/password-reset/ (assinado, expira em 3 dias) e depois confirma-se em
+        /users/password-reset/confirm/. Alcance: o próprio; admin sobre qualquer conta;
+        commercial_grants/commercial_public sobre um viewer/client. O corpo do pedido é ignorado.
       parameters:
         - name: id
           in: path
           required: true
           schema: { type: integer }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                password: { type: string }
-                current_password: { type: string, description: "Obrigatória exceto para admin." }
       responses:
         "200":
-          description: OK
+          description: Email enviado
         "400":
-          description: Password atual incorreta ou nova password inválida
+          description: A conta não tem email registado, ou está inativa
         "403":
           description: Sem permissão
         "404":

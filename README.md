@@ -113,8 +113,15 @@ Passos-chave:
 
 ```bash
 # 1. Variáveis de ambiente (ver .env.example se existir; mínimo abaixo)
-#    DJANGO_SECRET_KEY, DEBUG, ALLOWED_HOSTS, OPENAI_API_KEY,
-#    NIF_KEY (+ NIF_KEY1..4 opcionais), OPENROUTER_API_KEY, EMAIL_* (opcional)
+#    DJANGO_SECRET_KEY, DJANGO_DEBUG, DJANGO_ALLOWED_HOSTS, OPENAI_API_KEY,
+#    NIF_KEY (+ NIF_KEY1..4 opcionais), OPENROUTER_API_KEY + OPENROUTER_API_KEY1
+#    (o sistema roda entre as duas), EMAIL_* (opcional)
+#
+#    Com DJANGO_DEBUG=false, DJANGO_SECRET_KEY e DJANGO_ALLOWED_HOSTS são OBRIGATÓRIAS —
+#    a app recusa arrancar sem elas (ImproperlyConfigured). É deliberado: a chave de
+#    desenvolvimento está no repositório e assina os tokens de reset de password, por isso
+#    arrancar em produção com ela seria dar a qualquer conta a quem leia o código.
+#    Gerar uma: python -c "from django.core.management.utils import get_random_secret_key as g; print(g())"
 
 # 2. Subir Postgres + app
 docker compose up -d --build
@@ -122,10 +129,14 @@ docker compose up -d --build
 # 3. Migrações
 docker compose exec app python manage.py migrate
 
-# 4. (opcional) carregar o enriquecimento por NIF para o SQLite
+# 4. Tabela do cache (throttle do reset de password + match retido à espera do contacto;
+#    tem de ser partilhada entre workers — ver CACHES em main/settings.py)
+docker compose exec app python manage.py createcachetable
+
+# 5. (opcional) carregar o enriquecimento por NIF para o SQLite
 docker compose exec app python manage.py load_nif_dictionary
 
-# 5. Testes
+# 6. Testes
 docker compose exec app python manage.py test
 ```
 
@@ -151,6 +162,7 @@ Outras rotas:
 
 | Método | Rota | Descrição |
 |--------|------|-----------|
+| POST | `/anuncios/<id>/detail/` | Detalhe IA do caderno de encargos (descrição detalhada, critérios de avaliação, observações) — prompt fixo, cacheado, gera em background (202 enquanto gera, 200 quando pronto), `?refresh=true` força nova geração. |
 | POST | `/match/evaluate-nif/` | Match de um NIF → avisos elegíveis ordenados. |
 | POST | `/match/promote/<nif>/` | Promove um *viewer* (lead) a *client* (admin/commercial_grants/commercial_public). |
 | GET | `/planned-grants/` | Avisos previstos (Plano Anual) a partir de hoje, paginados/ordenáveis. |
@@ -162,9 +174,30 @@ Outras rotas:
 
 ## Testes
 
-Suite em `*/tests.py` (297 testes). As integrações externas (OpenAI, nif.pt, OpenRouter) são
+Suite em `*/tests.py` (550 testes). As integrações externas (OpenAI, nif.pt, OpenRouter) são
 sempre *mockadas* — os testes não fazem chamadas de rede. *Linting* com **ruff** e cobertura via
 GitHub Actions (`.github/workflows`).
+
+### Cobertura
+
+Tudo corre **dentro do container**, como os testes: o `.coverage` guarda caminhos absolutos de
+onde a medição correu (`/app/...`), por isso medir no container e ler no host não funciona.
+
+```bash
+# O coverage está em requirements-dev.txt; a imagem só instala o requirements.txt.
+docker compose exec app pip install coverage
+
+docker compose exec app coverage run manage.py test --noinput   # mede
+docker compose exec app coverage report        # tabela por FICHEIRO (config em .coveragerc)
+docker compose exec app coverage html          # navegável -> htmlcov/index.html
+
+# Vista por APP (a que falta ao coverage.py) — lê o .coverage, não repete os testes:
+docker compose exec app python scripts/coverage_by_app.py
+docker compose exec app python scripts/coverage_by_app.py --html   # + htmlcov/<app>/
+```
+
+Os relatórios aparecem em `htmlcov/` no teu disco (a pasta do projeto está montada no
+container) e estão no `.gitignore`.
 
 ## Decisões de arquitetura
 

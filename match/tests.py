@@ -5,8 +5,11 @@ these exercise scoring_rules directly, so they run fast and offline.
 """
 
 import json
+from types import SimpleNamespace
+import requests
 from unittest import mock
 
+from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.core import mail
 from django.core.cache import cache
@@ -27,11 +30,22 @@ from match.scoring_rules import (
 )
 from datetime import datetime
 
+from email_validator import validate_email as _real_validate_email
+
+from common.disposable_email import is_disposable_email
+from common.email_validation import (
+    email_error_label as _email_error_label,
+    EMAIL_INVALID_LABEL as _EMAIL_INVALID_LABEL,
+    EMAIL_UNDELIVERABLE_LABEL as _EMAIL_UNDELIVERABLE_LABEL,
+    _dns_resolver as _email_dns_resolver,
+)
+from match.leads import promote_viewer_to_client
 from match.services import (
-    NifMatchingService, MissingClientDataError, _next_nif_key,
+    NifMatchingService, MissingClientDataError, NifServiceError, _next_nif_key,
     _company_sector_text, _company_general_text,
 )
-from match.disposable_email import is_disposable_email
+from match import llm_validation
+from match.llm_validation import _next_api_key
 from match.models import NifCompany
 from match import grant_embeddings
 from match.grant_embeddings import build_general_embedding_text, build_sector_embedding_text
@@ -347,6 +361,22 @@ class NifKeyRotationTests(SimpleTestCase):
         self.assertEqual(_next_nif_key(), "ONLY")
         self.assertEqual(_next_nif_key(), "ONLY")
 
+    def test_api_key_never_reaches_the_logs(self):
+        # A str() das exceções do requests inclui o URL, e o URL leva a NIF_KEY. Os logs vão
+        # para a consola e para ficheiro — uma chave de API não pode ficar lá.
+        service = NifMatchingService(api_key="CHAVE-SECRETA-123")
+        boom = requests.ConnectionError(
+            "HTTPSConnectionPool(host='www.nif.pt'): Max retries with url: "
+            "/?json=1&q=500829993&key=CHAVE-SECRETA-123"
+        )
+        with mock.patch("match.services.requests.get", side_effect=boom):
+            with self.assertLogs("match.services", level="WARNING") as captured:
+                with self.assertRaises(NifServiceError):
+                    service.fetch_company("500829993")
+        logged = "\n".join(captured.output)
+        self.assertNotIn("CHAVE-SECRETA-123", logged)
+        self.assertIn("***", logged)
+
     @override_settings(NIF_KEYS=[], NIF_KEY="FALLBACK")
     def test_fallback_to_single_nif_key(self):
         self.assertEqual(_next_nif_key(), "FALLBACK")
@@ -497,6 +527,60 @@ class DisposableEmailTests(SimpleTestCase):
         self.assertFalse(is_disposable_email(None))
 
 
+class EmailDeliverabilityTests(SimpleTestCase):
+    """_email_error_label: além do formato, verifica que o DOMÍNIO existe de facto (DNS
+    MX/A, via email_validator). DNS sempre MOCKADO — nenhum destes testes toca a rede;
+    quem quiser confirmar o comportamento real tem de o fazer manualmente."""
+
+    def test_valid_email_with_existing_domain_returns_none(self):
+        with mock.patch("common.email_validation.validate_email", return_value=None) as validate:
+            self.assertIsNone(_email_error_label("ana@empresa.pt"))
+        validate.assert_called_once_with(
+            "ana@empresa.pt", check_deliverability=True, dns_resolver=_email_dns_resolver)
+
+    def test_nonexistent_domain_returns_specific_corporate_email_label(self):
+        from email_validator import EmailUndeliverableError
+        with mock.patch("common.email_validation.validate_email",
+                        side_effect=EmailUndeliverableError("no MX record")):
+            label = _email_error_label("ana@dominio-que-nao-existe-xyz.pt")
+        self.assertEqual(label, _EMAIL_UNDELIVERABLE_LABEL)
+        self.assertIn("profissional", label)  # orienta para um email corporativo
+
+    def test_malformed_syntax_returns_generic_invalid_label(self):
+        from email_validator import EmailSyntaxError
+        with mock.patch("common.email_validation.validate_email",
+                        side_effect=EmailSyntaxError("missing @")):
+            label = _email_error_label("x")
+        self.assertEqual(label, _EMAIL_INVALID_LABEL)
+
+    def test_dns_lookup_failure_degrades_to_valid(self):
+        # Uma falha de REDE/DNS (não do email em si) não pode bloquear um lead real — mesma
+        # filosofia de degradação graciosa do resto do projeto (nif.pt, OpenRouter).
+        with mock.patch("common.email_validation.validate_email", side_effect=OSError("dns down")):
+            self.assertIsNone(_email_error_label("ana@empresa.pt"))
+
+    def test_non_string_value_is_invalid(self):
+        self.assertEqual(_email_error_label(123), _EMAIL_INVALID_LABEL)
+
+    def test_empty_string_is_invalid(self):
+        self.assertEqual(_email_error_label("   "), _EMAIL_INVALID_LABEL)
+
+    def test_deliverable_but_disposable_domain_is_still_rejected(self):
+        # O domínio existe (mailinator.com é real) mas continua a ser lixo — a verificação
+        # de deliverability não substitui a de descartável/webmail, soma-se a ela.
+        with mock.patch("common.email_validation.validate_email", return_value=None):
+            label = _email_error_label("ana@mailinator.com")
+        self.assertEqual(label, _EMAIL_INVALID_LABEL)
+
+    def test_disposable_domain_short_circuits_before_dns_lookup(self):
+        # O descartável/webmail é uma consulta LOCAL (JSON em memória) — corre antes do DNS,
+        # para um domínio já sabido lixo não pagar o timeout/latência da consulta de rede.
+        with mock.patch("common.email_validation.validate_email") as validate:
+            label = _email_error_label("ana@mailinator.com")
+        self.assertEqual(label, _EMAIL_INVALID_LABEL)
+        validate.assert_not_called()
+
+
 class ViewerCreationTests(TestCase):
     """O viewer (lead) só nasce de um match NÃO autenticado. Um utilizador autenticado
     (admin, composer…) está a consultar — não polui a BD com viewers."""
@@ -517,6 +601,17 @@ class ViewerCreationTests(TestCase):
             NifMatchingService, "fetch_company", return_value=self.NIF_RECORD)
         self.vectors = mock.patch.object(
             NifMatchingService, "_company_vectors", return_value={})
+        # A verificação de DOMÍNIO (consulta DNS real) fica sempre mockada aqui — só a
+        # sintaxe é verificada de facto (mesmo comportamento de antes desta funcionalidade
+        # existir; os testes de deliverability propriamente dita vivem em
+        # EmailDeliverabilityTests, isolados e sem depender de rede).
+        email_syntax_only = mock.patch(
+            "common.email_validation.validate_email",
+            side_effect=lambda email, check_deliverability=True, dns_resolver=None: _real_validate_email(
+                email, check_deliverability=False),
+        )
+        email_syntax_only.start()
+        self.addCleanup(email_syntax_only.stop)
         cache.clear()  # isola o cache do gate de contacto entre testes (mesmo NIF em vários)
 
     def test_anonymous_match_creates_viewer(self):
@@ -581,6 +676,31 @@ class ViewerCreationTests(TestCase):
         self.assertEqual(user.profile.role, UserProfile.CLIENT)
         self.assertEqual(user.profile.address, "Morada original")  # intacto
 
+    def test_anonymous_match_cannot_hijack_a_promoted_account(self):
+        # SEGURANÇA: o NIF de uma empresa é público. Sem a guarda `is_viewer`, um match
+        # ANÓNIMO com esse NIF reescrevia o email da conta já promovida e o atacante pedia
+        # depois um link em /users/password-reset/ para o SEU email — tomando a conta.
+        victim = User.objects.create_user(
+            "cliente_promovido", email="real@empresa.pt", password="Xk93!vTq21mZ")
+        victim.profile.nif = "500829993"
+        victim.profile.role = UserProfile.CLIENT
+        victim.profile.job_title = "Diretor"
+        victim.profile.save()
+
+        with self.fetch, self.vectors:
+            NifMatchingService().evaluate(
+                "500829993", create_viewer=True,
+                contact={"email": "atacante@dominio-mau.pt", "name": "Atacante",
+                         "job_title": "Hacker"})
+
+        victim.refresh_from_db()
+        victim.profile.refresh_from_db()
+        self.assertEqual(victim.email, "real@empresa.pt")     # email intacto
+        self.assertEqual(victim.first_name, "")               # nome não foi sobrescrito
+        self.assertEqual(victim.profile.job_title, "Diretor")  # função intacta
+        self.assertEqual(victim.profile.role, UserProfile.CLIENT)
+        self.assertEqual(len(mail.outbox), 0)  # nem sequer um email de boas-vindas
+
     # --- Gate de contacto (email/nome/função) — só quem não tem sessão ---------------
 
     def test_anonymous_match_without_contact_is_gated(self):
@@ -607,8 +727,10 @@ class ViewerCreationTests(TestCase):
 
     def test_disposable_email_domain_is_gated_as_invalid(self):
         # Domínio de email descartável conhecido (ver match/disposable_email_domains.json) —
-        # tratado como "em falta", com label distinta para o front-end saber porquê.
-        with self.fetch, self.vectors:
+        # tratado como "em falta", com label distinta para o front-end saber porquê. Rejeitado
+        # ANTES de sequer chamar o nif.pt (ver test_invalid_submitted_contact_never_calls_nif
+        # abaixo) — por isso nem chega a criar lead nenhum desta vez.
+        with self.fetch as fetch_mock, self.vectors:
             with self.assertRaises(MissingClientDataError) as ctx:
                 NifMatchingService().evaluate(
                     "500829993", create_viewer=True,
@@ -617,11 +739,135 @@ class ViewerCreationTests(TestCase):
         fields = {(f["field"], f["label"]) for f in ctx.exception.fields}
         self.assertEqual(fields, {("email", "Email inválido")})
 
-        # O email descartável não pode ficar gravado no perfil nem disparar o email de
-        # boas-vindas — é tratado como se não tivesse vindo (ver evaluate/safe_contact).
-        user = User.objects.get(username="500829993")
-        self.assertEqual(user.email, "")
+        fetch_mock.assert_not_called()
+        self.assertFalse(User.objects.filter(username="500829993").exists())
         self.assertEqual(len(mail.outbox), 0)
+
+    def test_invalid_submitted_contact_never_calls_nif(self):
+        # A validação do contacto (formato + disposable_email_domains.json) é local e
+        # instantânea — rejeita-se ANTES de tocar em nif.pt/embeddings/LLM (a parte lenta do
+        # match). Sem isto, submeter o pop-up com um email óbvio (gmail.com, mailinator.com…)
+        # entrava no "pop-up de procura" do front-end e ficava ali preso o tempo do match
+        # inteiro só para no fim mostrar um erro que já se sabia antes de começar.
+        with self.fetch as fetch_mock, self.vectors:
+            with self.assertRaises(MissingClientDataError):
+                NifMatchingService().evaluate(
+                    "500829993", create_viewer=True,
+                    contact={"email": "ana@mailinator.com", "name": "Ana Silva",
+                            "job_title": "Sócia-Gerente"})
+        fetch_mock.assert_not_called()
+
+    def test_bare_nif_without_contact_still_calls_nif(self):
+        # Sem contacto nenhum (1ª chamada, só o NIF, antes do pop-up aparecer) a pesquisa
+        # continua a correr por inteiro como sempre — só se salta quando o contacto foi mesmo
+        # SUBMETIDO e é inválido (ver teste acima).
+        with self.fetch as fetch_mock, self.vectors:
+            with self.assertRaises(MissingClientDataError):
+                NifMatchingService().evaluate("500829993", create_viewer=True)
+        fetch_mock.assert_called_once()
+
+    def test_retrying_with_still_invalid_email_does_not_call_nif(self):
+        # Repetir com o MESMO email inválido (ex: gmail.com/mailinator.com) continua a não
+        # pagar o nif.pt (lento, limitado a 1 pedido/minuto) — agora nem a 1ª tentativa chega
+        # a chamá-lo, quanto mais as seguintes.
+        bad_contact = {"email": "ana@mailinator.com", "name": "Ana Silva",
+                       "job_title": "Sócia-Gerente"}
+        with self.fetch as fetch_mock, self.vectors:
+            for _ in range(3):
+                with self.assertRaises(MissingClientDataError):
+                    NifMatchingService().evaluate("500829993", create_viewer=True,
+                                                  contact=bad_contact)
+            fetch_mock.assert_not_called()
+
+            # Corrige o email — só agora é que faz sentido chamar o nif.pt.
+            result = NifMatchingService().evaluate(
+                "500829993", create_viewer=True, contact=self.CONTACT)
+            self.assertEqual(fetch_mock.call_count, 1)
+        self.assertIsNotNone(result["viewer_user_id"])
+        self.assertEqual(User.objects.get(username="500829993").email, "ana@xpto.pt")
+
+    def test_anonymous_match_cannot_overwrite_an_existing_lead_contact(self):
+        # O 1º contacto fica. Sem isto, quem soubesse o NIF público apontava a ficha do lead
+        # ao seu próprio email e passava a receber tudo o que lhe fosse enviado.
+        with self.fetch, self.vectors:
+            NifMatchingService().evaluate("500829993", create_viewer=True,
+                                          contact=self.CONTACT)
+            NifMatchingService().evaluate(
+                "500829993", create_viewer=True,
+                contact={"email": "atacante@dominio-mau.pt", "name": "Atacante",
+                         "job_title": "Hacker"})
+
+        user = User.objects.get(username="500829993")
+        self.assertEqual(user.email, "ana@xpto.pt")       # contacto original intacto
+        self.assertEqual(user.first_name, "Ana Silva")
+        self.assertEqual(user.profile.job_title, "Sócia-Gerente")
+
+    def test_malformed_email_is_gated_as_invalid(self):
+        # Uma string qualquer não é um email — sem validação de formato, "x" passava o gate
+        # e revelava os matches todos.
+        with self.fetch, self.vectors:
+            with self.assertRaises(MissingClientDataError) as ctx:
+                NifMatchingService().evaluate(
+                    "500829993", create_viewer=True,
+                    contact={"email": "x", "name": "Ana", "job_title": "Sócia"})
+        self.assertEqual({(f["field"], f["label"]) for f in ctx.exception.fields},
+                         {("email", "Email inválido")})
+
+    def test_non_string_email_does_not_crash(self):
+        # O corpo é JSON do cliente: {"email": 123} chegava a is_disposable_email e rebentava
+        # com AttributeError (HTTP 500) em vez de dar o 422 normal.
+        with self.fetch, self.vectors:
+            with self.assertRaises(MissingClientDataError) as ctx:
+                NifMatchingService().evaluate(
+                    "500829993", create_viewer=True,
+                    contact={"email": 123, "name": "Ana", "job_title": "Sócia"})
+        self.assertEqual({f["field"] for f in ctx.exception.fields}, {"email"})
+
+    def test_lead_is_registered_even_when_cae_is_missing(self):
+        # O viewer serve para guardar QUEM consultou; um NIF sem CAE ainda pede mais dados
+        # (422), mas o lead tem de ficar registado na mesma.
+        sem_cae = {**self.NIF_RECORD, "cae": []}
+        with mock.patch.object(NifMatchingService, "fetch_company", return_value=sem_cae), \
+             self.vectors:
+            with self.assertRaises(MissingClientDataError) as ctx:
+                NifMatchingService().evaluate("500829993", create_viewer=True,
+                                              contact=self.CONTACT)
+        self.assertIn("cae", {f["field"] for f in ctx.exception.fields})
+        self.assertTrue(UserProfile.objects.filter(nif="500829993").exists())
+
+    def test_pending_match_cache_is_isolated_per_session(self):
+        # Sem scope, o visitante B consumia o match retido do visitante A (mesmo NIF) e A
+        # ficava sem cache, a pagar um recálculo completo.
+        with self.fetch as fetch_mock, self.vectors:
+            with self.assertRaises(MissingClientDataError):
+                NifMatchingService().evaluate("500829993", create_viewer=True,
+                                              cache_scope="sessao-A")
+            self.assertEqual(fetch_mock.call_count, 1)
+
+            # B, com contacto completo, NÃO apanha o que ficou em cache para A — recalcula.
+            NifMatchingService().evaluate("500829993", create_viewer=True,
+                                          contact=self.CONTACT, cache_scope="sessao-B")
+            self.assertEqual(fetch_mock.call_count, 2)
+
+            # E a entrada de A continua lá: quando A completa o contacto, vem do cache.
+            NifMatchingService().evaluate("500829993", create_viewer=True,
+                                          contact=self.CONTACT, cache_scope="sessao-A")
+            self.assertEqual(fetch_mock.call_count, 2)  # não subiu — reaproveitou
+
+    def test_changing_overrides_recomputes_instead_of_serving_stale_cache(self):
+        # Reenviar com o CAE corrigido tem de recalcular — a chave do cache inclui os
+        # overrides, senão devolvia o match calculado para o valor ANTIGO.
+        with self.fetch as fetch_mock, self.vectors:
+            with self.assertRaises(MissingClientDataError):
+                NifMatchingService().evaluate(
+                    "500829993", overrides={"region": "Norte"},
+                    create_viewer=True, cache_scope="s1")
+            self.assertEqual(fetch_mock.call_count, 1)
+
+            NifMatchingService().evaluate(
+                "500829993", overrides={"region": "Algarve"},  # utilizador corrigiu
+                create_viewer=True, contact=self.CONTACT, cache_scope="s1")
+            self.assertEqual(fetch_mock.call_count, 2)  # recalculou, não serviu o antigo
 
     def test_authenticated_match_ignores_missing_contact(self):
         # Um admin/comercial nunca é gated — o gate só existe para captar leads.
@@ -723,6 +969,92 @@ class ViewerCreationTests(TestCase):
             {f["field"] for f in body["missing_fields"]}, {"email", "name", "job_title"})
 
 
+class ClientMatchHistoryTests(TestCase):
+    """Um client autenticado a consultar o PRÓPRIO NIF: os avisos devolvidos ficam gravados
+    no perfil (UserProfile.matched_grants) — aparecem depois nos detalhes da conta
+    (ver users/service.py:_serialize)."""
+
+    def _grant(self, code):
+        from avisos.models import Grant
+        return Grant.objects.create(
+            source="portugal", scraping_url=f"https://x/{code}/", grant_code=code,
+            title=f"Aviso {code}", ai_processed=True, active=True,
+        )
+
+    def setUp(self):
+        self.grant_a = self._grant("A")
+        self.grant_b = self._grant("B")
+        self.client_user = User.objects.create_user("cliente_y", password="Xk93!vTq21mZ")
+        self.client_user.profile.role = UserProfile.CLIENT
+        self.client_user.profile.nif = "500829993"
+        self.client_user.profile.save()
+
+    @staticmethod
+    def _evaluate_result(nif, grants):
+        return {
+            "company": {}, "nif": nif, "viewer_user_id": None,
+            "matches": [{"opportunity_id": g.id, "grant_code": g.grant_code, "title": g.title}
+                        for g in grants],
+        }
+
+    def test_client_match_on_own_nif_saves_matched_grants(self):
+        self.client.force_login(self.client_user)
+        with mock.patch.object(
+            NifMatchingService, "evaluate",
+            return_value=self._evaluate_result("500829993", [self.grant_a, self.grant_b]),
+        ):
+            self.client.post("/match/evaluate-nif/",
+                             data=json.dumps({"nif": "500829993"}), content_type="application/json")
+        self.client_user.profile.refresh_from_db()
+        self.assertEqual(
+            set(self.client_user.profile.matched_grants.values_list("id", flat=True)),
+            {self.grant_a.id, self.grant_b.id},
+        )
+
+    def test_client_match_on_someone_elses_nif_does_not_save(self):
+        # SEGURANÇA/CORREÇÃO: um client a testar um NIF que não é o seu não deve "herdar"
+        # avisos alheios no próprio perfil.
+        self.client.force_login(self.client_user)
+        with mock.patch.object(
+            NifMatchingService, "evaluate",
+            return_value=self._evaluate_result("999999999", [self.grant_a]),
+        ):
+            self.client.post("/match/evaluate-nif/",
+                             data=json.dumps({"nif": "999999999"}), content_type="application/json")
+        self.client_user.profile.refresh_from_db()
+        self.assertEqual(self.client_user.profile.matched_grants.count(), 0)
+
+    def test_admin_match_does_not_save_to_own_profile(self):
+        # Um admin/comercial está a CONSULTAR, não a gerar o histórico da própria conta.
+        admin = User.objects.create_user("admin_y", password="Xk93!vTq21mZ")
+        admin.profile.role = UserProfile.ADMIN
+        admin.profile.save()
+        self.client.force_login(admin)
+        with mock.patch.object(
+            NifMatchingService, "evaluate",
+            return_value=self._evaluate_result("500829993", [self.grant_a]),
+        ):
+            self.client.post("/match/evaluate-nif/",
+                             data=json.dumps({"nif": "500829993"}), content_type="application/json")
+        admin.profile.refresh_from_db()
+        self.assertEqual(admin.profile.matched_grants.count(), 0)
+
+    def test_matched_grants_replaces_previous_set(self):
+        self.client_user.profile.matched_grants.set([self.grant_a])
+        self.client.force_login(self.client_user)
+        with mock.patch.object(
+            NifMatchingService, "evaluate",
+            return_value=self._evaluate_result("500829993", [self.grant_b]),
+        ):
+            self.client.post("/match/evaluate-nif/",
+                             data=json.dumps({"nif": "500829993"}), content_type="application/json")
+        self.client_user.profile.refresh_from_db()
+        self.assertEqual(
+            list(self.client_user.profile.matched_grants.values_list("id", flat=True)),
+            [self.grant_b.id],
+        )
+
+
 class CaePrefilterTests(TestCase):
     """Prefiltro CAE em SQL (via tabela GrantCae): estreita o conjunto no Postgres mantendo a
     semântica EXATA — é impossível ser CAE-elegível fora do conjunto devolvido."""
@@ -804,13 +1136,13 @@ class LlmValidationTests(TestCase):
 
     def test_no_key_returns_empty(self):
         from match import llm_validation
-        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": ""}):
+        with override_settings(OPENROUTER_API_KEYS=[], OPENROUTER_API_KEY=None):
             self.assertEqual(
                 llm_validation.validate_matches({"nif": "1"}, [self._grant("A")]), {})
 
     def test_empty_grants_returns_empty(self):
         from match import llm_validation
-        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}):
+        with override_settings(OPENROUTER_API_KEYS=["k"]):
             self.assertEqual(llm_validation.validate_matches({"nif": "1"}, []), {})
 
     def test_parses_verdicts(self):
@@ -819,7 +1151,7 @@ class LlmValidationTests(TestCase):
         content = json.dumps([
             {"id": g.id, "adequate": False, "reason": "É para gestoras de resíduos."},
         ])
-        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}), \
+        with override_settings(OPENROUTER_API_KEYS=["k"]), \
              mock.patch("match.llm_validation.requests.post", return_value=self._fake_response(content)):
             verdicts = llm_validation.validate_matches({"nif": "1", "activity": "consultoria"}, [g])
         self.assertEqual(verdicts[g.id]["adequate"], False)
@@ -829,16 +1161,15 @@ class LlmValidationTests(TestCase):
         from match import llm_validation
         g = self._grant("B")
         content = "Aqui está:\n```json\n[{\"id\": %d, \"adequate\": true, \"reason\": \"ok\"}]\n```" % g.id
-        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}), \
+        with override_settings(OPENROUTER_API_KEYS=["k"]), \
              mock.patch("match.llm_validation.requests.post", return_value=self._fake_response(content)):
             verdicts = llm_validation.validate_matches({"nif": "1"}, [g])
         self.assertTrue(verdicts[g.id]["adequate"])
 
     def test_http_error_returns_empty(self):
         from match import llm_validation
-        import requests
         g = self._grant("C")
-        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}), \
+        with override_settings(OPENROUTER_API_KEYS=["k"]), \
              mock.patch("match.llm_validation.requests.post",
                         side_effect=requests.RequestException("boom")):
             self.assertEqual(llm_validation.validate_matches({"nif": "1"}, [g]), {})
@@ -846,7 +1177,7 @@ class LlmValidationTests(TestCase):
     def test_illegible_response_returns_empty(self):
         from match import llm_validation
         g = self._grant("D")
-        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}), \
+        with override_settings(OPENROUTER_API_KEYS=["k"]), \
              mock.patch("match.llm_validation.requests.post",
                         return_value=self._fake_response("desculpa, não percebi")):
             self.assertEqual(llm_validation.validate_matches({"nif": "1"}, [g]), {})
@@ -857,10 +1188,59 @@ class LlmValidationTests(TestCase):
         from match import llm_validation
         g = self._grant("E")
         body = {"error": {"message": "Upstream error from Nvidia: ResourceExhausted", "code": 502}}
-        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}), \
+        with override_settings(OPENROUTER_API_KEYS=["k"]), \
              mock.patch("match.llm_validation.requests.post",
                         return_value=self._fake_error_body(body, status=200)):
             self.assertEqual(llm_validation.validate_matches({"nif": "1"}, [g]), {})
+
+    def test_retries_after_transient_failure_then_succeeds(self):
+        # 1ª tentativa falha (rede), 2ª tem sucesso — não pode desistir à primeira falha
+        # transitória (ver _MAX_ATTEMPTS).
+        from match import llm_validation
+        g = self._grant("F")
+        content = json.dumps([{"id": g.id, "adequate": True, "reason": "ok"}])
+        with override_settings(OPENROUTER_API_KEYS=["k"]), \
+             mock.patch("match.llm_validation.requests.post",
+                        side_effect=[requests.RequestException("boom"),
+                                    self._fake_response(content)]) as post:
+            verdicts = llm_validation.validate_matches({"nif": "1"}, [g])
+        self.assertTrue(verdicts[g.id]["adequate"])
+        self.assertEqual(post.call_count, 2)
+
+    def test_gives_up_after_max_attempts(self):
+        # Todas as tentativas falham (rede) — desiste ao fim de _MAX_ATTEMPTS, não insiste
+        # para sempre.
+        from match import llm_validation
+        g = self._grant("G")
+        with override_settings(OPENROUTER_API_KEYS=["k"]), \
+             mock.patch("match.llm_validation.requests.post",
+                        side_effect=requests.RequestException("boom")) as post:
+            self.assertEqual(llm_validation.validate_matches({"nif": "1"}, [g]), {})
+        self.assertEqual(post.call_count, llm_validation._MAX_ATTEMPTS)
+
+    def test_retry_rotates_through_both_keys(self):
+        # Com duas chaves configuradas, cada tentativa roda para a seguinte (mesma lógica de
+        # _next_api_key) — a chave da 2ª tentativa é sempre DIFERENTE da 1ª. Comparação por
+        # conjunto (não por ordem exata): o índice global pode já ter avançado por causa de
+        # outros testes (ver OpenRouterKeyRotationTests).
+        from match import llm_validation
+        g = self._grant("H")
+        content = json.dumps([{"id": g.id, "adequate": True, "reason": "ok"}])
+        seen_keys = []
+
+        def fake_post(url, headers, data, timeout):
+            seen_keys.append(headers["Authorization"])
+            if len(seen_keys) == 1:
+                raise requests.RequestException("boom")
+            return self._fake_response(content)
+
+        with override_settings(OPENROUTER_API_KEYS=["chave-1", "chave-2"]), \
+             mock.patch("match.llm_validation.requests.post", side_effect=fake_post):
+            verdicts = llm_validation.validate_matches({"nif": "1"}, [g])
+        self.assertTrue(verdicts[g.id]["adequate"])
+        self.assertEqual(len(seen_keys), 2)
+        self.assertNotEqual(seen_keys[0], seen_keys[1])
+        self.assertEqual(set(seen_keys), {"Bearer chave-1", "Bearer chave-2"})
 
     def test_apply_llm_validation_filters_non_adequate(self):
         # A camada de integração: remove os não-adequados, mantém os adequados e os desconhecidos.
@@ -1102,3 +1482,148 @@ class EffectiveBudgetRateTests(SimpleTestCase):
         self.assertEqual(
             max_financing_rate_from_rates([{"max_global_rate": "60,0"}, {"base_rate": "40%"}]), 60.0)
         self.assertIsNone(max_financing_rate_from_rates([]))
+
+
+class LeadTakeoverChainTests(TestCase):
+    """A cadeia completa que permitia tomar a conta de uma empresa a partir do NIF público:
+    match anónimo escreve o email -> /users/password-reset/ manda o link para o atacante ->
+    atacante define uma password -> a promoção ativava a conta SEM lhe tocar na password.
+    Cada teste fecha um elo; o último percorre a cadeia toda."""
+
+    def setUp(self):
+        cache.clear()
+        self.viewer = User.objects.create_user(
+            "500829993", email="atacante@dominio-mau.pt", is_active=False)
+        self.viewer.set_unusable_password()
+        self.viewer.save()
+        self.viewer.profile.nif = "500829993"
+        self.viewer.profile.role = UserProfile.VIEWER
+        self.viewer.profile.save()
+
+    def test_password_reset_does_not_reach_an_inactive_viewer(self):
+        from users import service as users_service
+        users_service.request_password_reset("atacante@dominio-mau.pt")
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_promotion_invalidates_a_password_set_while_viewer(self):
+        # Mesmo que uma password chegue a ser definida na janela de viewer, ativar a conta
+        # tem de a invalidar — senão o atacante entrava assim que alguém promovesse o lead.
+        self.viewer.set_password("passwordDoAtacante123")
+        self.viewer.save()
+
+        result = promote_viewer_to_client("500829993")
+
+        self.viewer.refresh_from_db()
+        self.assertTrue(self.viewer.is_active)                       # foi promovido
+        self.assertEqual(self.viewer.profile.role, UserProfile.CLIENT)
+        self.assertFalse(self.viewer.check_password("passwordDoAtacante123"))
+        self.assertFalse(self.viewer.has_usable_password())
+        self.assertFalse(result["has_login"])  # sinaliza a quem gere que falta definir
+
+    def test_full_chain_cannot_log_in_after_promotion(self):
+        from users import service as users_service
+        # 1+2. Atacante tenta receber o link de reset para a conta que aponta ao seu email.
+        users_service.request_password_reset("atacante@dominio-mau.pt")
+        self.assertEqual(len(mail.outbox), 0)  # elo cortado logo aqui
+
+        # 3. Ainda assim, assumindo que conseguisse definir a password por outra via...
+        self.viewer.set_password("passwordDoAtacante123")
+        self.viewer.save()
+
+        # 4. ...a promoção invalida-a, por isso o login falha.
+        promote_viewer_to_client("500829993")
+        self.assertIsNone(authenticate(username="500829993",
+                                       password="passwordDoAtacante123"))
+
+    def test_promotion_sends_the_email_to_set_a_password(self):
+        # A conta fica ativa mas SEM password utilizavel — sem este email ficaria sem forma
+        # de entrar ate alguem se lembrar de o disparar a mao.
+        mail.outbox.clear()
+        promote_viewer_to_client("500829993")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["atacante@dominio-mau.pt"])
+
+    def test_promoting_an_already_active_account_does_not_resend(self):
+        self.viewer.is_active = True
+        self.viewer.save(update_fields=["is_active"])
+        mail.outbox.clear()
+        promote_viewer_to_client("500829993")
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_promotion_keeps_password_of_an_already_active_account(self):
+        # Só a ATIVAÇÃO invalida. Promover de novo uma conta já ativa (idempotente) não pode
+        # destruir as credenciais legítimas de um client a trabalhar.
+        self.viewer.is_active = True
+        self.viewer.set_password("passwordLegitima123")
+        self.viewer.save()
+
+        promote_viewer_to_client("500829993")
+
+        self.viewer.refresh_from_db()
+        self.assertTrue(self.viewer.check_password("passwordLegitima123"))
+
+
+def _fake_grant(grant_id: int):
+    """Aviso mínimo que o _grant_payload consegue serializar (um MagicMock não vai a JSON)."""
+    return SimpleNamespace(
+        id=grant_id, grant_code=f"A-{grant_id}", title="t", objective="o",
+        specific_objective="so", covered_actions="ca",
+        included_caes=[], excluded_caes=[], eligible_regions=[],
+        target_technology_sectors=[], beneficiary_eligibility_criteria=[],
+        operation_eligibility_criteria=[], final_recipients=[],
+        covered_areas=SimpleNamespace(all=lambda: []),
+    )
+
+
+class OpenRouterKeyRotationTests(SimpleTestCase):
+    """A validação LLM roda entre OPENROUTER_API_KEY e OPENROUTER_API_KEY1..N, uma por
+    chamada, para não esgotar o limite gratuito de uma só. Testes independentes do índice
+    global (outros testes podem tê-lo avançado): comparam por conjunto e por ciclo."""
+
+    @override_settings(OPENROUTER_API_KEYS=["K1", "K2"])
+    def test_alternates_between_the_two_keys(self):
+        first, second = _next_api_key(), _next_api_key()
+        self.assertNotEqual(first, second)            # a 2ª chamada NÃO repete a chave
+        self.assertEqual({first, second}, {"K1", "K2"})
+        self.assertEqual(_next_api_key(), first)      # a 3ª volta à 1ª (ciclo)
+
+    @override_settings(OPENROUTER_API_KEYS=["A", "B", "C"])
+    def test_rotates_through_all_keys_then_wraps(self):
+        sequence = [_next_api_key() for _ in range(3)]
+        self.assertEqual(set(sequence), {"A", "B", "C"})
+        self.assertEqual(_next_api_key(), sequence[0])
+
+    @override_settings(OPENROUTER_API_KEYS=[], OPENROUTER_API_KEY="ONLY")
+    def test_falls_back_to_the_single_key(self):
+        self.assertEqual(_next_api_key(), "ONLY")
+        self.assertEqual(_next_api_key(), "ONLY")
+
+    @override_settings(OPENROUTER_API_KEYS=[], OPENROUTER_API_KEY=None)
+    def test_without_any_key_validation_is_skipped(self):
+        self.assertIsNone(_next_api_key())
+        # Sem chave, validate_matches devolve {} — nada é filtrado (degradação graciosa).
+        self.assertEqual(llm_validation.validate_matches({}, [object()]), {})
+
+    @override_settings(OPENROUTER_API_KEYS=["K1", "K2"])
+    def test_each_validation_call_consumes_the_next_key(self):
+        # Cada chamada tem sucesso à 1ª tentativa (uma chamada que falhasse sempre consumiria
+        # várias chaves por causa do retry — ver LlmValidationTests.test_retry_rotates_
+        # through_both_keys — aqui o que se testa é a rotação ENTRE chamadas separadas).
+        used_keys = []
+
+        def fake_post(url, headers=None, **kwargs):
+            used_keys.append(headers["Authorization"])
+            m = mock.Mock()
+            m.status_code = 200
+            m.json.return_value = {"choices": [{"message": {
+                "content": json.dumps([{"id": 1, "adequate": True, "reason": "ok"}]),
+            }}]}
+            m.text = json.dumps(m.json.return_value)
+            return m
+
+        with mock.patch("match.llm_validation.requests.post", side_effect=fake_post):
+            llm_validation.validate_matches({}, [_fake_grant(1)])
+            llm_validation.validate_matches({}, [_fake_grant(2)])
+
+        self.assertEqual(len(used_keys), 2)
+        self.assertNotEqual(used_keys[0], used_keys[1])

@@ -87,8 +87,8 @@ def is_specifications(name: str) -> bool:
     """True if the name is a tender specifications doc (strong OR isolated 'CE')."""
     if not name:
         return False
-    n = _specs_normalize(name)
-    return bool(_SPECS_STRONG_RE.search(n) or _SPECS_WEAK_RE.search(n))
+    normalized_name = _specs_normalize(name)
+    return bool(_SPECS_STRONG_RE.search(normalized_name) or _SPECS_WEAK_RE.search(normalized_name))
 
 
 def is_program_strong(name: str) -> bool:
@@ -100,8 +100,8 @@ def is_program(name: str) -> bool:
     """True if the name is a competition-program doc (strong OR isolated 'PC'/'PP')."""
     if not name:
         return False
-    n = _specs_normalize(name)
-    return bool(_PROGRAM_STRONG_RE.search(n) or _PROGRAM_WEAK_RE.search(n))
+    normalized_name = _specs_normalize(name)
+    return bool(_PROGRAM_STRONG_RE.search(normalized_name) or _PROGRAM_WEAK_RE.search(normalized_name))
 
 
 # --- File helpers ---------------------------------------------------------
@@ -116,9 +116,9 @@ def _is_docx_internally(zip_bytes: bytes) -> bool:
 
 
 def _specs_dir(subdir: str = ""):
-    d = settings.BASE_DIR / SPECS_DIR / subdir if subdir else settings.BASE_DIR / SPECS_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    target_dir = settings.BASE_DIR / SPECS_DIR / subdir if subdir else settings.BASE_DIR / SPECS_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir
 
 
 def _url_filename(url: str) -> str:
@@ -155,9 +155,9 @@ def _get(url: str, cookies: dict | None = None, referer: str | None = None):
     if referer:
         headers["Referer"] = referer
     try:
-        r = requests.get(url, timeout=TIMEOUT, headers=headers, allow_redirects=True, cookies=cookies)
-        r.raise_for_status()
-        return r
+        http_response = requests.get(url, timeout=TIMEOUT, headers=headers, allow_redirects=True, cookies=cookies)
+        http_response.raise_for_status()
+        return http_response
     except requests.RequestException:
         return None
 
@@ -171,9 +171,9 @@ def _looks_pdf(resp) -> bool:
 def _response_filename(resp) -> str:
     """File name: Content-Disposition if present, else derived from the final URL."""
     cd = resp.headers.get("Content-Disposition", "")
-    m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd, re.I)
-    if m:
-        return unquote(m.group(1).strip())
+    match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd, re.I)
+    if match:
+        return unquote(match.group(1).strip())
     url_fn = _url_filename(resp.url)
     # If the URL-derived name is just "download" or a token, force a clean name.
     if "download" in url_fn.lower() or "token" in url_fn.lower():
@@ -187,14 +187,14 @@ def _find_in_zip(zip_bytes: bytes, matcher=is_specifications, subdir: str = "") 
     """Read the ZIP and extract the PDF matching `matcher` (or the first PDF as fallback)."""
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            pdfs = [i for i in zf.infolist()
-                    if not i.is_dir() and i.filename.lower().endswith(DOC_EXTENSIONS)]
-            if not pdfs:
+            document_entries = [zip_entry for zip_entry in zf.infolist()
+                    if not zip_entry.is_dir() and zip_entry.filename.lower().endswith(DOC_EXTENSIONS)]
+            if not document_entries:
                 return ""
-            for info in pdfs:  # prefer a file whose name matches
+            for info in document_entries:  # prefer a file whose name matches
                 if matcher(info.filename):
                     return _save_bytes(info.filename, zf.read(info), subdir)
-            info = pdfs[0]  # fallback: first document, keep its name
+            info = document_entries[0]  # fallback: first document, keep its name
             return _save_bytes(info.filename, zf.read(info), subdir)
     except zipfile.BadZipFile:
         return ""
@@ -208,19 +208,19 @@ def _pair_documents_in_zip(zip_bytes: bytes) -> dict:
     empty = {"specifications": "", "program": ""}
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            pdfs = [i for i in zf.infolist()
-                    if not i.is_dir() and i.filename.lower().endswith(DOC_EXTENSIONS)]
-            if not pdfs:
+            document_entries = [zip_entry for zip_entry in zf.infolist()
+                    if not zip_entry.is_dir() and zip_entry.filename.lower().endswith(DOC_EXTENSIONS)]
+            if not document_entries:
                 return empty
-            program = next((i for i in pdfs if is_program(i.filename)), None)
-            specs = next((i for i in pdfs if is_specifications(i.filename)), None)
+            program = next((zip_entry for zip_entry in document_entries if is_program(zip_entry.filename)), None)
+            specs = next((zip_entry for zip_entry in document_entries if is_specifications(zip_entry.filename)), None)
             # Fallback do CE: 1.º PDF que não seja o programa (comportamento histórico: apanha
             # o 1.º PDF quando nenhum tem nome de caderno de encargos).
             if specs is None:
-                specs = next((i for i in pdfs if i is not program), None)
+                specs = next((zip_entry for zip_entry in document_entries if zip_entry is not program), None)
             # Fallback do programa: outro PDF junto do caderno de encargos.
             if program is None and specs is not None:
-                program = next((i for i in pdfs if i is not specs), None)
+                program = next((zip_entry for zip_entry in document_entries if zip_entry is not specs), None)
             return {
                 "specifications": (_save_bytes(specs.filename, zf.read(specs), SPECS_SUBDIR)
                                    if specs else ""),
@@ -239,14 +239,14 @@ def _find_in_html(html, base_url: str, cookies: dict | None = None,
     for tr in soup.find_all("tr"):
         tr_text = tr.get_text(separator=" ", strip=True)
         if matcher(tr_text):
-            for a in tr.find_all("a", href=True):
-                href = a["href"].strip()
+            for link in tr.find_all("a", href=True):
+                href = link["href"].strip()
                 if href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
                     continue
                 candidates.append(urljoin(base_url, href))
 
-    for full in list(dict.fromkeys(candidates))[:5]:
-        resp = _get(full, cookies=cookies)
+    for absolute_url in list(dict.fromkeys(candidates))[:5]:
+        resp = _get(absolute_url, cookies=cookies)
         if not resp:
             continue
         content = resp.content
@@ -297,7 +297,7 @@ def _render_with_driver(driver, url: str):
         driver.get(url)
         # 1. Wait for the client-side navigation (token -> tender view).
         try:
-            WebDriverWait(driver, 15).until(lambda d: d.current_url != url)
+            WebDriverWait(driver, 15).until(lambda target_dir: target_dir.current_url != url)
         except TimeoutException:
             pass
         # 2. Scroll to trigger lazy-loading of the documents section.
@@ -305,7 +305,7 @@ def _render_with_driver(driver, url: str):
         # 3. Smart wait: return as soon as a download link appears (up to 20s).
         try:
             WebDriverWait(driver, 20).until(
-                lambda d: d.find_elements(By.XPATH, _DOWNLOAD_LINK_XPATH)
+                lambda target_dir: target_dir.find_elements(By.XPATH, _DOWNLOAD_LINK_XPATH)
             )
         except TimeoutException:
             pass  # no documents rendered
@@ -388,8 +388,3 @@ def fetch_documents(url: str, driver_factory=None) -> dict:
                                      matcher=is_program, subdir=PROGRAM_SUBDIR),
         }
     return empty
-
-
-def fetch_specifications(url: str, driver_factory=None) -> str:
-    """Retrocompatível: só o caderno de encargos. Ver `fetch_documents` (que obtém ambos)."""
-    return fetch_documents(url, driver_factory=driver_factory)["specifications"]

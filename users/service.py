@@ -8,6 +8,9 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
+from common.ctt import ctt_lookup
+from common.email_validation import email_error_label
+from common.nuts import nuts_for
 from common.pagination import paginate_queryset
 from . import notifications
 from .models import UserProfile
@@ -17,13 +20,26 @@ _VALID_ROLES = {
     UserProfile.CLIENT,
 }
 
-# Minimum password length (must be more than 8 characters).
+# Papéis INTERNOS (equipa). Uma conta destas identifica-se só por utilizador/nome/email/papel:
+# os campos de entidade (NIF, CAE, morada, NUTS…) descrevem uma EMPRESA candidata e não se
+# aplicam. Ver `_serialize` e `_apply_profile`.
+_STAFF_ROLES = (
+    UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC,
+)
+
+# Minimum password length (must be more than 8 characters). Continua a aplicar-se a quem
+# DEFINE a password pelo link recebido por email (ver reset_password_with_token) — ninguém
+# volta a passar uma password no corpo do pedido de criação/registo (ver create_user).
 _PASSWORD_MIN_LENGTH = 8
 
-# Entity fields accepted on create/update (role is handled separately by validation)
+# Entity fields accepted on create/update (role is handled separately by validation).
+# city/county/region são normalmente DERIVADOS do postal_code (ver
+# _fill_location_from_postal_code) — continuam aceites aqui para permitir uma correção
+# manual (ex: um admin a editar o perfil) sem depender de reenviar o código postal.
 _PROFILE_FIELDS = (
     "entity_type", "entity_size", "incorporation_date",
-    "nif", "main_cae", "secondary_cae", "address", "region", "nuts_ii", "nuts_iii",
+    "nif", "main_cae", "secondary_cae", "address", "postal_code",
+    "city", "county", "region", "nuts_ii", "nuts_iii",
 )
 
 
@@ -40,8 +56,10 @@ def get_all_users(role=None, active=True, filters=None, page=1, page_size=50,
     superuser pode calhar dentro de um filtro por role sem esta exclusão explícita).
     Returns {total, page, page_size, num_pages, users}.
     """
-    # select_related evita o N+1 do _serialize (1 query em vez de 1+N por página).
-    users = User.objects.select_related("profile").order_by("id")
+    # select_related/prefetch_related evitam o N+1 do _serialize (poucas queries no total,
+    # em vez de 1+N por página — matched_grants é M2M, select_related não chega para ele).
+    users = User.objects.select_related("profile") \
+        .prefetch_related("profile__matched_grants").order_by("id")
     if active is not None:
         users = users.filter(is_active=active)
     if role:
@@ -72,24 +90,32 @@ def get_user_detail(user_id: int) -> dict | None:
     return _serialize(user) if user else None
 
 
-def create_user(data) -> dict:
+def create_user(serialized) -> dict:
+    """Cria o utilizador. Devolve-o serializado.
 
-    if not data.get("username"):
+    NINGUÉM define a password na criação — nem quem se regista a si próprio (registo
+    público), nem quem cria a conta de outrem (um admin/comercial autenticado). A conta
+    nasce sempre SEM password utilizável e a pessoa recebe por email o link para a
+    escolher (`request_password_reset`, o mesmo mecanismo de sempre — ver essa função para
+    o porquê de a resposta nunca revelar se a conta já existia). Uma `password` que venha
+    no pedido é ignorada em silêncio.
+    """
+    if not serialized.get("username"):
         raise ValueError("The 'username' field is required.")
-    if not data.get("email"):
+    if not serialized.get("email"):
         raise ValueError("The 'email' field is required.")
-    if not data.get("password"):
-        raise ValueError("The 'password' field is required for new users.")
-    _validate_password(data.get("password"))
+    email_error = email_error_label(serialized.get("email"))
+    if email_error:
+        raise ValueError(email_error)
 
-    _validate_required_data(data, is_update=False)
-    _validate_profile_fields(data)
+    _validate_required_data(serialized, is_update=False)
+    _validate_profile_fields(serialized)
 
-    username = data.get("username")
+    username = serialized.get("username")
     if User.objects.filter(username=username).exists():
         raise ValueError("username already exists")
 
-    email = data.get("email")
+    email = serialized.get("email")
     if email and User.objects.filter(email=email).exists():
         raise ValueError("This email is already registered.")
 
@@ -100,17 +126,26 @@ def create_user(data) -> dict:
         with transaction.atomic():
             user = User.objects.create_user(
                 username=username,
-                email=data.get("email"),
-                password=data.get("password"),
+                # NENHUMA password é aceite na criação, de ninguém — ver docstring.
+                # `create_user(password=None)` deixa a conta com password inutilizável.
+                password=None,
+                email=email,
+                # `first_name` é o NOME da pessoa — um dos campos que identificam qualquer
+                # conta, incluindo as internas (admin/comercial), que não têm mais nenhum.
+                first_name=serialized.get("first_name") or "",
             )
             # The signal already creates the profile (client); apply role + entity fields
-            _apply_profile(user, data)
+            _apply_profile(user, serialized)
     except IntegrityError:
         raise ValueError("username already exists")
+
+    # Fora da transação: um email não se desfaz com um rollback, por isso só se envia depois
+    # de a conta estar mesmo gravada. Best-effort — ver notifications.
+    request_password_reset(user.email)
     return _serialize(user)
 
 
-def update_user(user_id: int, data) -> dict | None:
+def update_user(user_id: int, serialized) -> dict | None:
     user = User.objects.filter(pk=user_id).first()
     if user is None:
         return None
@@ -118,31 +153,32 @@ def update_user(user_id: int, data) -> dict | None:
     profile = getattr(user, "profile", None)
     current_role = profile.role if profile else UserProfile.CLIENT
 
-    _validate_required_data(data, current_role=current_role, is_update=True)
-    _validate_profile_fields(data)
-    if data.get("password"):
-        _validate_password(data["password"])
+    _validate_required_data(serialized, current_role=current_role, is_update=True)
+    _validate_profile_fields(serialized, current_role=current_role)
 
-    new_username = data.get("username")
+    new_username = serialized.get("username")
     if new_username and User.objects.filter(username=new_username).exclude(pk=user_id).exists():
         raise ValueError("username already exists")
 
-    new_email = data.get("email")
+    new_email = serialized.get("email")
     if new_email and User.objects.filter(email=new_email).exclude(pk=user_id).exists():
         raise ValueError("email already exists")
 
-    for field in ("username", "email"):
-        value = data.get(field)
+    for field in ("username", "email", "first_name"):
+        value = serialized.get(field)
         if value is not None:
             setattr(user, field, value)
 
-    if data.get("password"):
-        user.set_password(data["password"])
+    # Uma `password` no corpo é IGNORADA, de propósito: a password só se define pelo link
+    # enviado por email (ver users.views.users_change_password e reset_password_with_token).
+    # Enquanto isto aqui a aceitava, um comercial punha a password que quisesse na conta de
+    # qualquer client/viewer que gere — e entrava nela —, contornando por completo a regra de
+    # que só quem controla a caixa de correio a consegue definir (ver ADR-11 e ADR-16).
 
     try:
         with transaction.atomic():
             user.save()
-            _apply_profile(user, data)
+            _apply_profile(user, serialized)
     except IntegrityError:
         raise ValueError("username already exists")
     return _serialize(user)
@@ -158,40 +194,26 @@ def delete_user(user_id: int) -> bool:
     return True
 
 
-def change_password(user_id: int, new_password, current_password=None, by_admin: bool = False) -> bool | None:
-    """
-    Change the password (hashed). Returns None if the user does not exist.
-    by_admin=True -> direct reset. Otherwise the current password is validated.
-    """
-    user = User.objects.filter(pk=user_id).first()
-    if user is None:
-        return None
-    if not new_password:
-        raise ValueError("password is required")
-    _validate_password(new_password)
-    if not by_admin and not user.check_password(current_password or ""):
-        raise ValueError("current password is incorrect")
-    user.set_password(new_password)
-    user.save()
-    return True
-
-
 def request_password_reset(email: str) -> None:
     """Envia (best-effort) um email de reset/definição de password a quem tiver `email`.
     NUNCA revela se a conta existe — a view responde sempre a mesma mensagem genérica; esta
     função não devolve nada que distinga os casos.
 
-    Funciona mesmo para quem NUNCA teve password (viewers — set_unusable_password() no
-    create_or_update_viewer): serve também como forma de DEFINIR a primeira password, não só
-    de repor uma esquecida. Isto é seguro mesmo para um viewer ainda não promovido — o
-    is_active=False continua a impedir o login (ver Django ModelBackend), definir a password
-    sozinha não dá acesso; só depois da promoção (promote_viewer) é que a conta consegue
-    entrar com a password já definida aqui.
+    Funciona mesmo para quem NUNCA teve password (ex: uma conta criada por um admin, ou um
+    viewer já promovido): serve também como forma de DEFINIR a primeira password, não só de
+    repor uma esquecida — daí não haver aqui um filtro por has_usable_password().
+
+    Só chega a contas ATIVAS. Contas inativas ficam de fora porque um viewer nasce de um
+    pedido ANÓNIMO e é esse pedido que lhe escreve o email (ver
+    match.leads.create_or_update_viewer): sem este filtro, quem soubesse o NIF público de
+    uma empresa apontava a conta ao seu próprio email, recebia aqui o link e deixava uma
+    password sua à espera da promoção. Uma conta inativa recebe as credenciais no momento em
+    que é ativada, não antes (ver match.leads.promote_viewer_to_client).
     """
     email = (email or "").strip()
     if not email:
         return
-    user = User.objects.filter(email__iexact=email).first()
+    user = User.objects.filter(email__iexact=email, is_active=True).first()
     if user is None:
         return
     uidb64 = urlsafe_base64_encode(force_bytes(user.pk))
@@ -241,35 +263,90 @@ def _normalize_secondary_cae(value):
         return []
     if isinstance(value, str):
         value = [value]
-    if not isinstance(value, list) or any(not (isinstance(c, str) and len(c) == 5) for c in value):
+    if not isinstance(value, list) or any(not (isinstance(cae_code, str) and len(cae_code) == 5) for cae_code in value):
         raise ValueError("secondary_cae must be a list of 5-character CAE codes.")
     return value
 
 
-def _validate_profile_fields(data) -> None:
+# Primeiro dígito do NIF que identifica uma pessoa SINGULAR (1, 2) ou um NIF reservado (3,
+# não atribuído atualmente) — nunca uma empresa/entidade coletiva. O registo é só para
+# entidades, por isso um NIF pessoal é rejeitado aqui.
+_PERSONAL_NIF_PREFIXES = ("1", "2", "3")
+
+
+def _is_valid_company_nif(nif: str) -> bool:
+    """9 dígitos, dígito de controlo válido (algoritmo oficial mod 11) e NÃO é NIF de pessoa
+    singular (ver `_PERSONAL_NIF_PREFIXES`). Não confirma que o NIF EXISTE (isso é o nif.pt,
+    ver match/services.py) — só que tem uma forma válida de NIF de empresa/entidade."""
+    nif = (nif or "").strip()
+    if not (nif.isdigit() and len(nif) == 9):
+        return False
+    if nif[0] in _PERSONAL_NIF_PREFIXES:
+        return False
+    checksum = sum(int(digit) * weight for digit, weight in zip(nif[:8], range(9, 1, -1)))
+    remainder = checksum % 11
+    check_digit = 0 if remainder < 2 else 11 - remainder
+    return check_digit == int(nif[8])
+
+
+def _fill_location_from_postal_code(defaults: dict) -> None:
+    """Deriva city/county/region a partir do código postal (API CTT + NUTS) — mesma lógica
+    de match/company_metadata.py:_location (CTT→NUTS), aqui aplicada ao código postal que a
+    própria pessoa introduz no registo, em vez do vindo do nif.pt. (O CTT devolve também o
+    distrito, mas `UserProfile` não tem esse campo — só city/county/region.)
+
+    Só atua quando o código postal está de facto a ser definido NESTE pedido — não
+    reprocessa código postal já gravado em pedidos que não o tocam (ver `_apply_profile`).
+    Degrada em silêncio (sem CTT_KEY, código inválido, ou falha de rede) — mesma filosofia
+    do resto do projeto: um problema transitório nosso não pode bloquear o registo.
     """
-    Validate profile fields (max_length, choices) via full_clean on a transient
+    postal_code = defaults.get("postal_code")
+    if not postal_code:
+        return
+    city, county, _district = ctt_lookup(postal_code)
+    if city:
+        defaults["city"] = city
+    if county:
+        defaults["county"] = county
+    _, _, region_old = nuts_for(city, county) if (city or county) else (None, None, None)
+    if region_old:
+        defaults["region"] = region_old
+
+
+def _validate_profile_fields(serialized, current_role=None) -> None:
+    """
+    Validate profile fields (max_length, choices, NIF) via full_clean on a transient
     instance — before persisting. Converts ValidationError -> ValueError (-> 400).
+
+    Os campos de ENTIDADE (NIF, CAE, morada…) só são validados quando o papel EFETIVO não
+    é interno (`_STAFF_ROLES`) — um admin/comercial que os envie por hábito não pode ver a
+    criação/atualização falhar por causa deles: `_apply_profile` já os ignora em silêncio
+    para esse papel, a validação tem de ser coerente com isso.
     """
     # secondary_cae is a JSON list, validated separately
-    if "secondary_cae" in data:
-        _normalize_secondary_cae(data["secondary_cae"])
+    if "secondary_cae" in serialized:
+        _normalize_secondary_cae(serialized["secondary_cae"])
 
-    if "role" in data and data["role"] not in _VALID_ROLES:
+    if "role" in serialized and serialized["role"] not in _VALID_ROLES:
         raise ValueError("Invalid role provided.")
-    
-    fields = {}
-    if data.get("role") in _VALID_ROLES:
-        fields["role"] = data["role"]
-        
+
+    effective_role = (serialized["role"] if serialized.get("role") in _VALID_ROLES
+                      else (current_role or UserProfile.CLIENT))
+    if effective_role in _STAFF_ROLES:
+        return
+
+    if serialized.get("nif") and not _is_valid_company_nif(serialized["nif"]):
+        raise ValueError(
+            "NIF inválido — tem de ser um NIF de empresa/entidade (não pessoal), "
+            "com 9 dígitos e dígito de controlo correto."
+        )
+
+    fields = {"role": effective_role}
     for field in _PROFILE_FIELDS:
         if field == "secondary_cae":
             continue
-        if field in data and data[field] is not None:
-            fields[field] = data[field]
-            
-    if not fields:
-        return
+        if field in serialized and serialized[field] is not None:
+            fields[field] = serialized[field]
 
     probe = UserProfile(**fields)
     try:
@@ -279,17 +356,29 @@ def _validate_profile_fields(data) -> None:
         raise ValueError(msg)
 
 
-def _apply_profile(user: User, data) -> None:
-    """Update the user's profile (role + entity fields) from `data`."""
+def _apply_profile(user: User, serialized) -> None:
+    """Atualiza o perfil (papel + campos de entidade) a partir do pedido.
+
+    Num papel INTERNO (admin/comercial) os campos de entidade são IGNORADOS em silêncio: não
+    descrevem a pessoa, descrevem uma empresa candidata. Ignorar em vez de rejeitar evita
+    partir clientes que ainda os enviem por hábito — ver `_STAFF_ROLES`.
+    """
     defaults = {}
-    if data.get("role") in _VALID_ROLES:
-        defaults["role"] = data["role"]
-    for field in _PROFILE_FIELDS:
-        if field in data:
-            if field == "secondary_cae":
-                defaults[field] = _normalize_secondary_cae(data[field])
-            else:
-                defaults[field] = data[field]
+    if serialized.get("role") in _VALID_ROLES:
+        defaults["role"] = serialized["role"]
+
+    existing_profile = getattr(user, "profile", None)
+    effective_role = (defaults.get("role")
+                      or (existing_profile.role if existing_profile else UserProfile.CLIENT))
+
+    if effective_role not in _STAFF_ROLES:
+        for field in _PROFILE_FIELDS:
+            if field in serialized:
+                if field == "secondary_cae":
+                    defaults[field] = _normalize_secondary_cae(serialized[field])
+                else:
+                    defaults[field] = serialized[field]
+        _fill_location_from_postal_code(defaults)
     if defaults:
         profile, _ = UserProfile.objects.update_or_create(user=user, defaults=defaults)
         user.profile = profile  # refresh the reverse-relation cache (otherwise stale)
@@ -313,8 +402,15 @@ def _fill_entity_size_from_sqlite(profile) -> None:
 
 
 def _serialize(user: User) -> dict:
+    """Utilizador em JSON. Os campos de ENTIDADE (NIF, CAE, morada, NUTS…) só saem para
+    `client`/`viewer`.
+
+    Um admin ou comercial é uma pessoa da equipa, não uma empresa candidata: esses campos
+    nunca são preenchidos para eles, e devolvê-los a null só fazia o front-end desenhar um
+    formulário de empresa numa conta interna. Ver `_STAFF_ROLES`.
+    """
     profile = getattr(user, "profile", None)
-    data = {
+    serialized = {
         "id": user.id,
         "username": user.username,
         "email": user.email,
@@ -325,8 +421,8 @@ def _serialize(user: User) -> dict:
         "is_superuser": user.is_superuser,
         "date_joined": user.date_joined.isoformat() if user.date_joined else None,
     }
-    if profile:
-        data.update({
+    if profile and profile.role not in _STAFF_ROLES:
+        serialized.update({
             "entity_type": profile.entity_type,
             "entity_size": profile.entity_size,
             "incorporation_date": (
@@ -338,39 +434,38 @@ def _serialize(user: User) -> dict:
             "main_cae": profile.main_cae,
             "secondary_cae": profile.secondary_cae,
             "address": profile.address,
+            "postal_code": profile.postal_code,
+            "city": profile.city,
+            "county": profile.county,
             "region": profile.region,
             "nuts_ii": profile.nuts_ii,
             "nuts_iii": profile.nuts_iii,
             "job_title": profile.job_title,
+            "matched_grants": [
+                {"id": grant.id, "grant_code": grant.grant_code, "title": grant.title}
+                for grant in profile.matched_grants.all()
+            ],
         })
-    return data
+    return serialized
 
 
-def _validate_required_data(data, current_role=None, is_update=False):
+def _validate_required_data(serialized, current_role=None, is_update=False):
     """Validate the required fields according to the user's role."""
-    role = data.get("role", current_role or UserProfile.CLIENT)
+    role = serialized.get("role", current_role or UserProfile.CLIENT)
 
     if role in (UserProfile.ADMIN, UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC):
-        required_fields = ["username", "email"]
-        if not is_update:
-            required_fields.append("password")
-
-        for field in required_fields:
+        for field in ("username", "email"):
             # On update only validate the fields actually sent (supports partial updates)
-            if not is_update or field in data:
-                if not data.get(field):
+            if not is_update or field in serialized:
+                if not serialized.get(field):
                     raise ValueError(f"The '{field}' field is required for the '{role}' profile.")
 
     elif role == UserProfile.CLIENT:
-        client_fields = ["entity_type", "entity_size", "nif", "main_cae", "address", "region"]
+        # postal_code substitui region: a região é DERIVADA do código postal (ver
+        # _fill_location_from_postal_code), não pedida diretamente a quem se regista.
+        client_fields = ["entity_type", "entity_size", "nif", "main_cae", "address", "postal_code"]
         for field in client_fields:
             # On update only validate if the key was sent (supports partial updates)
-            if not is_update or field in data:
-                if not data.get(field):
-                    raise ValueError(f"The '{field}' field is required")
-
-        # Special handling for booleans (False would fail the 'not data.get()' check)
-        for field in ["nuts_ii", "nuts_iii"]:
-            if not is_update or field in data:
-                if data.get(field) is None:
+            if not is_update or field in serialized:
+                if not serialized.get(field):
                     raise ValueError(f"The '{field}' field is required")

@@ -16,8 +16,8 @@ def _first_non_null(*dicts: dict) -> dict:
     """
     result = {}
     for key in set().union(*dicts):
-        for d in dicts:
-            val = d.get(key)
+        for chunk_result in dicts:
+            val = chunk_result.get(key)
             if val not in (None, [], ""):
                 result[key] = val
                 break
@@ -34,8 +34,8 @@ def merge(r1: dict, r2: dict, r3: dict, r4: dict, r5: dict, r6: dict) -> dict:
 
     # Valida cada dict parcial pelo modelo Grant para obter chaves em inglês
     p1_data, p2_data, p3_data, p4_data, p5_data = (
-        Grant.model_validate(info).model_dump()
-        for info in (p1_info, p2_info, p3_info, p4_info, p5_info)
+        Grant.model_validate(prompt_result).model_dump()
+        for prompt_result in (p1_info, p2_info, p3_info, p4_info, p5_info)
     )
     p6_data = p6_info
 
@@ -59,14 +59,14 @@ def merge(r1: dict, r2: dict, r3: dict, r4: dict, r5: dict, r6: dict) -> dict:
 
     result = {
         "Grant":                  grant.model_dump(),
-        "BeneficiaryByAction":    [b.model_dump() for b in bpas],
-        "phases":                 [f.model_dump() for f in phases],
-        "CoveredArea":            [a.model_dump() for a in areas],
+        "BeneficiaryByAction":    [second.model_dump() for second in bpas],
+        "phases":                 [phase.model_dump() for phase in phases],
+        "CoveredArea":            [first.model_dump() for first in areas],
         "PhaseArea":              [fa_item.model_dump() for fa_item in fa],
-        "FinancingRate":          [t.model_dump() for t in rates],
+        "FinancingRate":          [rate.model_dump() for rate in rates],
         "ExpenseLimit":           [lim.model_dump() for lim in limits],
-        "NonCompliancePenalty":   [p.model_dump() for p in penalties],
-        "EvaluationMethodology":  [m.model_dump() for m in methodologies],
+        "NonCompliancePenalty":   [penalty.model_dump() for penalty in penalties],
+        "EvaluationMethodology":  [methodology.model_dump() for methodology in methodologies],
     }
 
     # --- Correções pós-merge ---
@@ -112,10 +112,10 @@ def merge(r1: dict, r2: dict, r3: dict, r4: dict, r5: dict, r6: dict) -> dict:
     if "FSE" in (result["Grant"].get("fund_name") or "").upper():
         targets = result["Grant"].get("financial_execution_targets") or []
         result["Grant"]["financial_execution_targets"] = [
-            m.replace("[Infra] ", "").replace("[Não-Infra] ", "") for m in targets
+            methodology.replace("[Infra] ", "").replace("[Não-Infra] ", "") for methodology in targets
         ]
 
-    filled_count = sum(1 for v in result["Grant"].values() if v not in (None, [], ""))
-    logger.info("Grant: %d/%d campos preenchidos", filled_count, len(result["Grant"]))
+    filled_count = sum(1 for field_value in result["Grant"].values() if field_value not in (None, [], ""))
+    logger.prompt_result("Grant: %d/%d campos preenchidos", filled_count, len(result["Grant"]))
 
     return result

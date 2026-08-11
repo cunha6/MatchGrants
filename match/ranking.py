@@ -26,20 +26,20 @@ def active_phase_id(phases: list[dict], now: datetime | None = None) -> int | No
     """id (PK) da fase relevante agora: a que está a decorrer; senão a próxima a abrir;
     senão a mais recente. None se nenhuma fase tiver datas utilizáveis."""
     now = now or datetime.now()
-    parsed = [(p.get("id"), _parse_dt(p.get("start_date")), _parse_dt(p.get("end_date")))
-              for p in (phases or [])]
+    parsed = [(phase.get("id"), _parse_dt(phase.get("start_date")), _parse_dt(phase.get("end_date")))
+              for phase in (phases or [])]
 
-    for pid, s, e in parsed:
-        if s and e and s <= now <= e:
-            return pid
-        if s and not e and s <= now:
-            return pid
+    for phase_id, start_date, end_date in parsed:
+        if start_date and end_date and start_date <= now <= end_date:
+            return phase_id
+        if start_date and not end_date and start_date <= now:
+            return phase_id
 
-    upcoming = sorted((s, pid) for pid, s, e in parsed if s and s > now)
+    upcoming = sorted((start_date, phase_id) for phase_id, start_date, end_date in parsed if start_date and start_date > now)
     if upcoming:
         return upcoming[0][1]
 
-    ended = sorted((e or s, pid) for pid, s, e in parsed if (e or s))
+    ended = sorted((end_date or start_date, phase_id) for phase_id, start_date, end_date in parsed if (end_date or start_date))
     if ended:
         return ended[-1][1]
     return None
@@ -51,11 +51,11 @@ def company_area_id(client_tokens: list[str], covered_areas: list[dict]) -> int 
     areas = covered_areas or []
     if len(areas) == 1:
         return areas[0].get("id")
-    toks = [t for t in (client_tokens or []) if t]
-    for a in areas:
-        g = _norm(a.get("geographic_area"))
-        if g and any(t in g or g in t for t in toks):
-            return a.get("id")
+    normalized_tokens = [token for token in (client_tokens or []) if token]
+    for area in areas:
+        normalized_area = _norm(area.get("geographic_area"))
+        if normalized_area and any(token in normalized_area or normalized_area in token for token in normalized_tokens):
+            return area.get("id")
     return None
 
 
@@ -71,18 +71,18 @@ def effective_budget_rate(phase_areas: list[dict], phase_id: int | None,
     pool = phase_areas or []
     # 1) filtra por área (linhas sem área — area_id None — aplicam-se a todas)
     if area_id is not None:
-        by_area = [pa for pa in pool if pa.get("area_id") in (area_id, None)]
+        by_area = [phase_area for phase_area in pool if phase_area.get("area_id") in (area_id, None)]
         pool = by_area or pool
     # 2) se houver linhas da FASE ativa, usa-as; senão considera TODAS as aplicáveis (assim
     #    o caso fundo+"Dotação Global" mantém as duas linhas: dotação da global, taxa do fundo).
-    phase_pool = [pa for pa in pool if phase_id is not None and pa.get("phase_id") == phase_id]
+    phase_pool = [phase_area for phase_area in pool if phase_id is not None and phase_area.get("phase_id") == phase_id]
     chosen = phase_pool or pool
 
-    budgets = [pa["budget_allocation"] for pa in chosen if pa.get("budget_allocation") is not None]
-    fund_rates = [pa["max_financing_rate"] for pa in chosen
-                  if pa.get("max_financing_rate") is not None
-                  and _norm(pa.get("fund_name")) != "dotacao global"]
-    all_rates = [pa["max_financing_rate"] for pa in chosen if pa.get("max_financing_rate") is not None]
+    budgets = [phase_area["budget_allocation"] for phase_area in chosen if phase_area.get("budget_allocation") is not None]
+    fund_rates = [phase_area["max_financing_rate"] for phase_area in chosen
+                  if phase_area.get("max_financing_rate") is not None
+                  and _norm(phase_area.get("fund_name")) != "dotacao global"]
+    all_rates = [phase_area["max_financing_rate"] for phase_area in chosen if phase_area.get("max_financing_rate") is not None]
 
     budget = max(budgets) if budgets else None
     rate = max(fund_rates) if fund_rates else (max(all_rates) if all_rates else None)
@@ -95,8 +95,8 @@ def _to_rate(value) -> float | None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    s = str(value).replace("%", "").replace(",", ".").strip()
-    m = re.search(r"\d+(?:\.\d+)?", s)
+    start_date = str(value).replace("%", "").replace(",", ".").strip()
+    m = re.search(r"\d+(?:\.\d+)?", start_date)
     return float(m.group()) if m else None
 
 
@@ -104,8 +104,8 @@ def max_financing_rate_from_rates(financing_rates: list[dict]) -> float | None:
     """Maior taxa (max_global_rate, senão base_rate) das FinancingRate — fallback quando não
     há PhaseArea com taxa."""
     rates = []
-    for fr in financing_rates or []:
-        r = _to_rate(fr.get("max_global_rate")) or _to_rate(fr.get("base_rate"))
-        if r is not None:
-            rates.append(r)
+    for financing_rate in financing_rates or []:
+        rate_value = _to_rate(financing_rate.get("max_global_rate")) or _to_rate(financing_rate.get("base_rate"))
+        if rate_value is not None:
+            rates.append(rate_value)
     return max(rates) if rates else None

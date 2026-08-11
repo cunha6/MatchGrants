@@ -106,6 +106,59 @@ class Notice(models.Model):
                   "(Programa de Concurso) PDF. Can be added/edited/removed manually.",
     )
 
+    # Local path (relative a BASE_DIR, sob output/markdown/) do caderno de encargos já
+    # convertido para markdown. Preenchido/atualizado por specifications_ai.py na primeira
+    # vez que /anuncios/<id>/detail/ é chamado — evita reconverter o PDF em cada pedido.
+    # Vazio se ainda não foi convertido ou se não há specifications_path.
+    specifications_markdown_path = models.CharField(
+        max_length=500, blank=True, default="",
+        verbose_name="Tender Specifications (markdown path)",
+        help_text="Local path (under output/markdown/) of the tender specifications "
+                  "converted to markdown. Generated on first AI-detail request.",
+    )
+
+    # Resposta da IA sobre o caderno de encargos — cache do resultado de
+    # specifications_ai.generate_detail, para não repetir a chamada (paga) ao OpenAI em
+    # cada pedido a /anuncios/<id>/detail/. Três campos em vez de um único JSON opaco:
+    # descrição e avaliação são texto simples; observações fica em JSON por ser
+    # estruturalmente uma lista de notas avulsas.
+    specifications_description = models.TextField(
+        blank=True, default="", verbose_name="Tender Specifications (AI description)",
+        help_text="Cached AI-generated detailed description of the tender's object/scope.",
+    )
+    # JSONField por historial (guardava {criterios, formula}); hoje guarda só uma frase —
+    # ver a regra de "avaliacao" em anuncios/specifications_ai.py:SYSTEM_PROMPT. Um
+    # JSONField aceita uma string perfeitamente bem, por isso não houve migração — só
+    # specifications_ai._coerce_avaliacao tem de lidar com registos antigos no formato
+    # objeto (regenerados com ?refresh=true ficam já no formato novo).
+    specifications_evaluation = models.JSONField(
+        default=str, blank=True, verbose_name="Tender Specifications (AI evaluation)",
+        help_text="Cached AI-generated evaluation-criteria summary (single sentence), "
+                  "as written in the document.",
+    )
+    # [str, ...] — uma nota por item (ex: "Visita ao local obrigatória.").
+    specifications_observations = models.JSONField(
+        default=list, blank=True, verbose_name="Tender Specifications (AI observations)",
+        help_text="Cached AI-generated list of notes (deadlines, guarantees, site visits, "
+                  "etc.) that don't fit the description/evaluation fields.",
+    )
+
+    # Options for `specifications_ai_status`
+    class AiStatusChoices(models.TextChoices):
+        PENDING = 'pending', 'Nunca gerado'
+        GENERATING = 'generating', 'A gerar'
+        DONE = 'done', 'Concluído'
+        ERROR = 'error', 'Erro'
+
+    # Estado da geração em BACKGROUND do detalhe IA (ver anuncios/specifications_ai.py:
+    # generate_detail_async). PENDING/ERROR são ambos "por gerar" — uma nova chamada a
+    # /anuncios/<id>/detail/ relança a geração a partir de qualquer um dos dois.
+    specifications_ai_status = models.CharField(
+        max_length=10, choices=AiStatusChoices.choices, default=AiStatusChoices.PENDING,
+        blank=True, verbose_name="Tender Specifications (AI status)",
+        help_text="Background AI-detail generation status.",
+    )
+
     proposal_deadline = models.DateField(null=True, blank=True, verbose_name="Proposal Deadline")
 
     # Options for `status`

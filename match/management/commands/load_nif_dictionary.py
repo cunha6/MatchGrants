@@ -23,15 +23,15 @@ BATCH = 5000
 
 
 def _norm(text: str) -> str:
-    t = unicodedata.normalize("NFKD", str(text))
-    return "".join(c for c in t if not unicodedata.combining(c)).lower().strip()
+    decomposed = unicodedata.normalize("NFKD", str(text))
+    return "".join(character for character in decomposed if not unicodedata.combining(character)).lower().strip()
 
 
 def _find_key(record: dict, *needles) -> str | None:
     """First key whose accent-insensitive form contains all needles."""
     for key in record:
-        nk = _norm(key)
-        if all(n in nk for n in needles):
+        normalized_key = _norm(key)
+        if all(needle in normalized_key for needle in needles):
             return key
     return None
 
@@ -48,13 +48,13 @@ def _to_int(value):
 def _to_decimal(value):
     if value in (None, ""):
         return None
-    s = str(value).strip().replace(" ", "").replace("€", "")
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
+    cleaned_number = str(value).strip().replace(" ", "").replace("€", "")
+    if "," in cleaned_number and "." in cleaned_number:
+        cleaned_number = cleaned_number.replace(".", "").replace(",", ".")
+    elif "," in cleaned_number:
+        cleaned_number = cleaned_number.replace(",", ".")
     try:
-        return Decimal(s)
+        return Decimal(cleaned_number)
     except InvalidOperation:
         return None
 

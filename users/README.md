@@ -26,8 +26,36 @@ Cada utilizador tem um perfil (`UserProfile`) com um de cinco roles:
 - `viewer` — conta inativa criada automaticamente por quem consulta o match **sem login** (lead).
   Sem acesso a login até ser promovido a `client` (`POST /match/promote/<nif>/`).
 
-**Sem login**: só o match (`POST /match/evaluate-nif/` e afins) e o detalhe de UM aviso
-(`GET /avisos/<id>/`) são acessíveis — nunca a listagem de avisos/anúncios/utilizadores.
+**Sem login**: só o match (`POST /match/evaluate-nif/` e afins) e o detalhe dos avisos que
+esse match devolveu (`GET /avisos/<id>/` e `/document/`, restritos à própria sessão) são
+acessíveis — nunca a listagem de avisos/anúncios/utilizadores.
+
+**Campos por papel** — um `admin` ou comercial é uma pessoa da equipa: identifica-se por
+`username`, `first_name` (nome), `email` e `role`, e mais nada. Os campos de ENTIDADE (NIF, CAE,
+morada, região, NUTS, `job_title`) descrevem uma **empresa candidata** e só existem em `client`
+e `viewer` — no detalhe de uma conta interna nem sequer aparecem a null, estão ausentes. Se
+forem enviados ao criar/atualizar um papel interno são **ignorados em silêncio**, não dão erro.
+
+**Criar sem password** — uma conta criada por um admin/comercial nasce **sem password
+utilizável** e a pessoa recebe logo o email para a escolher (uma `password` no corpo é
+ignorada). Só o **registo público** — a pessoa a registar-se a si própria, sem sessão — define
+a password na hora, porque obrigá-la a ir ao email para poder entrar seria atrito sem ganho.
+Promover um `viewer` a `client` envia o mesmo email, já que a promoção ativa a conta sem
+password.
+
+**Definir password** — o `POST /users/<id>/password/` não recebe passwords: dispara o link de
+redefinição para o email já registado na conta. Ninguém (nem o próprio, nem um admin) escolhe a
+password de ninguém, pelo que ela nunca passa no corpo do pedido nem pelas mãos de quem gere a
+conta — só quem controla a caixa de correio a consegue definir. Devolve 400 se a conta não tiver
+email ou estiver inativa.
+
+**Contas `viewer` e credenciais** — o email de um `viewer` é escrito por um pedido **anónimo**
+(o pop-up de contacto do match) e o `username` é o NIF, que é público. Por isso esse email
+não é de confiança enquanto a conta não for promovida, e três regras seguram a cadeia:
+o `/users/password-reset/` ignora contas inativas; a promoção invalida qualquer password
+definida na janela de `viewer` (devolve `has_login: false` — as credenciais definem-se
+**depois**, já com a conta ativa); e um pedido anónimo só **preenche** contacto em branco,
+nunca substitui o contacto já registado de um lead.
 
 **Superuser**: um superuser do Django (`createsuperuser`) é **sempre tratado como `admin`**
 nas permissões, independentemente do role do perfil (bypass de bootstrap) — mas só o `admin`
@@ -41,7 +69,7 @@ consegue **ver** superusers na listagem/detalhe de utilizadores (os comerciais n
 |-------------------------|---------|-------------------------------------|-----------------------------------------------------------|
 | `/users/login/`         | POST    | **Público**                         | Inicia sessão.                                          |
 | `/users/logout/`        | POST    | Público                             | Termina a sessão atual.                                 |
-| `/users/password-reset/`| POST    | Público                             | Pede o email de redefinição (resposta sempre igual, nunca revela se a conta existe). |
+| `/users/password-reset/`| POST    | Público                             | Pede o email de redefinição (resposta sempre igual, nunca revela se a conta existe). Só chega a contas **ativas** — o email de um `viewer` vem de um pedido anónimo, ver nota abaixo. |
 | `/users/password-reset/confirm/` | POST | Público                     | Define a nova password (uid+token do link recebido).   |
 | `/users/me/`            | GET     | Autenticado (qualquer role)         | Perfil do utilizador autenticado.                       |
 | `/users/`               | GET     | **admin, commercial_grants, commercial_public** | Lista. Admin filtra por `?role=` e `?active=true\|false\|all`; comerciais veem só `viewer`/`client`. |
@@ -49,7 +77,7 @@ consegue **ver** superusers na listagem/detalhe de utilizadores (os comerciais n
 | `/users/create/`        | POST    | Público/comercial/admin             | admin→qualquer role; comercial→só `client`; client→403; público→`client`. |
 | `/users/<id>/`          | GET     | Autenticado (varia por role)        | Detalhe de um utilizador.                               |
 | `/users/<id>/update/`   | PUT     | Autenticado (varia por role)        | Atualiza dados. Alterar `role` → **só admin**.          |
-| `/users/<id>/password/` | POST    | A própria conta, comercial (viewer/client) ou admin | Muda a password. |
+| `/users/<id>/password/` | POST    | A própria conta, comercial (viewer/client) ou admin | **Envia o email** para a pessoa definir a password. Não define nenhuma — ver nota abaixo. |
 | `/users/<id>/`          | DELETE  | **Só admin**                        | Desativa o utilizador (soft-delete: `is_active=False`). |
 
 ### Respostas de autorização

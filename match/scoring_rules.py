@@ -33,20 +33,14 @@ def _cae_matches_pattern(cae: str, pattern: str) -> bool:
     return str(cae).startswith(prefix)
 
 
-def _matches_any_pattern(client_caes: set[str], patterns) -> bool:
-    """True se algum CAE do cliente bater em algum dos padrões wildcard."""
-    pats = [str(p) for p in (patterns or []) if p]
-    return any(_cae_matches_pattern(cae, p) for cae in client_caes for p in pats)
-
-
 def _pattern_specificity(cae: str, patterns) -> int:
     """Comprimento do PREFIXO mais específico (mais longo) entre os `patterns` que batem no
     `cae`; -1 se nenhum bater. Ex: cae '91100' vs '911**' → 3; vs '91***' → 2."""
     best = -1
-    for p in patterns or []:
-        s = str(p).strip()
-        star = s.find("*")
-        prefix = s if star == -1 else s[:star]
+    for pattern in patterns or []:
+        cleaned_pattern = str(pattern).strip()
+        star = cleaned_pattern.find("*")
+        prefix = cleaned_pattern if star == -1 else cleaned_pattern[:star]
         if prefix.isdigit() and str(cae).startswith(prefix):
             best = max(best, len(prefix))
     return best
@@ -66,12 +60,12 @@ def match_cae(client: dict, opportunity: dict) -> bool:
     Elegível ⇔ existe um CAE do cliente cuja regra mais específica é uma inclusão (ou que não
     bate em nenhuma exclusão, quando não há lista positiva).
     """
-    client_caes = {str(c).strip() for c in (client.get("cae_codes") or []) if c}
+    client_caes = {str(cae_code).strip() for cae_code in (client.get("cae_codes") or []) if cae_code}
     if not client_caes:
         return False
 
-    included = [p for p in (opportunity.get("included_caes") or []) if p]
-    excluded = [p for p in (opportunity.get("excluded_caes") or []) if p]
+    included = [pattern for pattern in (opportunity.get("included_caes") or []) if pattern]
+    excluded = [pattern for pattern in (opportunity.get("excluded_caes") or []) if pattern]
     if not included and not excluded:
         return True
 
@@ -91,17 +85,17 @@ def match_cae(client: dict, opportunity: dict) -> bool:
 def match_location(client: dict, opportunity: dict) -> bool:
     """A localização do cliente cabe nas regiões elegíveis, OU o aviso menciona a localização
     (região/concelho/NUTS II/NUTS III) no seu texto de elegibilidade."""
-    normalized_regions = [_normalize(r) for r in (opportunity.get("eligible_regions") or []) if r]
-    if any(("todo o pais" in r or "nacional" in r or "continente" in r) for r in normalized_regions):
+    normalized_regions = [_normalize(region_name) for region_name in (opportunity.get("eligible_regions") or []) if region_name]
+    if any(("todo o pais" in region_name or "nacional" in region_name or "continente" in region_name) for region_name in normalized_regions):
         return True
 
     # Inclui a NUTS II/III resolvida do município (nuts.json): o cliente traz o concelho
     # ("Faro") mas os avisos usam a NUTS II ("Algarve"). É correspondência EXATA (não fuzzy).
     client_tokens = [
-        t for t in (
+        token for token in (
             _normalize(client.get(field))
             for field in ("region", "city", "county", "nuts_ii", "nuts_iii", "nuts_ii_old")
-        ) if t
+        ) if token
     ]
     if not client_tokens:
         return False
@@ -124,7 +118,7 @@ def _word_pattern(phrase: str) -> re.Pattern:
     Evita falsos positivos por substring — 'media' já não casa dentro de 'imediata',
     nem 'cim' dentro de 'decimo' — que ativavam indevidamente o filtro rígido e
     excluíam clientes elegíveis. Opera sobre texto normalizado (sem acentos)."""
-    words = [re.escape(w) + "s?" for w in phrase.split()]
+    words = [re.escape(word) + "s?" for word in phrase.split()]
     return re.compile(r"\b" + r"\s+".join(words) + r"\b")
 
 
@@ -154,7 +148,7 @@ def match_dimension(client: dict, opportunity: dict) -> bool:
 
     patterns = _DIMENSION_MATCH_PATTERNS.get(dimension, (_word_pattern(dimension),))
     text = opportunity.get("eligibility_text", "")
-    return any(p.search(text) for p in patterns)
+    return any(pattern.search(text) for pattern in patterns)
 
 
 # Sinónimos por tipo de beneficiário (texto normalizado, sem acentos). Fonte única usada
@@ -193,7 +187,7 @@ def match_entity_type(client: dict, opportunity: dict) -> bool:
         return False
     patterns = _ENTITY_TYPE_PATTERNS.get(entity_type, (_word_pattern(entity_type),))
     text = opportunity.get("beneficiary_text", "")
-    return any(p.search(text) for p in patterns)
+    return any(pattern.search(text) for pattern in patterns)
 
 
 # --- Classificação de dimensão (UE PME) -----------------------------------
@@ -211,16 +205,16 @@ def classify_dimension(employees, revenue) -> str | None:
     """
     if employees is None and revenue is None:
         return None
-    e = employees if employees is not None else 0
+    entity_type = employees if employees is not None else 0
     try:
-        r = float(revenue) if revenue is not None else 0.0
+        region_name = float(revenue) if revenue is not None else 0.0
     except (TypeError, ValueError):
-        r = 0.0
-    if e < 10 and r <= 2000000:
+        region_name = 0.0
+    if entity_type < 10 and region_name <= 2000000:
         return "micro"
-    if e < 50 and r <= 10000000:
+    if entity_type < 50 and region_name <= 10000000:
         return "pequena"
-    if e < 250 and r <= 50000000:
+    if entity_type < 250 and region_name <= 50000000:
         return "media"
     return "grande"
 
@@ -233,17 +227,17 @@ def grant_allowed_dimensions(eligibility_text: str) -> set[str]:
     Conjunto vazio ⇒ o aviso não restringe dimensão (todas elegíveis). Nota: micro,
     pequena e média SÃO PME; grande NÃO é PME.
     """
-    t = eligibility_text or ""
+    token = eligibility_text or ""
     allowed: set[str] = set()
-    if _PME_PAT.search(t) or _PME_PHRASE_PAT.search(t):
+    if _PME_PAT.search(token) or _PME_PHRASE_PAT.search(token):
         allowed |= {"micro", "pequena", "media"}
-    if _MICRO_PAT.search(t):
+    if _MICRO_PAT.search(token):
         allowed.add("micro")
-    if _PEQUENA_PAT.search(t):
+    if _PEQUENA_PAT.search(token):
         allowed.add("pequena")
-    if _MEDIA_PAT.search(t):
+    if _MEDIA_PAT.search(token):
         allowed.add("media")
-    if _GRANDE_PAT.search(t) or _NAO_PME_PAT.search(t):
+    if _GRANDE_PAT.search(token) or _NAO_PME_PAT.search(token):
         allowed.add("grande")
     return allowed
 
@@ -282,10 +276,10 @@ def grant_allowed_entity_types(beneficiary_text: str) -> set[str]:
 
     Conjunto vazio ⇒ o aviso não restringe o tipo (todos elegíveis). Usa os mesmos sinónimos
     do matcher — se o texto mencionar o tipo, considera-o admitido."""
-    t = beneficiary_text or ""
+    token = beneficiary_text or ""
     allowed: set[str] = set()
     for etype, patterns in _ENTITY_TYPE_PATTERNS.items():
-        if any(p.search(t) for p in patterns):
+        if any(pattern.search(token) for pattern in patterns):
             allowed.add(etype)
     return allowed
 
@@ -333,7 +327,7 @@ def missing_required_fields(client: dict) -> list[dict]:
     tolerante (em falta ⇒ decide pelos outros critérios).
     """
     missing = []
-    if not [c for c in (client.get("cae_codes") or []) if c]:
+    if not [cae_code for cae_code in (client.get("cae_codes") or []) if cae_code]:
         missing.append({"field": "cae", "label": "CAE (código de atividade)"})
     if not any(client.get(f) for f in ("region", "city", "county")):
         missing.append({"field": "region", "label": "Localização / região"})

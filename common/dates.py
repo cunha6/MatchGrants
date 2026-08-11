@@ -21,21 +21,21 @@ def parse_date(value) -> date | None:
     """
     if not value:
         return None
-    s = str(value).strip()
+    text = str(value).strip()
     try:
-        return datetime.fromisoformat(s[:19].replace("Z", "")).date()
+        return datetime.fromisoformat(text[:19].replace("Z", "")).date()
     except ValueError:
         pass
-    m = _DMY.search(s)
-    if m:
-        d, mo, y = (int(x) for x in m.groups())
+    match = _DMY.search(text)
+    if match:
+        day, month, year = (int(group_value) for group_value in match.groups())
     else:
-        m = _YMD.search(s)
-        if not m:
+        match = _YMD.search(text)
+        if not match:
             return None
-        y, mo, d = (int(x) for x in m.groups())
+        year, month, day = (int(group_value) for group_value in match.groups())
     try:
-        return date(y, mo, d)
+        return date(year, month, day)
     except ValueError:
         return None
 
@@ -47,11 +47,11 @@ def parse_datetime(value) -> datetime | None:
     """
     if not value:
         return None
-    s = str(value).strip().replace("Z", "")
+    text = str(value).strip().replace("Z", "")
     try:
-        return datetime.fromisoformat(s[:19])
+        return datetime.fromisoformat(text[:19])
     except ValueError:
         try:
-            return datetime.strptime(s[:10], "%Y-%m-%d")
+            return datetime.strptime(text[:10], "%Y-%m-%d")
         except ValueError:
             return None

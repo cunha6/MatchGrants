@@ -47,8 +47,8 @@ def build_general_embedding_text(grant) -> str:
     ]
     parts += list(grant.final_recipients or [])
     if grant.eligible_regions:
-        parts.append("Regiões elegíveis: " + ", ".join(str(r) for r in grant.eligible_regions))
-    return "\n".join(str(p) for p in parts if p)
+        parts.append("Regiões elegíveis: " + ", ".join(str(region_name) for region_name in grant.eligible_regions))
+    return "\n".join(str(part) for part in parts if part)
 
 
 def build_sector_embedding_text(grant) -> str:
@@ -59,7 +59,7 @@ def build_sector_embedding_text(grant) -> str:
     Fallback: o título do aviso, quando não há setores declarados (é o texto mais próximo do
     domínio); sem ele, o aviso ficaria sem dimensão setorial nenhuma.
     """
-    sectors = [str(s).strip() for s in (grant.target_technology_sectors or []) if s]
+    sectors = [str(sector).strip() for sector in (grant.target_technology_sectors or []) if sector]
     if sectors:
         return "\n".join(sectors)
     return (grant.title or "").strip()
@@ -74,12 +74,12 @@ _TEXT_BUILDERS = {
 
 def build_embedding_texts(grant) -> dict[str, str]:
     """{tipo: texto} para todos os tipos registados (só os que produzem texto não vazio)."""
-    out = {}
+    texts_by_type = {}
     for etype, builder in _TEXT_BUILDERS.items():
         text = (builder(grant) or "").strip()
         if text:
-            out[etype] = text
-    return out
+            texts_by_type[etype] = text
+    return texts_by_type
 
 
 # --- Persistência ----------------------------------------------------------
@@ -95,7 +95,7 @@ def pending_embeddings(grant, force: bool = False) -> list[tuple[str, str, str]]
     texts = build_embedding_texts(grant)
     if not texts:
         return []
-    existing = {e.embedding_type: e for e in grant.embeddings.all()}
+    existing = {existing_embedding.embedding_type: existing_embedding for existing_embedding in grant.embeddings.all()}
     pending = []
     for etype, text in texts.items():
         h = emb.text_hash(text)
@@ -135,7 +135,7 @@ def save_grant_embeddings(grant, force: bool = False) -> dict[str, list[float]]:
 def grant_vectors(grant) -> dict[str, list[float]]:
     """{tipo: vetor} já gravados do aviso. Só LÊ (usa os registos pré-carregados por
     prefetch_related no match — não gera nem chama a OpenAI)."""
-    return {e.embedding_type: e.embedding for e in grant.embeddings.all()}
+    return {existing_embedding.embedding_type: existing_embedding.embedding for existing_embedding in grant.embeddings.all()}
 
 
 # --- Similaridade ----------------------------------------------------------
@@ -159,8 +159,8 @@ def relevance(company_vectors: dict, grant_vectors: dict) -> tuple[float | None,
     sector = sims.get(GrantEmbedding.Type.SECTOR)
     general = sims.get(GrantEmbedding.Type.GENERAL)
 
-    total_weight = sum(_WEIGHTS[t] for t in sims)
+    total_weight = sum(_WEIGHTS[embedding_type] for embedding_type in sims)
     if not total_weight:
         return None, sector, general
-    final = sum(sims[t] * _WEIGHTS[t] for t in sims) / total_weight
+    final = sum(sims[embedding_type] * _WEIGHTS[embedding_type] for embedding_type in sims) / total_weight
     return final, sector, general

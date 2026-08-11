@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import zipfile
 from datetime import date, timedelta
 from decimal import Decimal
@@ -16,9 +17,10 @@ from pathlib import Path
 from unittest import mock
 
 from django.contrib.auth.models import User
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
+from django.utils import timezone
 
-from anuncios import services, specifications
+from anuncios import services, specifications, specifications_ai
 from anuncios.models import Notice
 from users.models import UserProfile
 
@@ -301,30 +303,6 @@ class FindInZipTests(SimpleTestCase):
         self.assertEqual(specifications._find_in_zip(data), "")
 
 
-class FetchSpecificationsTests(SimpleTestCase):
-    def test_direct_pdf_matching_name(self):
-        resp = FakeResp(b"%PDF-1.7", ctype="application/pdf", url="http://x/ce.pdf",
-                        cd='attachment; filename="Caderno de Encargos.pdf"')
-        with mock.patch("anuncios.specifications._get", return_value=resp), \
-             mock.patch("anuncios.specifications._save_bytes",
-                        side_effect=lambda name, content, subdir="": f"pdf_Anuncios/{subdir + chr(47) if subdir else ''}{name}"):
-            self.assertEqual(specifications.fetch_specifications("http://x/ce.pdf"),
-                             "pdf_Anuncios/caderno_encargos/Caderno de Encargos.pdf")
-
-    def test_direct_pdf_non_ce_name_skipped(self):
-        resp = FakeResp(b"%PDF-1.7", ctype="application/pdf", url="http://x/prog.pdf",
-                        cd='attachment; filename="Programa.pdf"')
-        with mock.patch("anuncios.specifications._get", return_value=resp):
-            self.assertEqual(specifications.fetch_specifications("http://x/prog.pdf"), "")
-
-    def test_empty_url(self):
-        self.assertEqual(specifications.fetch_specifications(""), "")
-
-    def test_get_failure(self):
-        with mock.patch("anuncios.specifications._get", return_value=None):
-            self.assertEqual(specifications.fetch_specifications("http://x"), "")
-
-
 # --- Persistence / upsert --------------------------------------------------
 
 def _notice_data(**over):
@@ -439,6 +417,28 @@ class SerializeNoticeTests(TestCase):
         self.assertEqual(out["proposal_deadline"], "2026-07-13")
         self.assertEqual(out["status"], "active")
         self.assertIn("specifications_path", out)
+
+    def test_serialize_includes_pending_ai_detail_by_default(self):
+        n = Notice.objects.create(notice_number="AID-1")
+        out = services.serialize_notice(n)
+        self.assertEqual(out["ai_detail"], {
+            "status": "pending", "descricao_detalhada": "",
+            "avaliacao": "", "observacoes": [],
+        })
+
+    def test_serialize_includes_generated_ai_detail_once_done(self):
+        n = Notice.objects.create(
+            notice_number="AID-2",
+            specifications_ai_status=Notice.AiStatusChoices.DONE,
+            specifications_description="Descrição gerada.",
+            specifications_evaluation="Monofator – Preço mais baixo (100%)",
+            specifications_observations=["Visita ao local obrigatória."],
+        )
+        out = services.serialize_notice(n)
+        self.assertEqual(out["ai_detail"]["status"], "done")
+        self.assertEqual(out["ai_detail"]["descricao_detalhada"], "Descrição gerada.")
+        self.assertEqual(out["ai_detail"]["avaliacao"], "Monofator – Preço mais baixo (100%)")
+        self.assertEqual(out["ai_detail"]["observacoes"], ["Visita ao local obrigatória."])
 
 
 class DeactivateExpiredTests(TestCase):
@@ -571,6 +571,37 @@ class LockTests(SimpleTestCase):
         services.mark_import_start()
         self.assertTrue(self.lock.exists())
         self.assertTrue(services.import_running())
+
+    def test_spawn_refuses_while_an_extraction_is_running(self):
+        # Uma extração demora dezenas de minutos — um 2º pedido não a pode deitar fora a
+        # meio. Sem esta guarda, o spawn matava-a e relançava do zero.
+        services.mark_import_start()
+        with mock.patch("anuncios.services.subprocess.Popen") as popen:
+            self.assertFalse(services.spawn_specifications_download())
+        popen.assert_not_called()
+        self.assertTrue(self.lock.exists())  # a extração em curso ficou intacta
+
+    def test_spawn_launches_when_nothing_is_running(self):
+        pid_file = Path(self.tmp) / "pid"
+        with mock.patch("anuncios.services._pid_path", return_value=pid_file), \
+             mock.patch("anuncios.services.subprocess.Popen") as popen:
+            popen.return_value.pid = 4242
+            self.assertTrue(services.spawn_specifications_download())
+        popen.assert_called_once()
+        self.assertEqual(pid_file.read_text(encoding="utf-8"), "4242")
+
+    def test_spawn_clears_stale_files_without_killing_the_pid(self):
+        # Sem extração viva, o PID guardado já não é nosso — o SO pode tê-lo reutilizado.
+        # Os ficheiros são limpos, mas NUNCA se mata o processo que lá está.
+        pid_file = Path(self.tmp) / "pid"
+        pid_file.write_text("999999", encoding="utf-8")
+        self.lock.write_text("999999", encoding="utf-8")
+        os.utime(self.lock, (0, 0))  # lock velho -> import_running() dá False
+        with mock.patch("anuncios.services._pid_path", return_value=pid_file), \
+             mock.patch("anuncios.services.subprocess.Popen") as popen:
+            popen.return_value.pid = 7
+            self.assertTrue(services.spawn_specifications_download())
+        self.assertEqual(pid_file.read_text(encoding="utf-8"), "7")  # substituído, não morto
 
     def test_end_only_removes_own_lock(self):
         self.lock.write_text("999999", encoding="utf-8")  # foreign owner
@@ -979,3 +1010,493 @@ class ProgramServeTests(TestCase):
         with override_settings(BASE_DIR=self.tmp):
             resp = self.client.get(f"/anuncios/{self.notice.pk}/document/programaConcurso/")
         self.assertEqual(resp.status_code, 404)
+
+
+class AnunciosEmailHeadlineTests(TestCase):
+    """O título do email era construído com `yesno` sobre um |length, que devolve sempre o
+    1º argumento para qualquer lista não vazia — ou seja, o <h1> saía VAZIO em todos os
+    envios de uma só lista (ex: qualquer edição manual, que envia notify_notices([], [n]))."""
+
+    def setUp(self):
+        self.commercial = User.objects.create_user("com_head_an", email="com_head_an@x.pt")
+        self.commercial.profile.role = UserProfile.COMMERCIAL_PUBLIC
+        self.commercial.profile.save()
+
+    def _html(self, new_count, updated_count):
+        from django.core import mail
+        from anuncios.notifications import notify_notices
+        mail.outbox = []
+        notices = [
+            Notice.objects.create(notice_number=f"H{i}/2026", description=f"Anúncio {i}")
+            for i in range(new_count + updated_count)
+        ]
+        notify_notices(notices[:new_count], notices[new_count:])
+        return mail.outbox[0].alternatives[0][0]
+
+    def test_headline_singular_new(self):
+        self.assertIn("Novo anúncio publicado", self._html(1, 0))
+
+    def test_headline_plural_new(self):
+        self.assertIn("Novos anúncios publicados", self._html(2, 0))
+
+    def test_headline_singular_updated(self):
+        self.assertIn("Anúncio atualizado", self._html(0, 1))
+
+    def test_headline_plural_updated(self):
+        self.assertIn("Anúncios atualizados", self._html(0, 2))
+
+    def test_headline_both_lists(self):
+        self.assertIn("Anúncios novos e atualizados", self._html(1, 1))
+
+
+# --- Detalhe IA do caderno de encargos (specifications_ai) ----------------
+
+class TenderAIDetailSchemaTests(SimpleTestCase):
+    """TenderAIDetail: defaults e validação do JSON vindo do LLM."""
+
+    def test_defaults_when_empty(self):
+        detail = specifications_ai.TenderAIDetail.model_validate({})
+        self.assertEqual(detail.descricao_detalhada, "")
+        self.assertEqual(detail.avaliacao, "")
+        self.assertEqual(detail.observacoes, [])
+
+    def test_parses_full_payload(self):
+        detail = specifications_ai.TenderAIDetail.model_validate({
+            "descricao_detalhada": "Aquisição de serviços de limpeza.",
+            "avaliacao": "Multifator – Preço (40%) + Qualidade técnica (60%: Metodologia "
+                         "30% + Equipa 30%)",
+            "observacoes": ["Visita ao local obrigatória.", "Caução de 5%."],
+        })
+        self.assertEqual(
+            detail.avaliacao,
+            "Multifator – Preço (40%) + Qualidade técnica (60%: Metodologia 30% + Equipa 30%)",
+        )
+        self.assertEqual(detail.observacoes, ["Visita ao local obrigatória.", "Caução de 5%."])
+
+
+class CoerceAvaliacaoTests(SimpleTestCase):
+    """_coerce_avaliacao: passa strings tal e qual, mas trata o formato ANTIGO (objeto
+    {criterios, formula}, de antes de avaliacao passar a ser uma frase única) como vazio
+    em vez de rebentar a validação do Pydantic."""
+
+    def test_passes_through_string(self):
+        self.assertEqual(
+            specifications_ai._coerce_avaliacao("Monofator – Preço mais baixo (100%)"),
+            "Monofator – Preço mais baixo (100%)",
+        )
+
+    def test_legacy_object_shape_becomes_empty(self):
+        self.assertEqual(
+            specifications_ai._coerce_avaliacao({"criterios": [], "formula": ""}), "",
+        )
+
+    def test_empty_dict_default_becomes_empty(self):
+        self.assertEqual(specifications_ai._coerce_avaliacao({}), "")
+
+
+class GetMarkdownTests(TestCase):
+    """_get_markdown: reutiliza o markdown já convertido ou converte e persiste o caminho."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "pdf_Anuncios").mkdir(parents=True)
+        self.pdf_rel = "pdf_Anuncios/20260101_ce.pdf"
+        (self.tmp / self.pdf_rel).write_bytes(b"%PDF-1.4\ncaderno\n%%EOF")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_reuses_existing_markdown_file(self):
+        md_rel = "output/markdown/pdf_Anuncios/20260101_ce.md"
+        (self.tmp / "output" / "markdown" / "pdf_Anuncios").mkdir(parents=True)
+        (self.tmp / md_rel).write_text("# Caderno já convertido", encoding="utf-8")
+        notice = Notice.objects.create(
+            notice_number="MD-1", specifications_path=self.pdf_rel,
+            specifications_markdown_path=md_rel,
+        )
+        with override_settings(BASE_DIR=self.tmp), \
+             mock.patch("anuncios.specifications_ai.pdf_to_markdown") as pdf_to_md:
+            markdown = specifications_ai._get_markdown(notice)
+        self.assertEqual(markdown, "# Caderno já convertido")
+        pdf_to_md.assert_not_called()  # não reconverte — usa o ficheiro em cache
+
+    def test_converts_and_persists_path_when_not_cached(self):
+        notice = Notice.objects.create(notice_number="MD-2", specifications_path=self.pdf_rel)
+        with override_settings(BASE_DIR=self.tmp), \
+             mock.patch("anuncios.specifications_ai.pdf_to_markdown",
+                        return_value=("# Convertido agora", "output/markdown/pdf_Anuncios/x.md")) as pdf_to_md:
+            markdown = specifications_ai._get_markdown(notice)
+        self.assertEqual(markdown, "# Convertido agora")
+        pdf_to_md.assert_called_once()
+        notice.refresh_from_db()
+        self.assertEqual(notice.specifications_markdown_path, "output/markdown/pdf_Anuncios/x.md")
+
+    def test_reconverts_when_cached_file_missing(self):
+        notice = Notice.objects.create(
+            notice_number="MD-3", specifications_path=self.pdf_rel,
+            specifications_markdown_path="output/markdown/pdf_Anuncios/ja-nao-existe.md",
+        )
+        with override_settings(BASE_DIR=self.tmp), \
+             mock.patch("anuncios.specifications_ai.pdf_to_markdown",
+                        return_value=("# Reconvertido", "output/markdown/pdf_Anuncios/x.md")) as pdf_to_md:
+            markdown = specifications_ai._get_markdown(notice)
+        self.assertEqual(markdown, "# Reconvertido")
+        pdf_to_md.assert_called_once()
+
+    def test_raises_when_no_specifications_pdf(self):
+        notice = Notice.objects.create(notice_number="MD-4", specifications_path="")
+        with override_settings(BASE_DIR=self.tmp):
+            with self.assertRaises(specifications_ai.SpecificationsNotFound):
+                specifications_ai._get_markdown(notice)
+
+    def test_raises_when_conversion_fails(self):
+        notice = Notice.objects.create(notice_number="MD-5", specifications_path=self.pdf_rel)
+        with override_settings(BASE_DIR=self.tmp), \
+             mock.patch("anuncios.specifications_ai.pdf_to_markdown", return_value=None):
+            with self.assertRaises(specifications_ai.SpecificationsNotFound):
+                specifications_ai._get_markdown(notice)
+
+
+class HasSpecificationsTests(TestCase):
+    """_has_specifications: verificação rápida (sem converter) usada por
+    generate_detail_async para decidir se vale a pena arrancar uma thread de fundo."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "pdf_Anuncios").mkdir(parents=True)
+        self.pdf_rel = "pdf_Anuncios/20260101_ce.pdf"
+        (self.tmp / self.pdf_rel).write_bytes(b"%PDF-1.4\ncaderno\n%%EOF")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_true_when_pdf_exists(self):
+        notice = Notice.objects.create(notice_number="HAS-1", specifications_path=self.pdf_rel)
+        with override_settings(BASE_DIR=self.tmp):
+            self.assertTrue(specifications_ai._has_specifications(notice))
+
+    def test_true_when_markdown_already_cached(self):
+        md_rel = "output/markdown/pdf_Anuncios/20260101_ce.md"
+        (self.tmp / "output" / "markdown" / "pdf_Anuncios").mkdir(parents=True)
+        (self.tmp / md_rel).write_text("# Caderno", encoding="utf-8")
+        notice = Notice.objects.create(
+            notice_number="HAS-2", specifications_path="", specifications_markdown_path=md_rel,
+        )
+        with override_settings(BASE_DIR=self.tmp):
+            self.assertTrue(specifications_ai._has_specifications(notice))
+
+    def test_false_when_neither_exists(self):
+        notice = Notice.objects.create(notice_number="HAS-3", specifications_path="")
+        with override_settings(BASE_DIR=self.tmp):
+            self.assertFalse(specifications_ai._has_specifications(notice))
+
+
+class GenerateDetailTests(TestCase):
+    """generate_detail: cache em specifications_description/evaluation/observations,
+    force=True e chamada ao OpenAI (create_client/call_openai_text mockados — sem
+    chamadas reais nem custo)."""
+
+    def setUp(self):
+        self.notice = Notice.objects.create(notice_number="AI-1", specifications_path="x.pdf")
+        self.ai_json = json.dumps({
+            "descricao_detalhada": "Descrição gerada.",
+            "avaliacao": "Monofator – Preço mais baixo (100%)",
+            "observacoes": ["Visita ao local obrigatória."],
+        })
+
+    def test_returns_cached_detail_without_calling_ai(self):
+        self.notice.specifications_description = "Já gerado"
+        self.notice.specifications_evaluation = ""
+        self.notice.specifications_observations = []
+        self.notice.save(update_fields=[
+            "specifications_description", "specifications_evaluation", "specifications_observations",
+        ])
+        with mock.patch("anuncios.specifications_ai.create_client") as create_client, \
+             mock.patch("anuncios.specifications_ai.call_openai_text") as call_text:
+            detail = specifications_ai.generate_detail(self.notice)
+        self.assertEqual(detail.descricao_detalhada, "Já gerado")
+        create_client.assert_not_called()
+        call_text.assert_not_called()
+
+    def test_generates_and_caches_when_not_cached(self):
+        with mock.patch("anuncios.specifications_ai._get_markdown", return_value="# Caderno"), \
+             mock.patch("anuncios.specifications_ai.create_client"), \
+             mock.patch("anuncios.specifications_ai.call_openai_text",
+                        new=mock.AsyncMock(return_value=self.ai_json)):
+            detail = specifications_ai.generate_detail(self.notice)
+        self.assertEqual(detail.descricao_detalhada, "Descrição gerada.")
+        self.assertEqual(detail.avaliacao, "Monofator – Preço mais baixo (100%)")
+        self.notice.refresh_from_db()
+        self.assertEqual(self.notice.specifications_description, "Descrição gerada.")
+        self.assertEqual(self.notice.specifications_evaluation, "Monofator – Preço mais baixo (100%)")
+        self.assertEqual(self.notice.specifications_observations, ["Visita ao local obrigatória."])
+
+    def test_force_regenerates_even_if_cached(self):
+        self.notice.specifications_description = "Antigo"
+        self.notice.specifications_evaluation = ""
+        self.notice.specifications_observations = []
+        self.notice.save(update_fields=[
+            "specifications_description", "specifications_evaluation", "specifications_observations",
+        ])
+        with mock.patch("anuncios.specifications_ai._get_markdown", return_value="# Caderno"), \
+             mock.patch("anuncios.specifications_ai.create_client"), \
+             mock.patch("anuncios.specifications_ai.call_openai_text",
+                        new=mock.AsyncMock(return_value=self.ai_json)) as call_text:
+            detail = specifications_ai.generate_detail(self.notice, force=True)
+        call_text.assert_called_once()
+        self.assertEqual(detail.descricao_detalhada, "Descrição gerada.")
+
+    def test_malformed_ai_json_falls_back_to_empty_detail(self):
+        with mock.patch("anuncios.specifications_ai._get_markdown", return_value="# Caderno"), \
+             mock.patch("anuncios.specifications_ai.create_client"), \
+             mock.patch("anuncios.specifications_ai.call_openai_text",
+                        new=mock.AsyncMock(return_value="isto não é JSON")):
+            detail = specifications_ai.generate_detail(self.notice)
+        self.assertEqual(detail, specifications_ai.TenderAIDetail())
+
+    def test_propagates_specifications_not_found(self):
+        with mock.patch("anuncios.specifications_ai._get_markdown",
+                        side_effect=specifications_ai.SpecificationsNotFound("sem PDF")):
+            with self.assertRaises(specifications_ai.SpecificationsNotFound):
+                specifications_ai.generate_detail(self.notice)
+
+
+class GenerateDetailAsyncTests(TestCase):
+    """generate_detail_async: devolve o cache já pronto sem tocar em nada quando DONE,
+    arranca uma thread de fundo quando PENDING/ERROR, e não duplica threads quando já
+    está GENERATING. threading.Thread mockado — sem threads reais nem custo de OpenAI."""
+
+    def setUp(self):
+        self.notice = Notice.objects.create(notice_number="ASYNC-1", specifications_path="x.pdf")
+
+    def test_raises_when_no_specifications_at_all(self):
+        n = Notice.objects.create(notice_number="ASYNC-2", specifications_path="")
+        with self.assertRaises(specifications_ai.SpecificationsNotFound):
+            specifications_ai.generate_detail_async(n)
+
+    def test_returns_cached_done_without_spawning_thread(self):
+        self.notice.specifications_description = "Já gerado"
+        self.notice.specifications_ai_status = Notice.AiStatusChoices.DONE
+        self.notice.save()
+        with mock.patch("anuncios.specifications_ai.threading.Thread") as thread_cls:
+            status, detail = specifications_ai.generate_detail_async(self.notice)
+        self.assertEqual(status, "done")
+        self.assertEqual(detail.descricao_detalhada, "Já gerado")
+        thread_cls.assert_not_called()
+
+    def test_claims_and_spawns_thread_when_pending(self):
+        with mock.patch("anuncios.specifications_ai._has_specifications", return_value=True), \
+             mock.patch("anuncios.specifications_ai.threading.Thread") as thread_cls:
+            status, detail = specifications_ai.generate_detail_async(self.notice)
+        self.assertEqual(status, "generating")
+        self.assertIsNone(detail)
+        thread_cls.assert_called_once_with(
+            target=specifications_ai._run_and_store_in_thread,
+            args=(self.notice.pk, False), daemon=True,
+        )
+        thread_cls.return_value.start.assert_called_once()
+        self.notice.refresh_from_db()
+        self.assertEqual(self.notice.specifications_ai_status, Notice.AiStatusChoices.GENERATING)
+
+    def test_does_not_spawn_second_thread_while_already_generating(self):
+        self.notice.specifications_ai_status = Notice.AiStatusChoices.GENERATING
+        self.notice.save()
+        with mock.patch("anuncios.specifications_ai._has_specifications", return_value=True), \
+             mock.patch("anuncios.specifications_ai.threading.Thread") as thread_cls:
+            status, detail = specifications_ai.generate_detail_async(self.notice)
+        self.assertEqual(status, "generating")
+        thread_cls.assert_not_called()
+
+    def test_reclaims_stale_generating_status(self):
+        # Simula um worker que reiniciou a meio: GENERATING há mais de
+        # _STALE_GENERATING_AFTER — a próxima chamada tem de relançar, não ficar presa.
+        self.notice.specifications_ai_status = Notice.AiStatusChoices.GENERATING
+        self.notice.save()
+        Notice.objects.filter(pk=self.notice.pk).update(
+            updated_at=timezone.now() - specifications_ai._STALE_GENERATING_AFTER * 2)
+        with mock.patch("anuncios.specifications_ai._has_specifications", return_value=True), \
+             mock.patch("anuncios.specifications_ai.threading.Thread") as thread_cls:
+            status, detail = specifications_ai.generate_detail_async(self.notice)
+        self.assertEqual(status, "generating")
+        thread_cls.assert_called_once()
+
+    def test_force_regenerates_even_if_already_done(self):
+        self.notice.specifications_description = "Antigo"
+        self.notice.specifications_ai_status = Notice.AiStatusChoices.DONE
+        self.notice.save()
+        with mock.patch("anuncios.specifications_ai._has_specifications", return_value=True), \
+             mock.patch("anuncios.specifications_ai.threading.Thread") as thread_cls:
+            status, detail = specifications_ai.generate_detail_async(self.notice, force=True)
+        self.assertEqual(status, "generating")
+        thread_cls.assert_called_once()
+
+    def test_error_status_is_retried_automatically(self):
+        self.notice.specifications_ai_status = Notice.AiStatusChoices.ERROR
+        self.notice.save()
+        with mock.patch("anuncios.specifications_ai._has_specifications", return_value=True), \
+             mock.patch("anuncios.specifications_ai.threading.Thread") as thread_cls:
+            status, detail = specifications_ai.generate_detail_async(self.notice)
+        self.assertEqual(status, "generating")
+        thread_cls.assert_called_once()
+
+
+class RunAndStoreTests(TestCase):
+    """_run_and_store/_run_and_store_in_thread: o trabalho de facto executado pela thread
+    de fundo — chamados a direito, sem thread real."""
+
+    def setUp(self):
+        self.notice = Notice.objects.create(
+            notice_number="RUN-1", specifications_path="x.pdf",
+            specifications_ai_status=Notice.AiStatusChoices.GENERATING,
+        )
+
+    def test_success_sets_done(self):
+        with mock.patch("anuncios.specifications_ai.generate_detail") as gen:
+            specifications_ai._run_and_store(self.notice.pk, False)
+        gen.assert_called_once()
+        self.notice.refresh_from_db()
+        self.assertEqual(self.notice.specifications_ai_status, Notice.AiStatusChoices.DONE)
+
+    def test_failure_sets_error(self):
+        with mock.patch("anuncios.specifications_ai.generate_detail",
+                        side_effect=RuntimeError("boom")):
+            specifications_ai._run_and_store(self.notice.pk, False)
+        self.notice.refresh_from_db()
+        self.assertEqual(self.notice.specifications_ai_status, Notice.AiStatusChoices.ERROR)
+
+    def test_in_thread_wrapper_closes_db_connection(self):
+        with mock.patch("anuncios.specifications_ai._run_and_store") as run, \
+             mock.patch("anuncios.specifications_ai.connection") as conn:
+            specifications_ai._run_and_store_in_thread(self.notice.pk, True)
+        run.assert_called_once_with(self.notice.pk, True)
+        conn.close.assert_called_once()
+
+    def test_in_thread_wrapper_closes_connection_even_on_error(self):
+        with mock.patch("anuncios.specifications_ai._run_and_store",
+                        side_effect=RuntimeError("boom")), \
+             mock.patch("anuncios.specifications_ai.connection") as conn:
+            with self.assertRaises(RuntimeError):
+                specifications_ai._run_and_store_in_thread(self.notice.pk, True)
+        conn.close.assert_called_once()
+
+
+class NoticeAiDetailViewTests(TestCase):
+    """POST /anuncios/<id>/detail/ — autenticação, permissões (só admin/commercial_public),
+    métodos, 404 e o fluxo não-bloqueante (202 generating / 200 done)."""
+
+    def setUp(self):
+        self.notice = Notice.objects.create(notice_number="AIV-1", specifications_path="x.pdf")
+        user = User.objects.create_user(
+            "comercial_aidet_an", email="c@x.pt", password=TEST_PASSWORD)
+        user.profile.role = UserProfile.COMMERCIAL_PUBLIC
+        user.profile.save()
+        self.client.force_login(user)
+
+    def test_requires_authentication(self):
+        self.client.logout()
+        resp = self.client.post(f"/anuncios/{self.notice.pk}/detail/")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_client_role_forbidden(self):
+        client_user = User.objects.create_user("cliente_aidet_an", password=TEST_PASSWORD)
+        # o signal já cria o perfil com role=client
+        self.client.force_login(client_user)
+        resp = self.client.post(f"/anuncios/{self.notice.pk}/detail/")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_get_not_allowed(self):
+        resp = self.client.get(f"/anuncios/{self.notice.pk}/detail/")
+        self.assertEqual(resp.status_code, 405)
+
+    def test_404_when_notice_missing(self):
+        resp = self.client.post("/anuncios/999999/detail/")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_404_when_specifications_not_found(self):
+        with mock.patch("anuncios.views.specifications_ai.generate_detail_async",
+                        side_effect=specifications_ai.SpecificationsNotFound("sem PDF")):
+            resp = self.client.post(f"/anuncios/{self.notice.pk}/detail/")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_returns_cached_detail_immediately_when_already_done(self):
+        detail = specifications_ai.TenderAIDetail(descricao_detalhada="X", observacoes=["Y"])
+        with mock.patch("anuncios.views.specifications_ai.generate_detail_async",
+                        return_value=("done", detail)) as gen:
+            resp = self.client.post(f"/anuncios/{self.notice.pk}/detail/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["descricao_detalhada"], "X")
+        self.assertEqual(resp.json()["status"], "done")
+        gen.assert_called_once_with(self.notice, force=False)
+
+    def test_returns_202_while_generating_in_background(self):
+        with mock.patch("anuncios.views.specifications_ai.generate_detail_async",
+                        return_value=("generating", None)):
+            resp = self.client.post(f"/anuncios/{self.notice.pk}/detail/")
+        self.assertEqual(resp.status_code, 202)
+        self.assertEqual(resp.json(), {"status": "generating"})
+
+    def test_refresh_query_param_forces_regeneration(self):
+        with mock.patch("anuncios.views.specifications_ai.generate_detail_async",
+                        return_value=("generating", None)) as gen:
+            self.client.post(f"/anuncios/{self.notice.pk}/detail/?refresh=true")
+        gen.assert_called_once_with(self.notice, force=True)
+
+    def test_unexpected_error_returns_502(self):
+        with mock.patch("anuncios.views.specifications_ai.generate_detail_async",
+                        side_effect=RuntimeError("boom")):
+            resp = self.client.post(f"/anuncios/{self.notice.pk}/detail/")
+        self.assertEqual(resp.status_code, 502)
+
+
+class AiDetailEndToEndTests(TransactionTestCase):
+    """Prova a ligação ponta-a-ponta: POST /anuncios/<id>/detail/ arranca a geração numa
+    thread de fundo REAL (threading.Thread não é mockado aqui) e, quando termina, um GET
+    /anuncios/<id>/ NUM PEDIDO SEPARADO já mostra o detalhe gerado. Só o que fala com o
+    exterior é mockado (Docling/OpenAI) — o resto (threading, DB entre pedidos) é real.
+
+    TransactionTestCase (não TestCase): a thread de fundo usa uma ligação PRÓPRIA à BD —
+    um TestCase normal envolve o teste numa transação nunca comitada nessa ligação, por
+    isso a thread nunca veria a Notice criada no setUp (DoesNotExist). Isto reproduz
+    exatamente a produção: cada pedido HTTP comita as suas escritas normalmente."""
+
+    def setUp(self):
+        self.notice = Notice.objects.create(notice_number="E2E-1", specifications_path="x.pdf")
+        user = User.objects.create_user(
+            "comercial_e2e_an", email="c@x.pt", password=TEST_PASSWORD)
+        user.profile.role = UserProfile.COMMERCIAL_PUBLIC
+        user.profile.save()
+        self.client.force_login(user)
+
+    def test_post_then_get_shows_generated_detail_once_background_finishes(self):
+        ai_json = json.dumps({
+            "descricao_detalhada": "Descrição E2E.",
+            "avaliacao": "Monofator – Preço mais baixo (100%)",
+            "observacoes": ["Nota E2E."],
+        })
+        with mock.patch("anuncios.specifications_ai._has_specifications", return_value=True), \
+             mock.patch("anuncios.specifications_ai._get_markdown", return_value="# Caderno"), \
+             mock.patch("anuncios.specifications_ai.create_client"), \
+             mock.patch("anuncios.specifications_ai.call_openai_text",
+                        new=mock.AsyncMock(return_value=ai_json)):
+            resp = self.client.post(f"/anuncios/{self.notice.pk}/detail/")
+            self.assertEqual(resp.status_code, 202)
+            self.assertEqual(resp.json(), {"status": "generating"})
+
+            # A thread de fundo é real: espera (com limite de 5s) que termine, SEM sair
+            # do bloco mockado — se saísse antes, a thread podia acabar de correr já sem
+            # os mocks e tentar mesmo converter/chamar o OpenAI.
+            for _ in range(50):
+                self.notice.refresh_from_db()
+                if self.notice.specifications_ai_status != Notice.AiStatusChoices.GENERATING:
+                    break
+                time.sleep(0.1)
+
+        self.assertEqual(self.notice.specifications_ai_status, Notice.AiStatusChoices.DONE)
+
+        get_resp = self.client.get(f"/anuncios/{self.notice.pk}/")
+        self.assertEqual(get_resp.status_code, 200)
+        ai_detail = get_resp.json()["ai_detail"]
+        self.assertEqual(ai_detail["status"], "done")
+        self.assertEqual(ai_detail["descricao_detalhada"], "Descrição E2E.")
+        self.assertEqual(ai_detail["avaliacao"], "Monofator – Preço mais baixo (100%)")
+        self.assertEqual(ai_detail["observacoes"], ["Nota E2E."])

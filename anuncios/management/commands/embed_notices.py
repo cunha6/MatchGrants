@@ -26,11 +26,11 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         notices = list(Notice.objects.all())
         pending = []
-        for n in notices:
-            text = notice_embedding_text(n)
+        for notice in notices:
+            text = notice_embedding_text(notice)
             h = emb.text_hash(text)
-            if options["all"] or n.activity_embedding is None or n.activity_embedding_hash != h:
-                pending.append((n, text, h))
+            if options["all"] or notice.activity_embedding is None or notice.activity_embedding_hash != h:
+                pending.append((notice, text, h))
 
         self.stdout.write(f"{len(notices)} anúncios; {len(pending)} a (re)calcular...")
         if not pending:
@@ -40,13 +40,13 @@ class Command(BaseCommand):
         batch, done = options["batch"], 0
         for i in range(0, len(pending), batch):
             chunk = pending[i:i + batch]
-            vecs = emb.embed_many([t for _, t, _ in chunk])
+            vecs = emb.embed_many([text_input for _, text_input, _ in chunk])
             updated = []
-            for (n, _, h), vec in zip(chunk, vecs):
+            for (notice, _, h), vec in zip(chunk, vecs):
                 if vec is not None:
-                    n.activity_embedding = vec
-                    n.activity_embedding_hash = h
-                    updated.append(n)
+                    notice.activity_embedding = vec
+                    notice.activity_embedding_hash = h
+                    updated.append(notice)
             if updated:
                 Notice.objects.bulk_update(updated, ["activity_embedding", "activity_embedding_hash"])
                 done += len(updated)

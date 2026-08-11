@@ -19,108 +19,108 @@ _MIL_RE         = re.compile(r"(?<![a-zA-Z])mil(?![a-zA-Z])", re.IGNORECASE)  # 
 
 # ---------------------------------------------------------------------------
 # Coercers reutilizáveis
-def _float(v: Any) -> Optional[float]:
-    if v is None:
+def _float(raw_value: Any) -> Optional[float]:
+    if raw_value is None:
         return None
-    if isinstance(v, bool):
+    if isinstance(raw_value, bool):
         return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).strip().lower()
+    if isinstance(raw_value, (int, float)):
+        return float(raw_value)
+    cleaned_text = str(raw_value).strip().lower()
     for junk in ("€", "euros", "eur", "%"):
-        s = s.replace(junk, "")
-    s = s.strip()
-    if s in ("null", "none", "n/a", "-", ""):
+        cleaned_text = cleaned_text.replace(junk, "")
+    cleaned_text = cleaned_text.strip()
+    if cleaned_text in ("null", "none", "n/a", "-", ""):
         return None
 
     # Montantes por extenso ("25 milhões", "1,5 milhão", "300 mil", "2 mil milhões",
     # "inferior a 25 milhões euros" → o texto à volta já foi removido pelo prompt/chamador,
     # mas mesmo que sobre "25 milhões", convertemos para o número).
     mult = 1.0
-    if _MIL_MILHOES_RE.search(s):
+    if _MIL_MILHOES_RE.search(cleaned_text):
         mult = 1_000_000_000.0
-        s = _MIL_MILHOES_RE.sub(" ", s)
-    elif _MILHAR_RE.search(s):
+        cleaned_text = _MIL_MILHOES_RE.sub(" ", cleaned_text)
+    elif _MILHAR_RE.search(cleaned_text):
         mult = 1_000.0
-        s = _MILHAR_RE.sub(" ", s)
-    elif _MILHAO_RE.search(s):
+        cleaned_text = _MILHAR_RE.sub(" ", cleaned_text)
+    elif _MILHAO_RE.search(cleaned_text):
         mult = 1_000_000.0
-        s = _MILHAO_RE.sub(" ", s)
-    elif _MIL_RE.search(s):
+        cleaned_text = _MILHAO_RE.sub(" ", cleaned_text)
+    elif _MIL_RE.search(cleaned_text):
         mult = 1_000.0
-        s = _MIL_RE.sub(" ", s)
+        cleaned_text = _MIL_RE.sub(" ", cleaned_text)
 
-    s = s.replace(" ", "")
-    if not s:
+    cleaned_text = cleaned_text.replace(" ", "")
+    if not cleaned_text:
         return None
-    if s.count(",") == 1 and s.rfind(",") > s.rfind("."):
+    if cleaned_text.count(",") == 1 and cleaned_text.rfind(",") > cleaned_text.rfind("."):
         # Vírgula ÚNICA e depois do último ponto = decimal PT ("1.000,50" → 1000.50).
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
+        cleaned_text = cleaned_text.replace(".", "").replace(",", ".")
+    elif "," in cleaned_text:
         # Múltiplas vírgulas (ou vírgula antes de ponto) = vírgulas são separador de milhares
         # (formato US "1,234,567") → remove-as; os pontos ficam para a regra dos milhares.
-        s = s.replace(",", "")
-        if _THOUSANDS_DOTS.fullmatch(s):
-            s = s.replace(".", "")
-    elif _THOUSANDS_DOTS.fullmatch(s):
+        cleaned_text = cleaned_text.replace(",", "")
+        if _THOUSANDS_DOTS.fullmatch(cleaned_text):
+            cleaned_text = cleaned_text.replace(".", "")
+    elif _THOUSANDS_DOTS.fullmatch(cleaned_text):
         # Sem vírgula e com pontos a separar grupos de 3 dígitos ("300.000" = 300000,
         # NÃO 300.0). Sem estes pontos, "." é decimal (ex: "85.0", "4705882.34").
-        s = s.replace(".", "")
+        cleaned_text = cleaned_text.replace(".", "")
     try:
-        return float(s) * mult
+        return float(cleaned_text) * mult
     except ValueError:
         return None
 
 
-def _int(v: Any) -> Optional[int]:
-    if v is None:
+def _int(raw_value: Any) -> Optional[int]:
+    if raw_value is None:
         return None
-    if isinstance(v, bool):
+    if isinstance(raw_value, bool):
         return None
-    if isinstance(v, int):
-        return v
-    s = str(v).strip()
-    if s.lower() in ("null", "none", "n/a", "-", ""):
+    if isinstance(raw_value, int):
+        return raw_value
+    cleaned_text = str(raw_value).strip()
+    if cleaned_text.lower() in ("null", "none", "n/a", "-", ""):
         return None
     try:
-        return int(float(s))
+        return int(float(cleaned_text))
     except ValueError:
         return None
 
 
-def _str(v: Any) -> Optional[str]:
-    if v is None:
+def _str(raw_value: Any) -> Optional[str]:
+    if raw_value is None:
         return None
-    s = str(v).strip()
-    return None if s.lower() in ("null", "none", "n/a", "") else s
+    cleaned_text = str(raw_value).strip()
+    return None if cleaned_text.lower() in ("null", "none", "n/a", "") else cleaned_text
 
 
-def _list(v: Any) -> list[str]:
-    if not v:
+def _list(raw_value: Any) -> list[str]:
+    if not raw_value:
         return []
-    if isinstance(v, str):
-        return [v] if v.strip() and v.strip().lower() not in ("null", "none") else []
-    if isinstance(v, list):
+    if isinstance(raw_value, str):
+        return [raw_value] if raw_value.strip() and raw_value.strip().lower() not in ("null", "none") else []
+    if isinstance(raw_value, list):
         result = []
-        for item in v:
+        for item in raw_value:
             if item is None:
                 continue
-            s = str(item).strip()
-            if s and s.lower() not in ("null", "none"):
-                result.append(s)
+            cleaned_text = str(item).strip()
+            if cleaned_text and cleaned_text.lower() not in ("null", "none"):
+                result.append(cleaned_text)
         return result
     return []
 
 
-def _bool(v: Any) -> Optional[bool]:
-    if v is None:
+def _bool(raw_value: Any) -> Optional[bool]:
+    if raw_value is None:
         return None
-    if isinstance(v, bool):
-        return v
-    s = str(v).lower().strip()
-    if s in ("true", "yes", "1", "sim", "verdadeiro"):
+    if isinstance(raw_value, bool):
+        return raw_value
+    cleaned_text = str(raw_value).lower().strip()
+    if cleaned_text in ("true", "yes", "1", "sim", "verdadeiro"):
         return True
-    if s in ("false", "no", "0", "não", "falso", "nao"):
+    if cleaned_text in ("false", "no", "0", "não", "falso", "nao"):
         return False
     return None
 
@@ -151,28 +151,28 @@ class DocumentoRegulamentacao(_Base):
     url:  CoercedStr = None
 
 
-def _article_refs(v: Any) -> list[dict]:
+def _article_refs(raw_value: Any) -> list[dict]:
     """Normaliza `artigos` para lista de objetos {artigo, refere_se_a}.
 
     Aceita também o formato legado (lista de strings) — cada string vira {"artigo": s}
     sem descrição — para não partir dados/outputs antigos.
     """
-    if not v:
+    if not raw_value:
         return []
-    if isinstance(v, (str, dict)):
-        v = [v]
-    if not isinstance(v, list):
+    if isinstance(raw_value, (str, dict)):
+        raw_value = [raw_value]
+    if not isinstance(raw_value, list):
         return []
     out: list[dict] = []
-    for item in v:
+    for item in raw_value:
         if item is None:
             continue
         if isinstance(item, dict):
             out.append(item)
         else:
-            s = str(item).strip()
-            if s and s.lower() not in ("null", "none"):
-                out.append({"artigo": s})
+            cleaned_text = str(item).strip()
+            if cleaned_text and cleaned_text.lower() not in ("null", "none"):
+                out.append({"artigo": cleaned_text})
     return out
 
 
@@ -194,26 +194,26 @@ class LegislationRef(_Base):
     refers_to:       CoercedStr        = Field(default=None, alias="refere_se_a")
 
 
-def _legislation_refs(v: Any) -> list[dict]:
+def _legislation_refs(raw_value: Any) -> list[dict]:
     """Normaliza `legislacao_aplicavel` para lista de objetos. Tolera o formato legado (lista
     de strings) — cada string vira {"nome_regulamento": s} — para não rebentar o parse quando
     o LLM devolve um diploma como texto simples em vez de objeto."""
-    if not v:
+    if not raw_value:
         return []
-    if isinstance(v, (str, dict)):
-        v = [v]
-    if not isinstance(v, list):
+    if isinstance(raw_value, (str, dict)):
+        raw_value = [raw_value]
+    if not isinstance(raw_value, list):
         return []
     out: list[dict] = []
-    for item in v:
+    for item in raw_value:
         if item is None:
             continue
         if isinstance(item, dict):
             out.append(item)
         else:
-            s = str(item).strip()
-            if s and s.lower() not in ("null", "none"):
-                out.append({"nome_regulamento": s})
+            cleaned_text = str(item).strip()
+            if cleaned_text and cleaned_text.lower() not in ("null", "none"):
+                out.append({"nome_regulamento": cleaned_text})
     return out
 
 
@@ -251,25 +251,25 @@ class CriterioAvaliacao(_Base):
 
     @field_validator("subcriteria", mode="before")
     @classmethod
-    def _subcriteria_empty_to_none(cls, v):
-        return v or None
+    def _subcriteria_empty_to_none(cls, raw_value):
+        return raw_value or None
 
 
-def _expense_groups(v: Any) -> list[dict]:
+def _expense_groups(raw_value: Any) -> list[dict]:
     """Normaliza despesas para lista de grupos {categoria, itens}.
 
     Aceita o formato legado (lista de strings) → um único grupo sem categoria
     ({"categoria": None, "itens": [...]}). Se já vier como lista de grupos (dicts),
     passa-os à frente; strings soltas à mistura vão para um grupo sem categoria.
     """
-    if not v:
+    if not raw_value:
         return []
-    if isinstance(v, (str, dict)):
-        v = [v]
-    if not isinstance(v, list):
+    if isinstance(raw_value, (str, dict)):
+        raw_value = [raw_value]
+    if not isinstance(raw_value, list):
         return []
-    dicts = [x for x in v if isinstance(x, dict)]
-    loose = [str(x).strip() for x in v
+    dicts = [x for x in raw_value if isinstance(x, dict)]
+    loose = [str(x).strip() for x in raw_value
              if not isinstance(x, dict) and x is not None and str(x).strip().lower() not in ("null", "none", "")]
     groups = list(dicts)
     if loose:
@@ -345,11 +345,11 @@ class Grant(_Base):
 
     @field_validator("eligible_expenses", "ineligible_expenses", mode="after")
     @classmethod
-    def _drop_empty_expense_groups(cls, v):
+    def _drop_empty_expense_groups(cls, raw_value):
         # Remove grupos sem itens (ex: o shell "[{category:null, items:[]}]" que o LLM às vezes
         # devolve quando não encontra despesas). Assim, "vazio" volta a ser [] — o que faz o
         # rescue do P7 disparar (que ignora [] mas não [{...}]).
-        return [g for g in v if g.items]
+        return [g for g in raw_value if g.items]
     output_indicators:                   list[Indicador] = Field(default_factory=list, alias="indicadores_realizacao")
     result_indicators:                   list[Indicador] = Field(default_factory=list, alias="indicadores_resultados")
     monitoring_indicators:               list[Indicador] = Field(default_factory=list, alias="indicadores_acompanhamento")

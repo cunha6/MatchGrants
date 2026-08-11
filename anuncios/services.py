@@ -8,6 +8,7 @@ from the listing. The tender-specifications download lives in specifications.py.
 
 import os
 import logging
+import re
 import subprocess
 import sys
 import time
@@ -41,9 +42,15 @@ KEYWORDS = [
     "Território", "Territorial", "Ecologia", "Ecológica", "Ecológico",
     "Compras públicas", "Compras sustentáveis", "Compras ecológicas", "ECO 360",
     "Turismo", "Interior", "Valorização", "Recursos", "Projeto", "Verdes",
-    "Ambiental", "Ambiente", "Pegada Ecológica", "Pegada Carbono",
+    "Ambiental", "Ambiente", "Pegada Ecológica", "Pegada Carbono", "Sistemas de informação", "Sistemas informação",
+    "IA", "Inteligência artificial", "Inteligencia artificial", "Business intelligence", "Data analytics", "Analise Dados",
+    "Análise Dados", "Transformação digital", "Integração", "Integracao"
 ]
-_NORM_KEYWORDS = [normalize(k) for k in KEYWORDS]
+# Cada keyword vira um padrão que só casa no INÍCIO de uma palavra (\b), mas aceita
+# sufixos: "estrategia" apanha "estratégias", enquanto "ia" deixa de apanhar "material",
+# "vigilância" ou "residência" — sem a fronteira, uma keyword curta casava dentro de meia
+# língua portuguesa e a importação trazia tudo.
+_KEYWORD_PATTERNS = [re.compile(r"\b" + re.escape(normalize(keyword))) for keyword in KEYWORDS]
 
 # Orderings supported by the listing (?order_by=).
 ORDERING = {
@@ -65,38 +72,39 @@ class BaseGovError(Exception):
 
 
 def matched_keywords(description: str) -> list[str]:
-    """Return the keywords (original spelling) present in the description."""
-    n = normalize(description)
-    return [kw for kw, nk in zip(KEYWORDS, _NORM_KEYWORDS) if nk in n]
+    """Keywords (na grafia original) presentes na descrição, ignorando acentos e maiúsculas."""
+    normalized_description = normalize(description)
+    return [keyword for keyword, pattern in zip(KEYWORDS, _KEYWORD_PATTERNS)
+            if pattern.search(normalized_description)]
 
 
 # --- Tolerant parsers for API data ----------------------------------------
-def _pick(raw: dict, *keys):
+def _pick(raw_notice: dict, *keys):
     """First non-empty value among key variants (case-insensitive).
 
     The base.gov API mixes camelCase and PascalCase (e.g. 'nAnuncio' but 'PrecoBase',
     'DataLimitePropostas'); comparing case-insensitively avoids losing fields.
     """
-    if not raw:
+    if not raw_notice:
         return None
-    low = {k.lower(): v for k, v in raw.items()}
-    for k in keys:
-        v = low.get(k.lower())
-        if v not in (None, ""):
-            return v
+    lowercased_keys = {key_variant.lower(): candidate_value for key_variant, candidate_value in raw_notice.items()}
+    for key_variant in keys:
+        candidate_value = lowercased_keys.get(key_variant.lower())
+        if candidate_value not in (None, ""):
+            return candidate_value
     return None
 
 
 def _parse_decimal(value):
     if value in (None, ""):
         return None
-    s = str(value).replace("€", "").replace(" ", "").strip()
-    if "," in s and "." in s:  # PT format "1.234.567,89" -> "1234567.89"
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
+    cleaned_number = str(value).replace("€", "").replace(" ", "").strip()
+    if "," in cleaned_number and "." in cleaned_number:  # PT format "1.234.567,89" -> "1234567.89"
+        cleaned_number = cleaned_number.replace(".", "").replace(",", ".")
+    elif "," in cleaned_number:
+        cleaned_number = cleaned_number.replace(",", ".")
     try:
-        return Decimal(s)
+        return Decimal(cleaned_number)
     except InvalidOperation:
         return None
 
@@ -122,37 +130,37 @@ def _parse_list(value) -> list:
     if isinstance(value, list):
         return value
     if isinstance(value, str):
-        return [p.strip() for p in value.split(",") if p.strip()]
+        return [list_part.strip() for list_part in value.split(",") if list_part.strip()]
     return [value]
 
 
-def _map_notice(raw: dict) -> dict:
+def _map_notice(raw_notice: dict) -> dict:
     """Map a raw API record to the model field dict.
 
     API keys are tried in several capitalization variants; if the real response uses
     different names, this is the (only) place to adjust.
     """
     return {
-        "incm_id": str(_pick(raw, "idINCM", "idIncm", "IdIncm", "id") or "")[:20],
-        "notice_number": str(_pick(raw, "nAnuncio", "numAnuncio", "NumAnuncio") or "")[:20],
-        "publication_date": _parse_date(_pick(raw, "dataPublicacao", "DataPublicacao", "dataPublicação")),
-        "entity_nif": str(_pick(raw, "nifEntidade", "NifEntidade", "nif") or "")[:9],
-        "entity_name": str(_pick(raw, "designacaoEntidade", "DesignacaoEntidade") or "")[:255],
-        "description": str(_pick(raw, "descricaoAnuncio", "DescricaoAnuncio") or ""),
-        "url": str(_pick(raw, "url", "URL", "urlAnuncio") or "")[:500],
-        "dr_number": str(_pick(raw, "numDR", "numDr", "NumDR") or "")[:10],
-        "series": str(_pick(raw, "serie", "Serie") or "")[:5],
-        "act_type": str(_pick(raw, "tipoActo", "tipoAto", "TipoActo") or ""),
-        "contract_types": _parse_list(_pick(raw, "tiposContrato", "tipoContrato", "TiposContrato")),
-        "cpvs": _parse_list(_pick(raw, "cpvs", "CPVs", "cpv")),
-        "lots": _parse_list(_pick(raw, "lotes", "Lotes")),
-        "base_price": _parse_decimal(_pick(raw, "precoBase", "PrecoBase")),
-        "procedure_type": str(_pick(raw, "modeloAnuncio", "ModeloAnuncio") or ""),
-        "year": _parse_int(_pick(raw, "ano", "Ano")),
-        "environmental_criteria": _parse_bool(_pick(raw, "criterAmbient", "criterioAmbiental", "CriterAmbient")),
-        "proposal_period_days": _parse_int(_pick(raw, "prazoPropostas", "PrazoPropostas")),
-        "procedure_documents_url": str(_pick(raw, "pecasProcedimento", "PecasProcedimento") or "")[:500],
-        "proposal_deadline": _parse_date(_pick(raw, "dataLimiteProposta", "DataLimiteProposta", "dataLimitePropostas")),
+        "incm_id": str(_pick(raw_notice, "idINCM", "idIncm", "IdIncm", "id") or "")[:20],
+        "notice_number": str(_pick(raw_notice, "nAnuncio", "numAnuncio", "NumAnuncio") or "")[:20],
+        "publication_date": _parse_date(_pick(raw_notice, "dataPublicacao", "DataPublicacao", "dataPublicação")),
+        "entity_nif": str(_pick(raw_notice, "nifEntidade", "NifEntidade", "nif") or "")[:9],
+        "entity_name": str(_pick(raw_notice, "designacaoEntidade", "DesignacaoEntidade") or "")[:255],
+        "description": str(_pick(raw_notice, "descricaoAnuncio", "DescricaoAnuncio") or ""),
+        "url": str(_pick(raw_notice, "url", "URL", "urlAnuncio") or "")[:500],
+        "dr_number": str(_pick(raw_notice, "numDR", "numDr", "NumDR") or "")[:10],
+        "series": str(_pick(raw_notice, "serie", "Serie") or "")[:5],
+        "act_type": str(_pick(raw_notice, "tipoActo", "tipoAto", "TipoActo") or ""),
+        "contract_types": _parse_list(_pick(raw_notice, "tiposContrato", "tipoContrato", "TiposContrato")),
+        "cpvs": _parse_list(_pick(raw_notice, "cpvs", "CPVs", "cpv")),
+        "lots": _parse_list(_pick(raw_notice, "lotes", "Lotes")),
+        "base_price": _parse_decimal(_pick(raw_notice, "precoBase", "PrecoBase")),
+        "procedure_type": str(_pick(raw_notice, "modeloAnuncio", "ModeloAnuncio") or ""),
+        "year": _parse_int(_pick(raw_notice, "ano", "Ano")),
+        "environmental_criteria": _parse_bool(_pick(raw_notice, "criterAmbient", "criterioAmbiental", "CriterAmbient")),
+        "proposal_period_days": _parse_int(_pick(raw_notice, "prazoPropostas", "PrazoPropostas")),
+        "procedure_documents_url": str(_pick(raw_notice, "pecasProcedimento", "PecasProcedimento") or "")[:500],
+        "proposal_deadline": _parse_date(_pick(raw_notice, "dataLimiteProposta", "DataLimiteProposta", "dataLimitePropostas")),
     }
 
 
@@ -183,7 +191,7 @@ def fetch_notices(num_days: int = 15) -> list[dict]:
 
 # --- Persistence -----------------------------------------------------------
 
-def _upsert_notice(data: dict) -> tuple[str, Notice]:
+def _upsert_notice(notice_fields: dict) -> tuple[str, Notice]:
     """Create/update the notice. Returns (status, notice) — status é 'created', 'updated' ou
     'unchanged'. O objeto devolvido alimenta a notificação aos comerciais (ver import_notices).
 
@@ -192,30 +200,30 @@ def _upsert_notice(data: dict) -> tuple[str, Notice]:
     - empty values (None/""/[]) do NOT overwrite stored data (partial rectification);
     - only writes to the DB if some field actually changed.
     """
-    obj = Notice.objects.filter(notice_number=data["notice_number"]).first()
-    if obj is None:
-        obj = Notice.objects.create(**data)
-        return "created", obj
+    notice_record = Notice.objects.filter(notice_number=notice_fields["notice_number"]).first()
+    if notice_record is None:
+        notice_record = Notice.objects.create(**notice_fields)
+        return "created", notice_record
 
     changed = []
-    for field, value in data.items():
+    for field, value in notice_fields.items():
         if value in (None, "", []):
             continue
-        if getattr(obj, field) != value:
-            setattr(obj, field, value)
+        if getattr(notice_record, field) != value:
+            setattr(notice_record, field, value)
             changed.append(field)
 
     if not changed:
-        return "unchanged", obj
+        return "unchanged", notice_record
 
     # A última escrita foi a importação — mesmo que o anúncio já tivesse sido editado à mão
     # antes, a origem passa a refletir esta escrita mais recente (ver Notice.last_update_source).
-    obj.last_update_source = Notice.SOURCE_SCRAPE
-    obj.last_updated_by = None
-    obj.save(update_fields=changed + [
+    notice_record.last_update_source = Notice.SOURCE_SCRAPE
+    notice_record.last_updated_by = None
+    notice_record.save(update_fields=changed + [
         "updated_at", "last_update_source", "last_updated_by",
     ])
-    return "updated", obj
+    return "updated", notice_record
 
 
 def _existing_doc_path(notice_number: str, field: str) -> str:
@@ -244,6 +252,61 @@ def existing_program_path(notice_number: str) -> str:
 
 # --- Import ----------------------------------------------------------------
 
+def _notice_status(notice_fields: dict, today: date) -> str:
+    """Estado do anúncio à luz dos dados importados.
+
+    Sem prazo → corrigir (falta o dado que decide tudo o resto). Prazo passado → inativo
+    (encerrado, não vale a pena pedir correção). Em aberto mas SEM PREÇO → corrigir também,
+    porque falta um dado essencial num anúncio ainda relevante. Caso contrário, ativo.
+    """
+    deadline = notice_fields["proposal_deadline"]
+    if deadline is None:
+        return Notice.StatusChoices.TO_FIX
+    if deadline < today:
+        return Notice.StatusChoices.INACTIVE
+    if notice_fields["base_price"] is None:
+        return Notice.StatusChoices.TO_FIX
+    return Notice.StatusChoices.ACTIVE
+
+
+def _apply_document_paths(notice_fields: dict, download_specs: bool, driver_factory) -> None:
+    """Preenche `specifications_path`/`program_path` (caderno de encargos + programa).
+
+    Reutiliza os já descarregados; senão obtém ambos numa única passagem, partilhando o
+    Chrome. "" não sobrescreve um caminho já guardado (ver _upsert_notice). Com
+    `download_specs=False` nem sequer abre o browser — é o modo rápido da rota HTTP.
+    """
+    number = notice_fields["notice_number"]
+    if not download_specs:
+        notice_fields["specifications_path"] = ""
+        notice_fields["program_path"] = ""
+        return
+
+    reused_specs = existing_specifications_path(number)
+    reused_program = existing_program_path(number)
+    if reused_specs and reused_program:
+        notice_fields["specifications_path"] = reused_specs
+        notice_fields["program_path"] = reused_program
+        logger.info(f"  [{number}] Documentos já descarregados.")
+        return
+
+    if not notice_fields["procedure_documents_url"]:
+        notice_fields["specifications_path"] = ""
+        notice_fields["program_path"] = ""
+        logger.info(f"  [{number}] Sem link para as peças do procedimento.")
+        return
+
+    logger.info(f"  [{number}] À procura dos documentos (CE + programa)...")
+    connection.close()  # avoid a stale DB connection during the long download
+    docs = fetch_documents(notice_fields["procedure_documents_url"], driver_factory=driver_factory)
+    notice_fields["specifications_path"] = reused_specs or docs["specifications"]
+    notice_fields["program_path"] = reused_program or docs["program"]
+    logger.info(
+        f"  [{number}] CE: {os.path.basename(notice_fields['specifications_path']) or '—'} | "
+        f"Programa: {os.path.basename(notice_fields['program_path']) or '—'}"
+    )
+
+
 def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=None) -> dict:
     """Import notices: filter by keywords and upsert only the matches.
 
@@ -269,70 +332,31 @@ def import_notices(num_days: int = 15, download_specs: bool = True, should_stop=
         return driver_cache["driver"]
 
     try:
-        for raw in raw_list:
+        for raw_notice in raw_list:
             if should_stop and should_stop():
                 logger.info("  [import_notices] cancelled (a new import started).")
                 break
-            description = _pick(raw, "descricaoAnuncio", "DescricaoAnuncio") or ""
+            description = _pick(raw_notice, "descricaoAnuncio", "DescricaoAnuncio") or ""
             if not matched_keywords(description):
                 continue
             with_keywords += 1
 
             _heartbeat_lock()
 
-            data = _map_notice(raw)
-            if not data["notice_number"]:
+            notice_fields = _map_notice(raw_notice)
+            if not notice_fields["notice_number"]:
                 continue  # no natural key -> cannot deduplicate
 
-            # Estado: sem prazo -> corrigir; prazo passado -> inativo (encerrado, não vale a
-            # pena pedir correção); em aberto mas SEM PREÇO -> corrigir também (falta um dado
-            # essencial num anúncio ainda relevante); caso contrário, ativo.
-            deadline = data["proposal_deadline"]
-            if deadline is None:
-                data["status"] = Notice.StatusChoices.TO_FIX
-            elif deadline < today:
-                data["status"] = Notice.StatusChoices.INACTIVE
-            elif data["base_price"] is None:
-                data["status"] = Notice.StatusChoices.TO_FIX
-            else:
-                data["status"] = Notice.StatusChoices.ACTIVE
+            notice_fields["status"] = _notice_status(notice_fields, today)
+            _apply_document_paths(notice_fields, download_specs, driver_factory)
 
-            # Documentos base — caderno de encargos + programa de concurso (só quando
-            # download_specs): reutiliza os já descarregados, senão obtém ambos numa passagem
-            # (partilhando o Chrome). "" não sobrescreve um caminho já guardado.
-            number = data["notice_number"]
-            if not download_specs:
-                data["specifications_path"] = ""
-                data["program_path"] = ""
-            else:
-                reused_specs = existing_specifications_path(number)
-                reused_program = existing_program_path(number)
-                if reused_specs and reused_program:
-                    data["specifications_path"] = reused_specs
-                    data["program_path"] = reused_program
-                    logger.info(f"  [{number}] Documentos já descarregados.")
-                elif data["procedure_documents_url"]:
-                    logger.info(f"  [{number}] À procura dos documentos (CE + programa)...")
-                    connection.close()  # avoid a stale DB connection during the long download
-                    docs = fetch_documents(data["procedure_documents_url"], driver_factory=driver_factory)
-                    data["specifications_path"] = reused_specs or docs["specifications"]
-                    data["program_path"] = reused_program or docs["program"]
-                    logger.info(
-                        f"  [{number}] CE: {os.path.basename(data['specifications_path']) or '—'} | "
-                        f"Programa: {os.path.basename(data['program_path']) or '—'}"
-                    )
-                else:
-                    data["specifications_path"] = ""
-                    data["program_path"] = ""
-                    logger.info(f"  [{number}] Sem link para as peças do procedimento.")
-
-            status, obj = _upsert_notice(data)
+            status, notice_record = _upsert_notice(notice_fields)
             if status == "created":
                 created += 1
-                created_records.append(obj)
+                created_records.append(notice_record)
             elif status == "updated":
                 updated += 1
-                updated_records.append(obj)
+                updated_records.append(notice_record)
             else:
                 unchanged += 1
     finally:
@@ -398,7 +422,7 @@ def download_missing_specifications() -> dict:
             if updates:
                 Notice.objects.filter(pk=pk).update(**updates)
                 downloaded += 1
-                logger.info(f"  [{number}] OK -> {', '.join(os.path.basename(v) for v in updates.values())}")
+                logger.info(f"  [{number}] OK -> {', '.join(os.path.basename(candidate_value) for candidate_value in updates.values())}")
             else:
                 missing += 1
                 logger.info(f"  [{number}] Nenhum documento novo encontrado.")
@@ -469,53 +493,42 @@ def mark_import_end():
             pass
 
 
-def kill_previous_import():
-    """Kill the previous import (tree: python + chromedriver + chrome), if any.
+def _clear_stale_import_files():
+    """Apaga o PID e o lock que tenham sobrado de uma extração JÁ TERMINADA.
 
-    Uses the PID stored by spawn_specifications_download. On Windows 'taskkill /T' kills the
-    whole tree; on POSIX the process group (start_new_session) is killed. Also clears the
-    lock and the PID file.
+    Só deve ser chamada depois de `import_running()` dar False. Deliberadamente NÃO mata o
+    PID guardado: sem extração viva, esse PID já não é nosso — o sistema operativo pode
+    tê-lo reutilizado entretanto para um processo alheio (o Postgres, o próprio worker), e
+    matá-lo às cegas mataria esse.
     """
-    pid_file = _pid_path()
-    pid = None
-    if pid_file.exists():
+    for stale_file in (_pid_path(), _lock_path()):
         try:
-            pid = int(pid_file.read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            pid = None
-    if pid:
-        try:
-            if os.name == "nt":
-                # taskkill /T mata a árvore toda (python + chromedriver + chrome).
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
-            else:
-                # POSIX: o processo foi lançado com start_new_session (grupo próprio),
-                # por isso killpg mata o grupo inteiro — incluindo o Chrome filho.
-                import signal
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-        except Exception:  # noqa: BLE001 — best-effort; the process may already be dead
-            pass
-    for f in (pid_file, _lock_path()):
-        try:
-            f.unlink()
+            stale_file.unlink()
         except FileNotFoundError:
             pass
 
 
 def spawn_specifications_download() -> bool:
-    """(Re)launch 'manage.py download_specifications' as a SEPARATE process.
+    """Launch 'manage.py download_specifications' as a SEPARATE process.
 
     Being its own process (not a runserver thread), it SURVIVES the runserver auto-reloads,
     so the long Vortal extraction runs to the end. Downloads only the missing specifications
-    (no API re-fetch — the notices were already registered by the route). Always kills the
-    previous run first. On POSIX the child gets its own session/process group so the whole
-    tree (python + chromedriver + chrome) can be killed together. Progress shows in the
-    runserver console (inherited stdout, unbuffered with '-u'). Always returns True.
+    (no API re-fetch — the notices were already registered by the route). On POSIX the child
+    gets its own session/process group. Progress shows in the runserver console (inherited
+    stdout, unbuffered with '-u').
+
+    Devolve False, SEM lançar nada, se já houver uma extração viva (ver `import_running`):
+    uma extração demora dezenas de minutos e um segundo pedido não a pode deitar fora a meio.
+    Uma extração que morra sem se limpar deixa o lock a envelhecer e liberta-se sozinha ao fim
+    de `_LOCK_MAX_AGE` — não fica presa para sempre.
     """
-    kill_previous_import()
+    if import_running():
+        logger.info(
+            "[anuncios] Extração de documentos já a decorrer — pedido ignorado "
+            "(a que está em curso não foi interrompida)."
+        )
+        return False
+    _clear_stale_import_files()
     manage_py = settings.BASE_DIR / "manage.py"
     popen_kwargs = {}
     if os.name == "nt":
@@ -667,4 +680,15 @@ def serialize_notice(n: Notice) -> dict:
         # Origem da última escrita ('scrape'/'manual') + quem a fez (username), quando manual.
         "last_update_source": n.last_update_source,
         "last_updated_by": n.last_updated_by.username if n.last_updated_by_id else None,
+        # Detalhe gerado por IA do caderno de encargos — o que já estiver cacheado (ver
+        # POST /anuncios/<id>/detail/, anuncios/specifications_ai.py). status="pending" se
+        # a geração ainda nunca foi pedida; os restantes campos vêm vazios nesse caso. Mesma
+        # forma do corpo devolvido por POST /detail/, para o front-end reutilizar o mesmo
+        # componente de apresentação nos dois sítios.
+        "ai_detail": {
+            "status": n.specifications_ai_status,
+            "descricao_detalhada": n.specifications_description,
+            "avaliacao": n.specifications_evaluation,
+            "observacoes": n.specifications_observations,
+        },
     }

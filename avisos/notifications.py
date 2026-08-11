@@ -15,25 +15,21 @@ usa o motor de templates do próprio Django em vez do pipeline React Email/rende
 import logging
 
 from django.conf import settings
-from django.core.mail import send_mail
 from django.template.loader import render_to_string
 
+from common.notifications import commercial_emails as _commercial_emails
+from common.notifications import format_euros, send_digest
+from .serializers import financing_rate
 from users.models import UserProfile
 
 logger = logging.getLogger("avisos.audit")
 
 
 def commercial_emails() -> list[str]:
-    """Emails dos utilizadores comerciais ativos (com email preenchido) com acesso a avisos —
-    commercial_grants (especialista) e commercial_public (acumula avisos+anúncios)."""
-    return list(
-        UserProfile.objects.filter(
-            role__in=(UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC),
-            user__is_active=True,
-        )
-        .exclude(user__email="")
-        .values_list("user__email", flat=True)
-    )
+    """Comerciais com acesso a avisos: commercial_grants (especialista) e commercial_public
+    (acumula avisos+anúncios)."""
+    return _commercial_emails(
+        UserProfile.COMMERCIAL_GRANTS, UserProfile.COMMERCIAL_PUBLIC)
 
 
 def _grant_line(grant) -> str:
@@ -43,21 +39,6 @@ def _grant_line(grant) -> str:
     return f"- [{code}] {title} — data final: {closing}"
 
 
-def _format_allocation(value: float | None) -> str:
-    """Formata em M€/mil € — 1 casa decimal só quando não é um valor redondo (evita
-    "4 M€" para 3.5M, mas também evita "3.0 M€" para um valor exato)."""
-    def _round(n: float) -> str:
-        return f"{n:.0f}" if n == int(n) else f"{n:.1f}"
-
-    if value is None:
-        return "N/D"
-    if value >= 1_000_000:
-        return f"{_round(value / 1_000_000)} M€"
-    if value >= 1_000:
-        return f"{_round(value / 1_000)} mil €"
-    return f"{value:.0f} €"
-
-
 def _format_rate(value: float | None) -> str:
     return "N/D" if value is None else f"{value:.0f}%"
 
@@ -65,13 +46,10 @@ def _format_rate(value: float | None) -> str:
 def _grant_row(grant) -> dict:
     """Uma linha da tabela do email (título/dotação/taxa/link). O link vai para a página do
     aviso no front-end — quem recebe este email já tem sessão (é comercial)."""
-    # Import local: avisos.views importa notify_grants deste módulo — importar _financing_rate
-    # ao nível do módulo criava um ciclo. Só _financing_rate é reaproveitada (cálculo único).
-    from .views import _financing_rate
     return {
         "titulo": grant.title or grant.grant_code or "(sem título)",
-        "dotacao": _format_allocation(grant.total_allocation),
-        "taxa": _format_rate(_financing_rate(grant)),
+        "dotacao": format_euros(grant.total_allocation),
+        "taxa": _format_rate(financing_rate(grant)),
         "url": f"{settings.FRONTEND_URL}/avisos/{grant.id}",
     }
 
@@ -81,8 +59,8 @@ def notify_grants(new_grants=None, updated_grants=None) -> int:
     atualizados. Devolve o nº de destinatários (0 se não houver avisos, nenhum comercial com
     email, ou falha de envio). Best-effort: qualquer falha fica no log e não propaga.
     """
-    new_grants = [g for g in (new_grants or []) if g is not None]
-    updated_grants = [g for g in (updated_grants or []) if g is not None]
+    new_grants = [grant for grant in (new_grants or []) if grant is not None]
+    updated_grants = [grant for grant in (updated_grants or []) if grant is not None]
     if not new_grants and not updated_grants:
         return 0
     recipients = commercial_emails()
@@ -95,24 +73,15 @@ def notify_grants(new_grants=None, updated_grants=None) -> int:
 
     body_parts = []
     if new_grants:
-        body_parts.append("Novos avisos:\n" + "\n".join(_grant_line(g) for g in new_grants))
+        body_parts.append("Novos avisos:\n" + "\n".join(_grant_line(grant) for grant in new_grants))
     if updated_grants:
         body_parts.append(
-            "Avisos atualizados:\n" + "\n".join(_grant_line(g) for g in updated_grants))
+            "Avisos atualizados:\n" + "\n".join(_grant_line(grant) for grant in updated_grants))
     body = "\n\n".join(body_parts) + "\n\nConsulta a listagem para mais detalhes."
 
     html = render_to_string("avisos/avisos_abertos_email.html", {
-        "new_grants": [_grant_row(g) for g in new_grants],
-        "updated_grants": [_grant_row(g) for g in updated_grants],
+        "new_grants": [_grant_row(grant) for grant in new_grants],
+        "updated_grants": [_grant_row(grant) for grant in updated_grants],
     })
 
-    try:
-        send_mail(
-            subject, body, settings.DEFAULT_FROM_EMAIL, recipients,
-            html_message=html, fail_silently=False,
-        )
-        logger.info("Notificação enviada a %d comercial(is): %s", len(recipients), subject)
-        return len(recipients)
-    except Exception:
-        logger.exception("Falha ao enviar a notificação de avisos aos comerciais.")
-        return 0
+    return send_digest(subject, body, html, recipients, logger)

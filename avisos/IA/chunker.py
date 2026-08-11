@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from .normalizers import normalize_text
-from ..Docling.docling_ocr import _clean_ocr
+from common.docling.docling_ocr import _clean_ocr
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +263,7 @@ def _parse_markdown_sections(md_text: str) -> list[tuple[tuple[str, ...], str]]:
             while stack and stack[-1][0] >= level:
                 stack.pop()
             stack.append((level, title))
-            current_key = tuple(t for _, t in stack) or (title,)
+            current_key = tuple(section_text for _, section_text in stack) or (title,)
         else:
             buf.append(line)
     flush()
