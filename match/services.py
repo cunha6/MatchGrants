@@ -253,9 +253,18 @@ class NifMatchingService:
             for field_name in ("region", "county", "city", "nuts_ii", "nuts_iii", "nuts_ii_old") if client_metadata.get(field_name)
         ]
 
+        # FUNIL — quantos avisos entram e saem de cada camada. Uma linha por etapa, para
+        # se perceber no log onde é que um aviso esperado se perdeu (e para dimensionar o
+        # efeito de cada filtro). O COUNT extra é sobre o índice parcial `ai_processed AND
+        # active` (ver ADR-3), por isso é barato.
+        active_total = Grant.objects.filter(ai_processed=True, active=True).count()
+        candidates = list(self._active_opportunities(client_metadata))
+        logger.info("Match [1/3] prefiltro CAE (SQL):   %d ativos -> %d candidatos",
+                    active_total, len(candidates))
+
         results = []
         grant_by_id = {}
-        for grant in self._active_opportunities(client_metadata):
+        for grant in candidates:
             opportunity = self._grant_to_opportunity(grant)
 
             eligible, eligibility = is_eligible(client_metadata, opportunity)
@@ -310,6 +319,10 @@ class NifMatchingService:
             })
             grant_by_id[opportunity["id"]] = grant
 
+        logger.info("Match [2/3] filtro rígido:         %d candidatos -> %d elegíveis "
+                    "(CAE fino, localização, dimensão, tipo de beneficiário)",
+                    len(candidates), len(results))
+
         # Atividade 1º, depois taxa, depois dotação — todos decrescentes.
         results.sort(
             key=lambda match_row: (
@@ -347,9 +360,9 @@ class NifMatchingService:
             if verdict is None or verdict["adequate"]:
                 final.append(match_row)
         removed = len(results) - len(final)
-        if removed:
-            logger.info("Validação LLM: %d de %d avisos (top-%d) removidos por não adequados.",
-                        removed, min(len(results), cls.LLM_VALIDATION_CAP), cls.LLM_VALIDATION_CAP)
+        logger.info("Match [3/3] validação LLM:        %d elegíveis -> %d finais "
+                    "(top-%d enviados, %d removidos por inadequação)",
+                    len(results), len(final), min(len(results), cls.LLM_VALIDATION_CAP), removed)
         return final
 
     # TTL do cache que guarda o match já calculado à espera do contacto (ver `evaluate`).

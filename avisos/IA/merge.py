@@ -116,6 +116,6 @@ def merge(r1: dict, r2: dict, r3: dict, r4: dict, r5: dict, r6: dict) -> dict:
         ]
 
     filled_count = sum(1 for field_value in result["Grant"].values() if field_value not in (None, [], ""))
-    logger.prompt_result("Grant: %d/%d campos preenchidos", filled_count, len(result["Grant"]))
+    logger.info("Grant: %d/%d campos preenchidos", filled_count, len(result["Grant"]))
 
     return result

@@ -375,7 +375,7 @@ def _pdf_info(url: str) -> dict:
     try:
         http_response = requests.get(url, headers=HEADERS, timeout=30)
         http_response.raise_for_status()
-        pdf_reader = PdfReader(io.BytesIO(http_response.column))
+        pdf_reader = PdfReader(io.BytesIO(http_response.content))
         text = " ".join(paragraph.extract_text() or "" for paragraph in pdf_reader.pages[:3]).lower()
         nature = "convite" if "convite" in text else None
         return {"paginas": len(pdf_reader.pages), "natureza": nature}

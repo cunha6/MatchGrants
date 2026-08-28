@@ -1,2 +1,6 @@
 ruff==0.15.21
 coverage==7.15.0
+# Métricas de qualidade de código (ver docs/_metricas.py -> docs/metricas.html)
+radon==6.0.1
+vulture==2.16
+pylint==4.0.7

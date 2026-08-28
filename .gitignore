@@ -43,3 +43,6 @@ venv/
 emails/node_modules/
 emails/.render-tmp-*.mjs
 
+
+# Artefactos JUnit XML da execução dos testes (ver docs/_testes.py)
+docs/testes-xml/
