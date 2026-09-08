@@ -11,6 +11,8 @@ import logging
 import os
 from datetime import date
 
+from django.utils import timezone
+
 from common.dates import parse_date as _parse_closing_date
 from common.docling.converter import download_pdf, pdf_to_markdown, find_existing_document, text_is_invitation
 
@@ -255,15 +257,19 @@ def deactivate_expired_grants(today: date | None = None) -> int:
     ainda a decorrer ou sem data legível → active=True (reativa se foi prorrogado). MANTÉM os
     ficheiros (PDF/markdown/JSON). Devolve o nº de registos cujo estado mudou."""
     today = today or date.today()
+    now = timezone.now()
     to_update = []
     for grant in Grant.objects.only("id", "closing_date", "active"):
         closing = _parse_closing_date(grant.closing_date)
         want_active = not (closing is not None and closing < today)
         if grant.active != want_active:
             grant.active = want_active
+            # bulk_update escreve SQL direto e NAO dispara o auto_now do updated_at; sem isto
+            # a abertura/fecho de um aviso ficava invisivel para a newsletter semanal.
+            grant.updated_at = now
             to_update.append(grant)
     if to_update:
-        Grant.objects.bulk_update(to_update, ["active"])
+        Grant.objects.bulk_update(to_update, ["active", "updated_at"])
         logger.info("[Avisos] %d aviso(s) mudaram de estado ativo/inativo (por data de fim).",
                     len(to_update))
     return len(to_update)

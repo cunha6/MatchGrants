@@ -19,6 +19,7 @@ import requests
 from django.conf import settings
 from django.db import connection
 from django.db.models import Q
+from django.utils import timezone
 
 from common.dates import parse_date as _parse_date
 from common.files import safe_media_path
@@ -420,7 +421,8 @@ def download_missing_specifications() -> dict:
             if not has_program and docs["program"]:
                 updates["program_path"] = docs["program"]
             if updates:
-                Notice.objects.filter(pk=pk).update(**updates)
+                # update() escreve SQL direto e nao dispara o auto_now do updated_at.
+                Notice.objects.filter(pk=pk).update(**updates, updated_at=timezone.now())
                 downloaded += 1
                 logger.info(f"  [{number}] OK -> {', '.join(os.path.basename(candidate_value) for candidate_value in updates.values())}")
             else:
@@ -550,7 +552,7 @@ def deactivate_expired() -> int:
     prazo for preenchido (nova importação ou edição manual)."""
     return Notice.objects.filter(
         status=Notice.StatusChoices.ACTIVE, proposal_deadline__lt=date.today(),
-    ).update(status=Notice.StatusChoices.INACTIVE)
+    ).update(status=Notice.StatusChoices.INACTIVE, updated_at=timezone.now())
 
 
 # --- Listing with filters --------------------------------------------------
