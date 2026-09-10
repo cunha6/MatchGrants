@@ -394,10 +394,10 @@ class NifKeyRotationTests(SimpleTestCase):
 
 
 class GeneralEmbeddingTextTests(SimpleTestCase):
-    """Texto do embedding GENERAL: o que o aviso financia, para quem e onde (sem burocracia
-    e SEM os setores — esses têm o seu próprio embedding)."""
+    """Texto do embedding GENERAL: o ENQUADRAMENTO do aviso — título, tipologia, para quem e
+    onde. O domínio (setores, objetivo, ações) pertence ao embedding SECTOR."""
 
-    def test_includes_content_and_final_recipients(self):
+    def test_includes_framing_and_final_recipients(self):
         grant = Grant(
             title="Infraestruturas de valorização de Resíduos Urbanos",
             objective="Promover uma gestão eficiente dos resíduos.",
@@ -408,44 +408,51 @@ class GeneralEmbeddingTextTests(SimpleTestCase):
             eligible_regions=["NUTS II Norte", "NUTS II Centro"],
         )
         text = build_general_embedding_text(grant)
-        for expected in ("Infraestruturas de valorização", "gestão eficiente dos resíduos",
-                         "Economia Circular", "Subinvestimentos em alta",
-                         "estações de triagem", "Entidades gestoras de RU", "NUTS II Norte"):
+        for expected in ("Infraestruturas de valorização", "Subinvestimentos em alta",
+                         "Entidades gestoras de RU", "NUTS II Norte"):
             self.assertIn(expected, text)
 
-    def test_excludes_sectors(self):
-        # Os setores pertencem ao embedding SECTOR — se entrassem aqui, diluíam-se no geral.
-        grant = Grant(title="Aviso X", objective="Objetivo Y",
+    def test_excludes_the_domain_fields(self):
+        # Setores, objetivo e ações pertencem ao SECTOR — duplicá-los aqui correlacionaria as
+        # duas dimensões e tornaria a ponderação 0.60/0.40 inconsequente.
+        grant = Grant(title="Aviso X", objective="Objetivo Y", covered_actions="Ações W",
                       target_technology_sectors=["Economia circular", "Compostagem"])
         text = build_general_embedding_text(grant)
         self.assertNotIn("Compostagem", text)
+        self.assertNotIn("Objetivo Y", text)
+        self.assertNotIn("Ações W", text)
 
     def test_empty_fields_do_not_break(self):
-        grant = Grant(title="Aviso X", objective="Objetivo Y")
+        grant = Grant(title="Aviso X", operation_typology="Tipologia Z")
         text = build_general_embedding_text(grant)
         self.assertIn("Aviso X", text)
-        self.assertIn("Objetivo Y", text)
+        self.assertIn("Tipologia Z", text)
 
 
 class SectorEmbeddingTextTests(SimpleTestCase):
-    """Texto do embedding SECTOR: só o domínio tecnológico/económico."""
+    """Texto do embedding SECTOR: o domínio do aviso — setores-alvo MAIS o objetivo e as ações
+    que descrevem, em concreto, o que financia."""
 
-    def test_uses_only_target_technology_sectors(self):
+    def test_joins_sectors_with_objective_and_actions(self):
         grant = Grant(
             title="Infraestruturas de valorização de Resíduos Urbanos",
-            objective="Um objetivo qualquer que não deve entrar",
+            objective="Promover uma gestão eficiente dos resíduos",
+            specific_objective="RSO2.6 - Economia Circular",
+            covered_actions="Construção de estações de triagem",
+            operation_typology="Enquadramento que não deve entrar",
             target_technology_sectors=["Valorização de resíduos urbanos", "Compostagem"],
         )
         text = build_sector_embedding_text(grant)
-        self.assertIn("Valorização de resíduos urbanos", text)
-        self.assertIn("Compostagem", text)
-        self.assertNotIn("objetivo qualquer", text)   # o texto geral não contamina o setorial
+        for expected in ("Valorização de resíduos urbanos", "Compostagem",
+                         "gestão eficiente dos resíduos", "RSO2.6", "estações de triagem"):
+            self.assertIn(expected, text)
+        self.assertNotIn("Enquadramento", text)   # a tipologia pertence ao GENERAL
 
-    def test_falls_back_to_title_when_no_sectors(self):
+    def test_uses_objective_when_no_sectors(self):
         grant = Grant(title="Apoio à Inovação Produtiva", objective="Objetivo")
-        self.assertEqual(build_sector_embedding_text(grant), "Apoio à Inovação Produtiva")
+        self.assertEqual(build_sector_embedding_text(grant), "Objetivo")
 
-    def test_empty_sectors_list_falls_back(self):
+    def test_falls_back_to_title_when_nothing_else(self):
         grant = Grant(title="Aviso Y", target_technology_sectors=[])
         self.assertEqual(build_sector_embedding_text(grant), "Aviso Y")
 
@@ -1353,7 +1360,9 @@ class SaveGrantEmbeddingsTests(TestCase):
         with self.fake as m:
             saved = grant_embeddings.save_grant_embeddings(self.grant)
         self.assertEqual(set(saved), {GrantEmbedding.Type.SECTOR})
-        self.assertEqual(m.call_args[0][0], ["Compostagem\nBiogás"])  # só este texto foi pedido
+        # O texto setorial junta os setores ao objetivo/ações (ver build_sector_embedding_text).
+        self.assertEqual(len(m.call_args[0][0]), 1)          # só UM texto foi pedido
+        self.assertIn("Compostagem\nBiogás", m.call_args[0][0][0])
 
     def test_force_recalculates_everything(self):
         with self.fake:
@@ -1389,7 +1398,8 @@ class SaveGrantEmbeddingsTests(TestCase):
 
 
 class CompanyTextTests(SimpleTestCase):
-    """Textos da empresa: o setorial isola a atividade; o geral junta todo o perfil."""
+    """Textos da empresa: o setorial isola o domínio económico; o geral fica com a identidade
+    e a localização."""
 
     META = {
         "activity": "Recolha e tratamento de resíduos urbanos",
@@ -1397,9 +1407,10 @@ class CompanyTextTests(SimpleTestCase):
         "cae_codes": ["38112"], "region": "Norte", "city": "Porto",
     }
 
-    def test_sector_text_is_only_the_activity(self):
+    def test_sector_text_is_activity_plus_cae(self):
         text = _company_sector_text(self.META)
-        self.assertEqual(text, "Recolha e tratamento de resíduos urbanos")
+        self.assertIn("Recolha e tratamento de resíduos urbanos", text)
+        self.assertIn("38112", text)      # o CAE reforça o sinal setorial
         self.assertNotIn("Porto", text)   # localização não pertence ao sinal setorial
 
     def test_sector_text_falls_back_to_cae_and_name(self):
@@ -1407,10 +1418,14 @@ class CompanyTextTests(SimpleTestCase):
         self.assertIn("38112", text)
         self.assertIn("Resíduos SA", text)
 
-    def test_general_text_has_full_profile(self):
+    def test_general_text_is_identity_and_location(self):
+        # A atividade e o CAE pertencem ao SETORIAL — repeti-los aqui correlacionaria as duas
+        # dimensões e tornaria a ponderação 0.60/0.40 inconsequente.
         text = _company_general_text(self.META)
-        for expected in ("Recolha e tratamento", "Resíduos SA", "empresa", "38112", "Porto"):
+        for expected in ("Resíduos SA", "empresa", "Porto"):
             self.assertIn(expected, text)
+        self.assertNotIn("Recolha e tratamento", text)
+        self.assertNotIn("38112", text)
 
 
 class ActivePhaseTests(SimpleTestCase):

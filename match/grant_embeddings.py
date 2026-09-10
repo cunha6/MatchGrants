@@ -34,35 +34,37 @@ _WEIGHTS = {
 # --- Builders de texto (um por tipo) ---------------------------------------
 
 def build_general_embedding_text(grant) -> str:
-    """Texto do conteúdo GERAL do aviso: o que financia, para quem e onde.
+    """Texto do ENQUADRAMENTO do aviso: titulo, tipologia, para quem e onde.
 
-    Inclui título, objetivo, objetivo específico, tipologia, ações abrangidas, destinatários
-    finais e regiões elegíveis. Fica de fora a burocracia (elegibilidade formal, documentos,
-    prazos) — não descreve o que o aviso financia e só introduzia ruído.
-    NOTA: os setores tecnológicos NÃO entram aqui — têm o seu próprio embedding (SECTOR).
+    Fica de fora a burocracia (elegibilidade formal, documentos, prazos) - nao descreve o que
+    o aviso financia e so introduzia ruido.
+    NOTA: os setores tecnologicos, o objetivo e as acoes abrangidas NAO entram aqui - descrevem
+    o DOMINIO do aviso e pertencem ao embedding SECTOR. Mante-los fora evita que as duas
+    dimensoes fiquem correlacionadas, o que tornaria a ponderacao 0.60/0.40 inconsequente.
     """
-    parts = [
-        grant.title, grant.objective, grant.specific_objective,
-        grant.operation_typology, grant.covered_actions,
-    ]
+    parts = [grant.title, grant.operation_typology]
     parts += list(grant.final_recipients or [])
     if grant.eligible_regions:
-        parts.append("Regiões elegíveis: " + ", ".join(str(region_name) for region_name in grant.eligible_regions))
+        parts.append("Regioes elegiveis: " + ", ".join(str(region_name) for region_name in grant.eligible_regions))
     return "\n".join(str(part) for part in parts if part)
 
 
 def build_sector_embedding_text(grant) -> str:
-    """Texto SETORIAL: só o domínio tecnológico/económico do aviso.
+    """Texto SETORIAL: o dominio do aviso - setores-alvo MAIS o que financia em concreto.
 
-    Usa exclusivamente `target_technology_sectors`. Isolado do resto, este sinal deixa de se
-    diluir no texto geral e passa a discriminar avisos de nicho.
-    Fallback: o título do aviso, quando não há setores declarados (é o texto mais próximo do
-    domínio); sem ele, o aviso ficaria sem dimensão setorial nenhuma.
+    Junta `target_technology_sectors` ao objetivo, objetivo especifico e acoes abrangidas.
+    Os setores-alvo, sozinhos, sao rotulos de politica publica ("Economia circular",
+    "Descarbonizacao") - vocabulario distinto do das descricoes de atividade das empresas
+    ("Fabricacao de outros artigos de plastico"), pelo que a comparacao direta alinhava mal.
+    O objetivo e as acoes descrevem operacoes concretas (investimento, aquisicao de
+    equipamento, diversificacao da producao) e fazem a ponte entre os dois vocabularios.
+    Fallback: o titulo do aviso, quando nao ha nada disto; sem ele o aviso ficaria sem
+    dimensao setorial nenhuma.
     """
-    sectors = [str(sector).strip() for sector in (grant.target_technology_sectors or []) if sector]
-    if sectors:
-        return "\n".join(sectors)
-    return (grant.title or "").strip()
+    parts = [str(sector).strip() for sector in (grant.target_technology_sectors or []) if sector]
+    parts += [grant.objective, grant.specific_objective, grant.covered_actions]
+    text = "\n".join(str(part).strip() for part in parts if part)
+    return text or (grant.title or "").strip()
 
 
 # Registry tipo → builder. É a ÚNICA coisa a mexer para acrescentar um tipo novo.

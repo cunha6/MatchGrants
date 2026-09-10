@@ -63,46 +63,45 @@ def _next_nif_key() -> str | None:
 
 
 def _company_general_text(metadata: dict) -> str:
-    """Texto GERAL do cliente (compara com o embedding GENERAL do aviso) — junta tudo o que
-    o descreve: atividade + nome + tipo de entidade + CAE + localização.
+    """Texto de ENQUADRAMENTO do cliente (compara com o embedding GENERAL do aviso): quem e a
+    empresa e onde esta - nome, tipo de entidade e localizacao.
 
-    A `activity` (descrição do nif.pt) é o sinal semântico mais forte; os restantes campos
-    acrescentam contexto (setor via CAE, afinidade regional via localização). Quando a atividade
-    vem vazia, o resto garante que a semântica tem sempre com que trabalhar."""
+    Faz par com o lado do aviso, que nesta dimensao traz titulo, tipologia, destinatarios
+    finais e regioes elegiveis. A atividade economica e o CAE NAO entram aqui: pertencem ao
+    texto SETORIAL. Mante-los fora evita duplicar o mesmo sinal nas duas dimensoes, o que
+    tornaria a ponderacao 0.60/0.40 inconsequente.
+    """
     parts: list[str] = []
-    activity = (metadata.get("activity") or "").strip()
-    if activity:
-        parts.append(activity)
     if metadata.get("name"):
         parts.append(str(metadata["name"]))
     if metadata.get("entity_type"):
         parts.append(str(metadata["entity_type"]))
-    cae_codes = [str(cae_code) for cae_code in (metadata.get("cae_codes") or []) if cae_code]
-    if cae_codes:
-        parts.append("CAE: " + ", ".join(cae_codes))
     location_parts = [str(metadata.get(field_name)) for field_name in ("region", "county", "city", "address") if metadata.get(field_name)]
     if location_parts:
-        parts.append("Localização: " + ", ".join(location_parts))
+        parts.append("Localizacao: " + ", ".join(location_parts))
     return "\n".join(parts)
 
 
 def _company_sector_text(metadata: dict) -> str:
     """Texto SETORIAL do cliente (compara com o embedding SECTOR do aviso): a ATIVIDADE
-    PRINCIPAL — a descrição do nif.pt é o que define o domínio económico da empresa.
+    ECONOMICA mais os codigos CAE - o que a empresa faz e em que setor esta classificada.
 
-    Sem localização nem nome: aqui só interessa "o que a empresa faz", para casar com os
-    setores-alvo do aviso. Fallback ao CAE + nome quando o nif.pt não traz atividade — senão
-    a empresa ficaria sem dimensão setorial nenhuma."""
+    Sem localizacao nem nome: aqui so interessa o dominio economico, para casar com os
+    setores-alvo e o objetivo do aviso. O CAE entra como reforco do sinal setorial quando a
+    descricao de atividade e curta ou vaga. Fallback ao CAE + nome quando o nif.pt nao traz
+    atividade - senao a empresa ficaria sem dimensao setorial nenhuma.
+    """
+    parts: list[str] = []
     activity = (metadata.get("activity") or "").strip()
     if activity:
-        return activity
-    parts: list[str] = []
+        parts.append(activity)
     cae_codes = [str(cae_code) for cae_code in (metadata.get("cae_codes") or []) if cae_code]
     if cae_codes:
         parts.append("CAE: " + ", ".join(cae_codes))
-    if metadata.get("name"):
+    if not activity and metadata.get("name"):
         parts.append(str(metadata["name"]))
     return "\n".join(parts)
+
 
 
 class NifValidationError(Exception):
