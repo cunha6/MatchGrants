@@ -1087,7 +1087,7 @@ class StaffProfileHasNoEntityFieldsTests(TestCase):
 
     ENTITY_FIELDS = ("entity_type", "entity_size", "incorporation_date", "nif", "main_cae",
                      "secondary_cae", "address", "postal_code", "city", "county", "region",
-                     "nuts_ii", "nuts_iii", "job_title", "matched_grants")
+                     "nuts_ii", "nuts_iii", "job_title", "matched_grants", "objectives")
 
     def setUp(self):
         self.client = Client()
@@ -1136,6 +1136,19 @@ class StaffProfileHasNoEntityFieldsTests(TestCase):
             detail["matched_grants"],
             [{"id": grant.id, "grant_code": "G1", "title": "Aviso G1"}],
         )
+
+    def test_client_detail_lists_objectives_most_recent_first(self):
+        from users.models import ClientObjective
+        first = ClientObjective.objects.create(
+            profile=self.client_user.profile, text="Primeiro projeto")
+        second = ClientObjective.objects.create(
+            profile=self.client_user.profile, text="Segundo projeto")
+        detail = service.get_user_detail(self.client_user.id)
+        self.assertEqual(
+            [o["id"] for o in detail["objectives"]], [second.id, first.id],
+        )
+        self.assertEqual(detail["objectives"][0]["text"], "Segundo projeto")
+        self.assertIn("created_at", detail["objectives"][0])
 
     def test_entity_fields_are_ignored_when_creating_staff(self):
         self.client.login(username="admin_staff", password="Xk93!vTq21mZ")

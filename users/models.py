@@ -90,12 +90,41 @@ class UserProfile(models.Model):
     # --- Contacto (preenchido pelo pop-up do match sem login, não vem do nif.pt) ---
     job_title = models.CharField(max_length=150, blank=True, null=True)   # função na empresa
 
-    # --- Resultado do último match (só client, ver match/views.py:evaluate_nif) ---
+    # --- Avisos resultantes de matches (viewer OU client, ver match/views.py:evaluate_nif) ---
     # 'avisos.Grant' em string: referência preguiçosa, evita import direto (avisos->users
     # já existe; users->avisos não existia antes disto).
+    # ACUMULA entre matches (a view usa .add(), não .set()): um cliente que faz vários
+    # pedidos ao longo do tempo mantém o histórico de tudo o que já lhe apareceu, em vez de
+    # o último match apagar os anteriores.
     matched_grants = models.ManyToManyField(
         "avisos.Grant", blank=True, related_name="matched_by_profiles",
     )
 
     def __str__(self):
         return f"{self.user.username} ({self.role})"
+
+
+class ClientObjective(models.Model):
+    """Um objetivo/projeto que o cliente descreveu ao pedir um match (`match.evaluate_nif`).
+
+    Texto livre — "que tipo de projeto tem em mente" — usado para reforçar a relevância
+    SETORIAL do match (ver `match.services._company_sector_text`). Histórico completo: um
+    cliente pode voltar a pedir matches com objetivos diferentes ao longo do tempo (um
+    projeto de automação hoje, um de expansão internacional daqui a uns meses), e cada um
+    fica guardado — não se sobrepõe ao anterior, ao contrário de `entity_size`/`activity`
+    (que são o estado ATUAL da empresa, não um histórico de pedidos).
+    """
+
+    profile = models.ForeignKey(
+        UserProfile, on_delete=models.CASCADE, related_name="objectives",
+    )
+    text = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Objetivo do cliente"
+        verbose_name_plural = "Objetivos do cliente"
+
+    def __str__(self):
+        return f"{self.profile.user.username}: {self.text[:60]}"

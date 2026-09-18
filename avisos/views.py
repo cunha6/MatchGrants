@@ -14,6 +14,7 @@ from django.http import FileResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_POST
 
+from common.automation import require_sync_token
 from common.files import safe_media_path
 from common.pagination import paginate
 from common.session_access import can_view_grant
@@ -320,10 +321,11 @@ def _log_and_notify_edit(request, grant, changes, collection_keys) -> None:
     notify_grants([], [grant])
 
 
-# --- Scrape (ingestão de avisos) — ABERTO (sem autenticação), POST (tem efeitos) -----
+# --- Scrape (ingestão de avisos) — AUTOMAÇÃO (header X-Sync-Token), POST (tem efeitos) -----
 
 @csrf_exempt
 @require_POST
+@require_sync_token
 def grants_all(request):
     try:
         payload = service.scrape_todos()
@@ -335,6 +337,7 @@ def grants_all(request):
 
 @csrf_exempt
 @require_POST
+@require_sync_token
 def grants_compete(request):
     try:
         payload = service.scrape_compete()
@@ -349,6 +352,7 @@ def grants_compete(request):
 
 @csrf_exempt
 @require_POST
+@require_sync_token
 def grants_portugal(request):
     try:
         payload = service.scrape_portugal()
@@ -363,6 +367,7 @@ def grants_portugal(request):
 
 @csrf_exempt
 @require_POST
+@require_sync_token
 def grants_prr(request):
     try:
         payload = service.scrape_prr()

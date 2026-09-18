@@ -57,9 +57,10 @@ def get_all_users(role=None, active=True, filters=None, page=1, page_size=50,
     Returns {total, page, page_size, num_pages, users}.
     """
     # select_related/prefetch_related evitam o N+1 do _serialize (poucas queries no total,
-    # em vez de 1+N por página — matched_grants é M2M, select_related não chega para ele).
+    # em vez de 1+N por página — matched_grants é M2M e objectives é reverse FK, select_related
+    # não chega para nenhum dos dois).
     users = User.objects.select_related("profile") \
-        .prefetch_related("profile__matched_grants").order_by("id")
+        .prefetch_related("profile__matched_grants", "profile__objectives").order_by("id")
     if active is not None:
         users = users.filter(is_active=active)
     if role:
@@ -444,6 +445,13 @@ def _serialize(user: User) -> dict:
             "matched_grants": [
                 {"id": grant.id, "grant_code": grant.grant_code, "title": grant.title}
                 for grant in profile.matched_grants.all()
+            ],
+            # Histórico completo dos objetivos/projetos descritos em cada pedido de match
+            # (ver match/leads.py:record_match_result) — mais recente primeiro (Meta.ordering
+            # de ClientObjective).
+            "objectives": [
+                {"id": obj.id, "text": obj.text, "created_at": obj.created_at.isoformat()}
+                for obj in profile.objectives.all()
             ],
         })
     return serialized

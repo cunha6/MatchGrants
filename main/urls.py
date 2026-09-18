@@ -13,4 +13,5 @@ urlpatterns = [
     path("anuncios/", include("anuncios.urls")),
     path("", include("planned_grants.urls")),
     path("news/", include("newsletter.urls")),
+    path("calls/", include("calls.urls")),
 ]

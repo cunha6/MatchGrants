@@ -266,7 +266,10 @@ class MissingRequiredFieldsTests(SimpleTestCase):
 
 
 class ApplyOverridesTests(SimpleTestCase):
-    """User-supplied data fills ONLY missing fields; it never overrides nif.pt data."""
+    """User-supplied data ALWAYS prevails over nif.pt/NifCompany data, when provided: the
+    user knows, at the moment of the request, the CAE/region/dimension/entity_type relevant
+    to THAT match — nif.pt can be outdated and the SQLite enrichment is a snapshot of the
+    last available year. An empty/absent override never erases what nif.pt brought."""
 
     def _meta(self, **over):
         base = {"cae_codes": [], "main_cae": None, "secondary_cae": [],
@@ -290,16 +293,39 @@ class ApplyOverridesTests(SimpleTestCase):
         self.assertEqual(md["region"], "Algarve")
         self.assertEqual(md["dimension"], "micro")  # normalized to lowercase
 
-    def test_does_not_override_existing_data(self):
+    def test_user_value_prevails_over_nif_pt_data(self):
+        # O utilizador manda CAE/região DIFERENTES dos que o nif.pt já trouxe — o valor do
+        # formulário ganha, não o do nif.pt/SQLite.
         md = NifMatchingService._apply_overrides(
-            self._meta(cae_codes=["11111"], region="Norte"),
-            {"cae": "99999", "region": "Sul"})
-        self.assertEqual(md["cae_codes"], ["11111"])  # nif.pt CAE kept
-        self.assertEqual(md["region"], "Norte")       # nif.pt region kept
+            self._meta(cae_codes=["11111"], region="Norte", dimension="grande"),
+            {"cae": "99999", "region": "Sul", "dimension": "micro"})
+        self.assertEqual(md["cae_codes"], ["99999"])
+        self.assertEqual(md["region"], "Sul")
+        self.assertEqual(md["dimension"], "micro")
+
+    def test_empty_override_keeps_the_nif_pt_value(self):
+        # Um override AUSENTE/vazio não apaga o que já veio do nif.pt.
+        md = NifMatchingService._apply_overrides(
+            self._meta(cae_codes=["11111"], region="Norte", dimension="grande"),
+            {"cae": "", "region": "", "dimension": ""})
+        self.assertEqual(md["cae_codes"], ["11111"])
+        self.assertEqual(md["region"], "Norte")
+        self.assertEqual(md["dimension"], "grande")
 
     def test_none_overrides_are_safe(self):
         md = NifMatchingService._apply_overrides(self._meta(), None)
         self.assertEqual(md["cae_codes"], [])
+
+    def test_objective_is_applied_even_when_already_set(self):
+        # objective NUNCA vem do nif.pt — é sempre o valor do pedido atual, mesmo que já
+        # exista um de um pedido anterior (mesma regra dos restantes: o utilizador prevalece).
+        md = NifMatchingService._apply_overrides(
+            self._meta(objective="projeto antigo"), {"objective": "novo projeto"})
+        self.assertEqual(md["objective"], "novo projeto")
+
+    def test_blank_objective_is_not_applied(self):
+        md = NifMatchingService._apply_overrides(self._meta(), {"objective": "   "})
+        self.assertNotIn("objective", md)
 
 
 class NifCompanyProfileConcordanceTests(SimpleTestCase):
@@ -976,6 +1002,100 @@ class ViewerCreationTests(TestCase):
             {f["field"] for f in body["missing_fields"]}, {"email", "name", "job_title"})
 
 
+class ViewerMatchHistoryTests(TestCase):
+    """Um pedido ANÓNIMO (viewer) também acumula avisos + objetivos no perfil — não só o
+    client autenticado (ver ClientMatchHistoryTests). Mesmo fixture de nif.pt/embeddings
+    mockados de ViewerCreationTests, com process_matches mockado para controlar quais
+    avisos "o motor de matching" devolve."""
+
+    NIF_RECORD = ViewerCreationTests.NIF_RECORD
+    CONTACT = ViewerCreationTests.CONTACT
+
+    def _grant(self, code):
+        from avisos.models import Grant
+        return Grant.objects.create(
+            source="portugal", scraping_url=f"https://x/{code}/", grant_code=code,
+            title=f"Aviso {code}", ai_processed=True, active=True,
+        )
+
+    def _match_row(self, grant):
+        return {
+            "opportunity_id": grant.id, "grant_code": grant.grant_code, "title": grant.title,
+            "score": 0, "max_score": 0, "activity_relevance": None,
+            "sector_similarity": None, "general_similarity": None,
+            "effective_financing_rate": None, "effective_budget_allocation": None,
+            "active_phase_id": None, "matched_area_id": None,
+            "eligibility": [], "breakdown": [], "llm_adequate": None, "llm_reason": None,
+        }
+
+    def setUp(self):
+        self.fetch = mock.patch.object(
+            NifMatchingService, "fetch_company", return_value=self.NIF_RECORD)
+        self.vectors = mock.patch.object(
+            NifMatchingService, "_company_vectors", return_value={})
+        email_syntax_only = mock.patch(
+            "common.email_validation.validate_email",
+            side_effect=lambda email, check_deliverability=True, dns_resolver=None: _real_validate_email(
+                email, check_deliverability=False),
+        )
+        email_syntax_only.start()
+        self.addCleanup(email_syntax_only.stop)
+        cache.clear()
+        self.grant_a = self._grant("VA")
+        self.grant_b = self._grant("VB")
+
+    def test_viewer_match_saves_grants_and_objective(self):
+        with self.fetch, self.vectors, mock.patch.object(
+            NifMatchingService, "process_matches",
+            return_value=[self._match_row(self.grant_a), self._match_row(self.grant_b)],
+        ):
+            NifMatchingService().evaluate(
+                "500829993", overrides={"objective": "Digitalizar processos internos"},
+                create_viewer=True, contact=self.CONTACT,
+            )
+        profile = UserProfile.objects.get(nif="500829993")
+        self.assertEqual(
+            set(profile.matched_grants.values_list("id", flat=True)),
+            {self.grant_a.id, self.grant_b.id},
+        )
+        self.assertEqual(
+            list(profile.objectives.values_list("text", flat=True)),
+            ["Digitalizar processos internos"],
+        )
+
+    def test_viewer_match_without_objective_creates_no_entry(self):
+        with self.fetch, self.vectors, mock.patch.object(
+            NifMatchingService, "process_matches", return_value=[self._match_row(self.grant_a)],
+        ):
+            NifMatchingService().evaluate(
+                "500829993", create_viewer=True, contact=self.CONTACT)
+        profile = UserProfile.objects.get(nif="500829993")
+        self.assertEqual(profile.objectives.count(), 0)
+        self.assertEqual(profile.matched_grants.count(), 1)
+
+    def test_repeated_viewer_matches_accumulate(self):
+        with self.fetch, self.vectors, mock.patch.object(
+            NifMatchingService, "process_matches", return_value=[self._match_row(self.grant_a)],
+        ):
+            NifMatchingService().evaluate(
+                "500829993", overrides={"objective": "Primeiro projeto"},
+                create_viewer=True, contact=self.CONTACT,
+            )
+        with self.fetch, self.vectors, mock.patch.object(
+            NifMatchingService, "process_matches", return_value=[self._match_row(self.grant_b)],
+        ):
+            NifMatchingService().evaluate(
+                "500829993", overrides={"objective": "Segundo projeto"},
+                create_viewer=True, contact=self.CONTACT,
+            )
+        profile = UserProfile.objects.get(nif="500829993")
+        self.assertEqual(
+            set(profile.matched_grants.values_list("id", flat=True)),
+            {self.grant_a.id, self.grant_b.id},
+        )
+        self.assertEqual(profile.objectives.count(), 2)
+
+
 class ClientMatchHistoryTests(TestCase):
     """Um client autenticado a consultar o PRÓPRIO NIF: os avisos devolvidos ficam gravados
     no perfil (UserProfile.matched_grants) — aparecem depois nos detalhes da conta
@@ -1046,7 +1166,9 @@ class ClientMatchHistoryTests(TestCase):
         admin.profile.refresh_from_db()
         self.assertEqual(admin.profile.matched_grants.count(), 0)
 
-    def test_matched_grants_replaces_previous_set(self):
+    def test_matched_grants_accumulate_across_matches(self):
+        # Histórico, não o último pedido: um 2º match com um aviso DIFERENTE junta-se ao
+        # que já lá estava, não o substitui.
         self.client_user.profile.matched_grants.set([self.grant_a])
         self.client.force_login(self.client_user)
         with mock.patch.object(
@@ -1057,9 +1179,43 @@ class ClientMatchHistoryTests(TestCase):
                              data=json.dumps({"nif": "500829993"}), content_type="application/json")
         self.client_user.profile.refresh_from_db()
         self.assertEqual(
-            list(self.client_user.profile.matched_grants.values_list("id", flat=True)),
-            [self.grant_b.id],
+            set(self.client_user.profile.matched_grants.values_list("id", flat=True)),
+            {self.grant_a.id, self.grant_b.id},
         )
+
+    def test_objective_is_saved_as_a_new_history_entry(self):
+        self.client.force_login(self.client_user)
+        result = self._evaluate_result("500829993", [self.grant_a])
+        result["company"]["objective"] = "Modernizar a linha de produção"
+        with mock.patch.object(NifMatchingService, "evaluate", return_value=result):
+            self.client.post("/match/evaluate-nif/",
+                             data=json.dumps({"nif": "500829993", "objective": "x"}),
+                             content_type="application/json")
+        self.assertEqual(
+            list(self.client_user.profile.objectives.values_list("text", flat=True)),
+            ["Modernizar a linha de produção"],
+        )
+
+    def test_repeated_matches_keep_every_objective(self):
+        self.client.force_login(self.client_user)
+        for text in ("Automação da produção", "Expansão para novo mercado"):
+            result = self._evaluate_result("500829993", [self.grant_a])
+            result["company"]["objective"] = text
+            with mock.patch.object(NifMatchingService, "evaluate", return_value=result):
+                self.client.post("/match/evaluate-nif/",
+                                 data=json.dumps({"nif": "500829993"}),
+                                 content_type="application/json")
+        self.assertEqual(self.client_user.profile.objectives.count(), 2)
+
+    def test_no_objective_does_not_create_an_empty_entry(self):
+        self.client.force_login(self.client_user)
+        with mock.patch.object(
+            NifMatchingService, "evaluate",
+            return_value=self._evaluate_result("500829993", [self.grant_a]),
+        ):
+            self.client.post("/match/evaluate-nif/",
+                             data=json.dumps({"nif": "500829993"}), content_type="application/json")
+        self.assertEqual(self.client_user.profile.objectives.count(), 0)
 
 
 class CaePrefilterTests(TestCase):
@@ -1417,6 +1573,27 @@ class CompanyTextTests(SimpleTestCase):
         text = _company_sector_text({**self.META, "activity": ""})
         self.assertIn("38112", text)
         self.assertIn("Resíduos SA", text)
+
+    def test_sector_text_includes_the_objective(self):
+        text = _company_sector_text(
+            {**self.META, "objective": "Automatizar a linha de triagem de resíduos"}
+        )
+        self.assertIn("Automatizar a linha de triagem de resíduos", text)
+        self.assertIn("Recolha e tratamento de resíduos urbanos", text)  # não substitui
+
+    def test_objective_alone_avoids_the_name_fallback(self):
+        # Sem atividade mas COM objetivo, o fallback ao nome não é necessário — o
+        # objetivo já dá sinal setorial.
+        text = _company_sector_text(
+            {**self.META, "activity": "", "objective": "Instalar painéis solares"}
+        )
+        self.assertIn("Instalar painéis solares", text)
+        self.assertNotIn("Resíduos SA", text)
+
+    def test_blank_objective_is_ignored(self):
+        text = _company_sector_text({**self.META, "objective": "   "})
+        self.assertNotIn("   ", text)
+        self.assertIn("Recolha e tratamento de resíduos urbanos", text)
 
     def test_general_text_is_identity_and_location(self):
         # A atividade e o CAE pertencem ao SETORIAL — repeti-los aqui correlacionaria as duas

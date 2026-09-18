@@ -64,7 +64,14 @@ INSTALLED_APPS = [
     'anuncios',
     'planned_grants',
     'newsletter',
+    'calls',
 ]
+
+# Segredo partilhado das rotas de automação (sync/import disparados pelo n8n), enviado no
+# header X-Sync-Token — ver common/automation.py. Sem ele essas rotas respondem 503: são
+# chamadas por um agendador sem sessão, e ficarem abertas deixava qualquer um disparar
+# scrapes completos contra as fontes externas a partir deste servidor.
+SYNC_TOKEN = os.getenv('SYNC_TOKEN', '')
 
 # Chave(s) da API nif.pt — lidas do .env. A principal (NIF_KEY) mais alternativas opcionais
 # (NIF_KEY1..NIF_KEY4). O serviço de match roda entre elas, uma de cada vez, para distribuir

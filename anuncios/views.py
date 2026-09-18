@@ -9,6 +9,7 @@ from django.http import FileResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST, require_http_methods
 
+from common.automation import require_sync_token
 from common.files import safe_media_path
 from common.pagination import paginate
 from users.models import UserProfile
@@ -51,6 +52,7 @@ def _audit_value(value, limit: int = 300) -> str:
 
 @csrf_exempt
 @require_POST
+@require_sync_token
 def import_notices(request):
     """POST /anuncios/?num_days=N — query the base.gov.pt API, filter by keywords and store
     notices in the DB. `num_days` é opcional (15 por omissão).

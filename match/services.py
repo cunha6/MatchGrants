@@ -84,21 +84,34 @@ def _company_general_text(metadata: dict) -> str:
 
 def _company_sector_text(metadata: dict) -> str:
     """Texto SETORIAL do cliente (compara com o embedding SECTOR do aviso): a ATIVIDADE
-    ECONOMICA mais os codigos CAE - o que a empresa faz e em que setor esta classificada.
+    ECONOMICA mais os codigos CAE - o que a empresa faz e em que setor esta classificada -
+    e o OBJETIVO do projeto que o cliente tem em mente, quando o formulário o traz.
 
     Sem localizacao nem nome: aqui so interessa o dominio economico, para casar com os
     setores-alvo e o objetivo do aviso. O CAE entra como reforco do sinal setorial quando a
     descricao de atividade e curta ou vaga. Fallback ao CAE + nome quando o nif.pt nao traz
     atividade - senao a empresa ficaria sem dimensao setorial nenhuma.
+
+    O `objective` (texto livre — "que tipo de projeto tem em mente") NÃO vem do nif.pt: é
+    preenchido pelo utilizador no formulário do match e chega via `overrides` (ver
+    `_apply_overrides`). Entra aqui, e não como embedding à parte, porque descreve o MESMO
+    domínio que a atividade/CAE — o que a empresa QUER FAZER com o financiamento —, e é
+    exatamente o vocabulário que o embedding SECTOR do aviso usa do outro lado (ver
+    `grant_embeddings.build_sector_embedding_text`: setores-alvo + objetivo + ações). Juntar
+    os dois lados reforça o sinal sem mexer na ponderação 0.60/0.40 nem exigir um tipo de
+    embedding novo.
     """
     parts: list[str] = []
     activity = (metadata.get("activity") or "").strip()
     if activity:
         parts.append(activity)
+    objective = (metadata.get("objective") or "").strip()
+    if objective:
+        parts.append(objective)
     cae_codes = [str(cae_code) for cae_code in (metadata.get("cae_codes") or []) if cae_code]
     if cae_codes:
         parts.append("CAE: " + ", ".join(cae_codes))
-    if not activity and metadata.get("name"):
+    if not activity and not objective and metadata.get("name"):
         parts.append(str(metadata["name"]))
     return "\n".join(parts)
 
@@ -395,10 +408,11 @@ class NifMatchingService:
                  cache_scope: str | None = None) -> dict:
         """Orquestra o fluxo completo e devolve o payload pronto para a resposta.
 
-        `overrides` permite preencher dados que o nif.pt/enriquecimento não trazem
-        (CAE, região, dimensão) — usado quando o utilizador responde ao pedido de mais
-        informações. Se, mesmo assim, faltar um campo obrigatório (CAE ou localização),
-        levanta MissingClientDataError em vez de excluir avisos em silêncio.
+        `overrides` (CAE, região, dimensão, entity_type, objective) — sempre que o utilizador
+        manda um valor, PREVALECE sobre o que o nif.pt/enriquecimento SQLite já trouxer, não
+        só quando falta (ver `_apply_overrides`). Se, mesmo assim, faltar um campo
+        obrigatório (CAE ou localização), levanta MissingClientDataError em vez de excluir
+        avisos em silêncio.
 
         `create_viewer`: só se regista a empresa como viewer quando o match vem de alguém
         NÃO autenticado (é aí que o viewer serve — guardar o lead que consultou os apoios).
@@ -445,6 +459,10 @@ class NifMatchingService:
                     metadata, self._sanitize_contact(contact, missing_contact))
                 if not missing_contact:
                     cache.delete(cache_key)
+                    leads.record_match_result(
+                        user.profile, metadata.get("objective"),
+                        (match_row["opportunity_id"] for match_row in matches),
+                    )
                     return {
                         "company": dict(metadata), "nif": metadata["nif"],
                         "viewer_user_id": user.id, "matches": matches,
@@ -481,6 +499,12 @@ class NifMatchingService:
                       self.CONTACT_CACHE_TTL)
             raise MissingClientDataError(missing_contact)
 
+        if user is not None:
+            leads.record_match_result(
+                user.profile, metadata.get("objective"),
+                (match_row["opportunity_id"] for match_row in matches),
+            )
+
         # `company` expõe os dados ricos do contribuinte (incluindo a `activity`).
         return {
             "company": dict(metadata),
@@ -508,32 +532,45 @@ class NifMatchingService:
 
     @staticmethod
     def _apply_overrides(metadata: dict, overrides: dict | None) -> dict:
-        """Preenche campos EM FALTA com os dados fornecidos pelo utilizador (não
-        sobrepõe dados já obtidos do nif.pt). Aceita CAE como lista ou string
-        separada por vírgulas/ponto-e-vírgula."""
+        """Aplica os dados fornecidos pelo utilizador no formulário — CAE, região, dimensão
+        e tipo de entidade. Quando o utilizador manda um valor, esse valor PREVALECE sobre o
+        que veio do nif.pt/enriquecimento SQLite (NifCompany), mesmo que esses já tragam algo:
+        é o utilizador quem sabe, no momento do pedido, qual o CAE/região/dimensão/tipo
+        relevantes para AQUELE match — o nif.pt pode estar desatualizado (mudança de sede,
+        de atividade) e o enriquecimento SQLite é uma foto do último ano disponível.
+        Um override vazio/ausente não apaga nada: o campo fica como veio do nif.pt.
+        Aceita CAE como lista ou string separada por vírgulas/ponto-e-vírgula.
+        """
         overrides = overrides or {}
 
-        if not metadata.get("cae_codes"):
-            cae_codes = overrides.get("cae_codes") or overrides.get("cae")
-            if isinstance(cae_codes, str):
-                cae_codes = cae_codes.replace(";", ",").split(",")
-            cae_codes = [str(cae_code).strip() for cae_code in (cae_codes or []) if str(cae_code).strip()]
-            if cae_codes:
-                metadata["cae_codes"] = cae_codes
-                metadata["main_cae"] = cae_codes[0]
-                metadata["secondary_cae"] = cae_codes[1:]
+        cae_codes = overrides.get("cae_codes") or overrides.get("cae")
+        if isinstance(cae_codes, str):
+            cae_codes = cae_codes.replace(";", ",").split(",")
+        cae_codes = [str(cae_code).strip() for cae_code in (cae_codes or []) if str(cae_code).strip()]
+        if cae_codes:
+            metadata["cae_codes"] = cae_codes
+            metadata["main_cae"] = cae_codes[0]
+            metadata["secondary_cae"] = cae_codes[1:]
 
-        if not metadata.get("region") and overrides.get("region"):
+        if overrides.get("region"):
             metadata["region"] = str(overrides["region"]).strip()
 
-        # Dimensão é opcional, mas se o utilizador a fornecer, respeita-a.
-        if not metadata.get("dimension") and overrides.get("dimension"):
+        if overrides.get("dimension"):
             metadata["dimension"] = str(overrides["dimension"]).strip().lower()
 
-        # entity_type é INFERIDO (heurística nome/natureza); um valor explícito do utilizador
-        # PREVALECE — permite corrigir a inferência ou testar como outro tipo de beneficiário.
+        # entity_type é INFERIDO (heurística nome/natureza) — um valor explícito do
+        # utilizador PREVALECE, tal como os restantes.
         if overrides.get("entity_type"):
             metadata["entity_type"] = str(overrides["entity_type"]).strip().lower()
+
+        # objective NUNCA vem do nif.pt (não há campo equivalente na API) — ao contrário dos
+        # restantes overrides, que só preenchem o que falta, este é sempre o valor do pedido
+        # atual: o utilizador pode reformular o projeto em mente entre um match e o seguinte.
+        # O strip() acontece ANTES do if — "   " é truthy mas não deve gravar um objective
+        # vazio (_company_sector_text já tolera a ausência do campo, não um vazio presente).
+        objective = str(overrides.get("objective") or "").strip()
+        if objective:
+            metadata["objective"] = objective
 
         return metadata
 

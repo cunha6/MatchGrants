@@ -56,6 +56,9 @@ services:
       # Faz o scraping usar o Chrome do container `chrome` (WebDriver remoto).
       - SELENIUM_REMOTE_URL=http://chrome:4444/wd/hub
       - DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,matchgrants
+      # Segredo das rotas de automação (header X-Sync-Token). O container só vê as variáveis
+      # listadas aqui: sem esta linha o .env não lá chegava e os syncs respondiam 503.
+      - SYNC_TOKEN=${SYNC_TOKEN}
     depends_on:
       db:
         condition: service_healthy

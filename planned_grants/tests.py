@@ -8,13 +8,15 @@ from decimal import Decimal
 from unittest import mock
 
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from openpyxl import Workbook
 
 from . import services
 from .models import PlannedGrant
 
 TEST_PASSWORD = os.environ.get("TEST_USER_PASSWORD", "test-only-password")
+# Token da automação usado nos testes das rotas de sync (ver common/automation.py).
+SYNC_TOKEN = "test-sync-token"
 
 _HEADER = [
     "ID", "Tipo Ent. Beneficiária", "Natureza Aviso", "Designação do Aviso", "Programa",
@@ -176,9 +178,11 @@ class SerializerTests(TestCase):
 
 # --- Endpoints -----------------------------------------------------------
 
+@override_settings(SYNC_TOKEN=SYNC_TOKEN)
 class EndpointTests(TestCase):
     def setUp(self):
-        # A listagem (Plano Anual) exige sessão admin/commercial; o sync fica aberto (automação).
+        # A listagem (Plano Anual) exige sessão admin/commercial; o sync é da automação
+        # (sem sessão, mas com o header X-Sync-Token).
         user = User.objects.create_user("comercial_plano", password=TEST_PASSWORD)
         user.profile.role = "commercial_grants"
         user.profile.save()
@@ -194,17 +198,25 @@ class EndpointTests(TestCase):
         self.client.force_login(client_user)  # role=client por omissão (signal)
         self.assertEqual(self.client.get("/planned-grants/").status_code, 403)
 
-    def test_sync_works_without_authentication(self):
+    # O sync é a rota da automação (n8n): POST + header X-Sync-Token, sem sessão.
+    def test_sync_needs_no_session_but_needs_the_token(self):
         self.client.logout()
         with mock.patch("planned_grants.services._download_workbook",
                         return_value=_workbook([_row(1)])):
-            resp = self.client.get("/planned-grants/sync/")
+            resp = self.client.post("/planned-grants/sync/", HTTP_X_SYNC_TOKEN=SYNC_TOKEN)
         self.assertEqual(resp.status_code, 200)
+
+    def test_sync_without_the_token_is_rejected(self):
+        with mock.patch("planned_grants.services._download_workbook",
+                        return_value=_workbook([_row(1)])) as download:
+            resp = self.client.post("/planned-grants/sync/")
+        self.assertEqual(resp.status_code, 401)
+        download.assert_not_called()  # nem chega a bater no Portugal 2030
 
     def test_sync_returns_success(self):
         with mock.patch("planned_grants.services._download_workbook",
                         return_value=_workbook([_row(1)])):
-            resp = self.client.get("/planned-grants/sync/")
+            resp = self.client.post("/planned-grants/sync/", HTTP_X_SYNC_TOKEN=SYNC_TOKEN)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"success": True})
         self.assertEqual(PlannedGrant.objects.count(), 1)
@@ -212,12 +224,14 @@ class EndpointTests(TestCase):
     def test_sync_reports_scrape_failure(self):
         with mock.patch("planned_grants.services._download_workbook",
                         side_effect=services.PlannedGrantsSyncError("sem xlsx")):
-            resp = self.client.get("/planned-grants/sync/")
+            resp = self.client.post("/planned-grants/sync/", HTTP_X_SYNC_TOKEN=SYNC_TOKEN)
         self.assertEqual(resp.status_code, 502)
         self.assertFalse(resp.json()["success"])
 
-    def test_sync_rejects_post(self):
-        self.assertEqual(self.client.post("/planned-grants/sync/").status_code, 405)
+    def test_sync_rejects_get(self):
+        """GET deixou de servir: o sync escreve na BD, por isso é POST."""
+        resp = self.client.get("/planned-grants/sync/", HTTP_X_SYNC_TOKEN=SYNC_TOKEN)
+        self.assertEqual(resp.status_code, 405)
 
     def test_list_returns_paginated_envelope(self):
         today = date.today()

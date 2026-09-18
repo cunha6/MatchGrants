@@ -19,7 +19,7 @@ As três seguram a mesma cadeia: o NIF de uma empresa é público, e o email é 
 from django.contrib.auth.models import User
 from django.db import transaction
 
-from users.models import UserProfile
+from users.models import ClientObjective, UserProfile
 from . import notifications
 
 
@@ -143,6 +143,28 @@ def create_or_update_viewer(metadata: dict, contact: dict | None = None) -> User
         notifications.send_welcome_email(user.email)
 
     return user
+
+
+def record_match_result(profile: UserProfile, objective: str | None,
+                        grant_ids) -> None:
+    """Persiste o resultado de UM pedido de match no perfil: o objetivo descrito (se algum) e
+    os avisos devolvidos — ambos ACUMULAM, nunca substituem o que já lá estava.
+
+    `matched_grants` é histórico: um cliente que pede vários matches ao longo do tempo (NIF
+    igual, pedidos diferentes) mantém tudo o que já lhe apareceu — não só o último pedido.
+    `ClientObjective` é uma linha NOVA por objetivo não vazio; texto repetido cria outra
+    linha na mesma (é o histórico do que foi pedido, não um conjunto de valores distintos).
+
+    Usado tanto para o viewer criado por um pedido anónimo (leads.create_or_update_viewer)
+    como para um client autenticado a testar o próprio NIF (match/views.py:evaluate_nif) —
+    o mesmo comportamento nos dois casos, sem duplicar a lógica de acumulação.
+    """
+    objective = (objective or "").strip()
+    if objective:
+        ClientObjective.objects.create(profile=profile, text=objective)
+    grant_ids = [gid for gid in grant_ids if gid is not None]
+    if grant_ids:
+        profile.matched_grants.add(*grant_ids)
 
 
 def promote_viewer_to_client(nif: str) -> dict | None:

@@ -27,6 +27,8 @@ from users.models import UserProfile
 # Password dos utilizadores de teste — lida do ambiente (.env), nunca hardcoded. Os testes usam
 # force_login, por isso o valor não é autenticado; só não pode ficar no código versionado.
 TEST_PASSWORD = os.environ.get("TEST_USER_PASSWORD", "test-only-password")
+# Token da automação usado nos testes da rota de import (ver common/automation.py).
+SYNC_TOKEN = "test-sync-token"
 
 
 class FakeResp:
@@ -614,10 +616,12 @@ class LockTests(SimpleTestCase):
 
 # --- Views -----------------------------------------------------------------
 
+@override_settings(SYNC_TOKEN=SYNC_TOKEN)
 class ViewTests(TestCase):
     def setUp(self):
         # Listagem/detalhe/filtros exigem sessão (anúncios não fazem parte do match) — a
-        # importação (POST /anuncios/) fica de fora, é automação sem login.
+        # importação (POST /anuncios/) fica de fora: é automação sem login, autenticada
+        # pelo header X-Sync-Token.
         user = User.objects.create_user("cliente_view_an", password=TEST_PASSWORD)
         self.client.force_login(user)
 
@@ -625,33 +629,40 @@ class ViewTests(TestCase):
         resp = self.client.get("/anuncios/")
         self.assertEqual(resp.status_code, 405)  # GET not allowed (side-effecting)
 
+    # O import é a rota da automação (n8n): POST + header X-Sync-Token, sem sessão.
     def test_import_route_post_registers_and_spawns(self):
         with mock.patch("anuncios.services.import_notices",
                         return_value={"created": 1, "with_keywords": 1}) as imp, \
              mock.patch("anuncios.services.spawn_specifications_download") as spawn:
-            resp = self.client.post("/anuncios/")
+            resp = self.client.post("/anuncios/", HTTP_X_SYNC_TOKEN=SYNC_TOKEN)
         self.assertEqual(resp.status_code, 200)
         imp.assert_called_once_with(15, download_specs=False)
         spawn.assert_called_once()
         self.assertIn("specifications", resp.json())
 
+    def test_import_route_without_the_token_is_rejected(self):
+        with mock.patch("anuncios.services.import_notices") as imp:
+            resp = self.client.post("/anuncios/")
+        self.assertEqual(resp.status_code, 401)
+        imp.assert_not_called()  # nem chega a bater no base.gov.pt
+
     def test_import_route_accepts_num_days_query_param(self):
         with mock.patch("anuncios.services.import_notices",
                         return_value={"created": 0, "with_keywords": 0}) as imp, \
              mock.patch("anuncios.services.spawn_specifications_download"):
-            resp = self.client.post("/anuncios/?num_days=30")
+            resp = self.client.post("/anuncios/?num_days=30", HTTP_X_SYNC_TOKEN=SYNC_TOKEN)
         self.assertEqual(resp.status_code, 200)
         imp.assert_called_once_with(30, download_specs=False)
 
     def test_import_route_invalid_num_days_returns_400(self):
-        resp = self.client.post("/anuncios/?num_days=abc")
+        resp = self.client.post("/anuncios/?num_days=abc", HTTP_X_SYNC_TOKEN=SYNC_TOKEN)
         self.assertEqual(resp.status_code, 400)
 
     def test_import_route_api_error(self):
         with mock.patch("anuncios.services.import_notices",
                         side_effect=services.BaseGovError("no key")), \
              mock.patch("anuncios.services.spawn_specifications_download"):
-            resp = self.client.post("/anuncios/")
+            resp = self.client.post("/anuncios/", HTTP_X_SYNC_TOKEN=SYNC_TOKEN)
         self.assertEqual(resp.status_code, 502)
 
     def test_list_route(self):

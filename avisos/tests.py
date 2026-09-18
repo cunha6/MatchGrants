@@ -1305,3 +1305,39 @@ class LoadAllPagesResilienceTests(SimpleTestCase):
     def test_stale_element_ends_normally(self):
         clicks, _ = self._run([StaleElementReferenceException()])
         self.assertEqual(clicks, 0)
+
+
+# --- Rotas de scrape (automação) -------------------------------------------
+
+@override_settings(SYNC_TOKEN="test-sync-token")
+class ScrapeRouteAuthTests(TestCase):
+    """As rotas de scrape são disparadas pelo n8n e autenticadas pelo header X-Sync-Token.
+
+    Estavam abertas: qualquer pedido anónimo lançava um scrape completo (Selenium incluído)
+    contra o COMPETE/Portugal 2030/PRR a partir deste servidor.
+    """
+
+    ROUTES = ("/avisos/", "/avisos/compete/", "/avisos/portugal/", "/avisos/prr/")
+
+    def test_without_the_token_nothing_is_scraped(self):
+        for route in self.ROUTES:
+            with self.subTest(route=route):
+                with patch("avisos.service.scrape_todos") as todos, \
+                     patch("avisos.service.scrape_compete") as compete, \
+                     patch("avisos.service.scrape_portugal") as portugal, \
+                     patch("avisos.service.scrape_prr") as prr:
+                    response = self.client.post(route)
+                self.assertEqual(response.status_code, 401)
+                for mocked in (todos, compete, portugal, prr):
+                    mocked.assert_not_called()
+
+    def test_with_the_token_the_scrape_runs(self):
+        with patch("avisos.service.scrape_compete", return_value=[]) as compete:
+            response = self.client.post("/avisos/compete/", HTTP_X_SYNC_TOKEN="test-sync-token")
+        self.assertEqual(response.status_code, 200)
+        compete.assert_called_once()
+
+    @override_settings(SYNC_TOKEN="")
+    def test_without_a_configured_token_the_routes_are_closed(self):
+        response = self.client.post("/avisos/compete/", HTTP_X_SYNC_TOKEN="anything")
+        self.assertEqual(response.status_code, 503)

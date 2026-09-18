@@ -3,8 +3,10 @@
 import logging
 
 from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
+from common.automation import require_sync_token
 from common.pagination import paginate
 from users.models import UserProfile
 from users.permissions import require_role
@@ -29,10 +31,15 @@ def list_planned_grants(request):
     return JsonResponse(payload, json_dumps_params={"ensure_ascii": False, "indent": 2})
 
 
-@require_http_methods(["GET"])
+@csrf_exempt
+@require_http_methods(["POST"])
+@require_sync_token
 def sync_planned_grants(request):
-    """GET /planned-grants/sync/ — scrape do plano anual, encontra o Excel, descarrega e
-    sincroniza a base de dados. Devolve apenas {"success": true} (ou 502 em falha de scrape)."""
+    """POST /planned-grants/sync/ — scrape do plano anual, encontra o Excel, descarrega e
+    sincroniza a base de dados. Devolve apenas {"success": true} (ou 502 em falha de scrape).
+
+    Rota da automação (n8n): protegida pelo header `X-Sync-Token`. Passou de GET a POST ao
+    ganhar essa proteção — escreve na base de dados, por isso não é um pedido seguro."""
     try:
         services.sync_planned_grants()
     except services.PlannedGrantsSyncError as exc:

@@ -9,7 +9,7 @@ from django.views.decorators.http import require_http_methods
 from common.session_access import allow_grants
 from users.models import UserProfile
 from users.permissions import get_role, require_role
-from .leads import promote_viewer_to_client
+from .leads import promote_viewer_to_client, record_match_result
 from .services import (
     NifMatchingService, NifValidationError, NifServiceError, MissingClientDataError,
 )
@@ -28,12 +28,22 @@ def _payload(request) -> dict:
 @csrf_exempt
 @require_http_methods(["POST"])
 def evaluate_nif(request):
-    """POST {"nif": "...", "cae"?, "region"?, "dimension"?, "entity_type"?,
+    """POST {"nif": "...", "cae"?, "region"?, "dimension"?, "entity_type"?, "objective"?,
     "email"?, "name"?, "job_title"?} -> matches ordenados.
 
-    Os campos opcionais cae/region/dimension/entity_type servem para responder a um pedido
-    de mais informações: quando o nif.pt não traz CAE ou localização, a resposta 422 diz
-    o que falta; o cliente reenvia o mesmo pedido já com esses campos preenchidos.
+    Os campos opcionais cae/region/dimension/entity_type servem tanto para responder a um
+    pedido de mais informações (quando o nif.pt não traz CAE ou localização, a resposta 422
+    diz o que falta) como para o utilizador CORRIGIR o que o nif.pt trouxer: sempre que um
+    destes campos vem preenchido no pedido, PREVALECE sobre o dado do nif.pt/enriquecimento
+    SQLite, mesmo que já exista um (ver `NifMatchingService._apply_overrides`) — o nif.pt
+    pode estar desatualizado, o utilizador sabe o que é relevante para este match.
+
+    `objective`: texto livre — que tipo de projeto o cliente tem em mente (ex: "modernizar
+    a linha de produção com automação"). Não vem do nif.pt de todo, por isso é sempre o
+    valor do pedido atual — entra no cálculo da relevância SETORIAL (ver
+    `NifMatchingService._company_sector_text`), lado a lado com a atividade económica e o
+    CAE, para aproximar os avisos cujo objetivo/ações combinam com o projeto descrito, não
+    só com o setor de atividade.
 
     email/name/job_title: GATE de contacto, só para quem NÃO tem sessão. A procura corre
     sempre já na 1ª chamada (nunca espera pelo contacto), mas sem estes 3 campos os
@@ -61,6 +71,7 @@ def evaluate_nif(request):
         "region": data.get("region"),
         "dimension": data.get("dimension"),
         "entity_type": data.get("entity_type"),
+        "objective": data.get("objective"),
     }
     contact = {
         "email": data.get("email"),
@@ -96,13 +107,15 @@ def evaluate_nif(request):
         # trocando o id na URL.
         allow_grants(request, (m.get("opportunity_id") for m in result.get("matches", [])))
     elif get_role(request.user) == UserProfile.CLIENT:
-        # Um client autenticado a consultar o PRÓPRIO NIF: guarda o resultado no perfil para
-        # aparecer nos detalhes da conta (ver users/service.py:_serialize). Compara com o NIF
-        # do perfil — um client a testar um NIF alheio não deve "herdar" avisos no perfil.
+        # Um client autenticado a consultar o PRÓPRIO NIF: acumula o resultado no perfil
+        # (avisos + objetivo, se algum) para aparecer no histórico da conta (ver
+        # users/service.py:_serialize). Compara com o NIF do perfil — um client a testar um
+        # NIF alheio não deve "herdar" avisos/objetivos no perfil.
         profile = getattr(request.user, "profile", None)
         if profile is not None and profile.nif == result.get("nif"):
-            profile.matched_grants.set(
-                m["opportunity_id"] for m in result.get("matches", [])
+            record_match_result(
+                profile, result.get("company", {}).get("objective"),
+                (m["opportunity_id"] for m in result.get("matches", [])),
             )
 
     return JsonResponse(result, json_dumps_params={"ensure_ascii": False, "indent": 2})
